@@ -20,6 +20,7 @@ device, the watchdog reports as disabled and yields a no-op.
 from __future__ import annotations
 
 import contextvars
+import logging
 import sys
 import threading
 import time
@@ -27,6 +28,9 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from .._exceptions import IOStallError
+from ._audit import append_audit_event
+
+_logger = logging.getLogger(__name__)
 
 _active_io_stall_watchdog: contextvars.ContextVar[Optional["IOStallWatchdog"]] = (
     contextvars.ContextVar("active_io_stall_watchdog", default=None)
@@ -96,6 +100,38 @@ def _read_io_bytes(device: str) -> Optional[int]:
 
     Returns ``None`` when the device cannot be found in
     ``disk_io_counters(perdisk=True)``.
+
+    The fallback lookup handles Windows / POSIX device-name shape
+    differences. ``psutil.disk_partitions()`` and
+    ``disk_io_counters(perdisk=True)`` use slightly different
+    conventions for the same device on Windows, so we try two
+    normalisations after the direct lookup misses.
+
+    Examples:
+        Windows direct match::
+
+            device = "C:"
+            counters = {"C:": <iostat>, ...}
+            # Direct lookup hits; no fallback needed.
+
+        Windows fallback via ``device + ":"``::
+
+            device = "C"  # caller resolved it without the colon
+            counters = {"C:": <iostat>, ...}
+            # Direct lookup misses; fallback ``"C" + ":"`` matches.
+
+        Windows fallback via ``rstrip(":")``::
+
+            device = "C:"  # caller has the colon
+            counters = {"C": <iostat>, ...}
+            # Direct lookup misses; fallback ``"C:".rstrip(":")``
+            # → ``"C"`` matches.
+
+        POSIX direct match::
+
+            device = "sda1"
+            counters = {"sda1": <iostat>, "sda": <iostat>, ...}
+            # Direct lookup hits the partition entry.
     """
     try:
         import psutil
@@ -151,9 +187,19 @@ class IOStallWatchdog:
             ``kill()`` for registered subprocesses.
 
     Notes:
-        - Disabled (no-op) when ``psutil`` is missing, when no
-          device can be resolved for *folder*, or when ``stall_s``
-          is non-positive.
+        - Disabled (no-op) when ``psutil`` is missing or when no
+          device can be resolved for *folder*. To skip the I/O-stall
+          check intentionally, omit any ``register_kill_callback``
+          calls — the watchdog still polls but has nothing to abort.
+        - Unlike :class:`HostMemoryWatchdog`, this watchdog does not
+          accept subprocess registrations — only kill callbacks. A
+          Docker-backed sort whose container is registered with the
+          host watchdog will not have its container killed when the
+          I/O stall watchdog trips. Callers should rely on the
+          per-recording watchdog hierarchy (host watchdog kills
+          subprocesses; I/O stall fires callbacks for in-process
+          sorters) rather than expecting symmetric subprocess
+          teardown across all watchdogs.
     """
 
     def __init__(
@@ -165,9 +211,17 @@ class IOStallWatchdog:
         warn_repeat_s: float = 60.0,
         kill_grace_s: float = 5.0,
     ) -> None:
+        if stall_s <= 0.0:
+            raise ValueError(
+                f"stall_s must be positive, got {stall_s}."
+            )
         if poll_interval_s <= 0.0:
             raise ValueError(
                 f"poll_interval_s must be positive, got {poll_interval_s}."
+            )
+        if kill_grace_s < 0.0:
+            raise ValueError(
+                f"kill_grace_s must be non-negative, got {kill_grace_s}."
             )
         self.folder = Path(folder)
         self.stall_s = float(stall_s)
@@ -186,6 +240,10 @@ class IOStallWatchdog:
         self._device: Optional[str] = None
         self._enabled = False
         self._token: Optional[contextvars.Token] = None
+        # Set True when the trip cascade ran but
+        # ``_thread.interrupt_main`` raised — see
+        # :meth:`interrupt_delivery_failed`.
+        self._interrupt_main_failed = False
 
     # ------------------------------------------------------------------
     # Trip-state queries
@@ -194,6 +252,20 @@ class IOStallWatchdog:
     def tripped(self) -> bool:
         """Return True once the watchdog has fired its abort path."""
         return self._tripped
+
+    def interrupt_delivery_failed(self) -> bool:
+        """Return True if the trip fired but ``_thread.interrupt_main`` raised.
+
+        When True, host I/O protection ran successfully (kill
+        callbacks invoked) but the main thread did not receive a
+        ``KeyboardInterrupt``. The pipeline's catch site checks this
+        to reclassify a downstream exception.
+
+        Returns:
+            failed (bool): True only when the watchdog tripped and
+                the interrupt delivery raised.
+        """
+        return self._interrupt_main_failed
 
     def device(self) -> Optional[str]:
         """Return the resolved device identifier (e.g. "sda1")."""
@@ -235,27 +307,25 @@ class IOStallWatchdog:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "IOStallWatchdog":
-        if self.stall_s <= 0:
-            self._enabled = False
-            return self
         device = _resolve_device_for_path(self.folder)
         if device is None:
-            print(
-                f"[io stall watchdog] could not resolve a block device "
-                f"for {self.folder} (psutil missing or no matching "
-                "mountpoint) — disabled. The log inactivity watchdog "
-                "still covers most stall cases."
+            _logger.warning(
+                "could not resolve a block device for %s (psutil "
+                "missing or no matching mountpoint) — disabled. The "
+                "log inactivity watchdog still covers most stall cases.",
+                self.folder,
             )
             self._enabled = False
             return self
         # Probe once to confirm we can read counters for the device.
         if _read_io_bytes(device) is None:
-            print(
-                f"[io stall watchdog] device {device!r} is not exposed "
-                f"by psutil.disk_io_counters(perdisk=True) — disabled. "
-                "Common on Linux NVMe setups where only the parent disk "
-                "is reported; consider monitoring at the parent device "
-                "instead."
+            _logger.warning(
+                "device %r is not exposed by "
+                "psutil.disk_io_counters(perdisk=True) — disabled. "
+                "Common on Linux NVMe setups where only the parent "
+                "disk is reported; consider monitoring at the parent "
+                "device instead.",
+                device,
             )
             self._enabled = False
             return self
@@ -267,10 +337,12 @@ class IOStallWatchdog:
         # classified ``IOStallError`` rather than letting it
         # bubble up raw.
         self._token = _active_io_stall_watchdog.set(self)
-        print(
-            f"[io stall watchdog] active: device={device} "
-            f"folder={self.folder} stall_s={self.stall_s:.1f} "
-            f"poll={self.poll_interval_s:.1f}s"
+        _logger.info(
+            "active: device=%s folder=%s stall_s=%.1f poll=%.1fs",
+            device,
+            self.folder,
+            self.stall_s,
+            self.poll_interval_s,
         )
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -289,7 +361,10 @@ class IOStallWatchdog:
         if self._token is not None:
             try:
                 _active_io_stall_watchdog.reset(self._token)
-            except (LookupError, ValueError):
+            except (LookupError, ValueError, RuntimeError):
+                # Another context modified the var between set/reset,
+                # or the token was already consumed (Python 3.10+
+                # raises RuntimeError on re-used tokens).
                 pass
             self._token = None
 
@@ -304,12 +379,27 @@ class IOStallWatchdog:
         last_bytes = _read_io_bytes(self._device or "")
         last_change_t = time.time()
         last_warn_t = 0.0
+        blind_started_t: Optional[float] = None
+        blind_warned = False
         while not self._stop_event.is_set():
             current = _read_io_bytes(self._device or "")
             now = time.time()
             if current is None:
+                # Counters unreadable this poll. Reset last_change_t so
+                # we don't accumulate stall time we can't observe; track
+                # how long we have been blind so we can warn once.
+                last_change_t = now
+                if blind_started_t is None:
+                    blind_started_t = now
+                elif not blind_warned and now - blind_started_t >= self.stall_s:
+                    self._warn_blind(now - blind_started_t)
+                    blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
                 continue
+            # Successful read clears the blindness tracker so a later
+            # episode is reported afresh.
+            blind_started_t = None
+            blind_warned = False
             if last_bytes is None:
                 last_bytes = current
                 last_change_t = now
@@ -329,44 +419,53 @@ class IOStallWatchdog:
             self._stop_event.wait(self.poll_interval_s)
 
     def _maybe_warn(self, stalled_for: float) -> None:
-        print(
-            f"[io stall watchdog] WARNING: device {self._device!r} "
-            f"idle for {stalled_for:.1f}s (will abort at "
-            f"{self.stall_s:.1f}s)."
+        _logger.warning(
+            "device %r idle for %.1fs (will abort at %.1fs).",
+            self._device,
+            stalled_for,
+            self.stall_s,
         )
-        try:
-            from ._audit import append_audit_event
+        append_audit_event(
+            watchdog="io_stall",
+            event="warn",
+            device=self._device,
+            stalled_for_s=stalled_for,
+            tolerance_s=self.stall_s,
+        )
 
-            append_audit_event(
-                watchdog="io_stall",
-                event="warn",
-                device=self._device,
-                stalled_for_s=stalled_for,
-                tolerance_s=self.stall_s,
-            )
-        except Exception:
-            pass
+    def _warn_blind(self, blind_for: float) -> None:
+        _logger.warning(
+            "I/O counter for device %r unreadable for %.1fs — "
+            "watchdog is blind to stalls until counters become "
+            "readable again. Other watchdogs (log inactivity, host "
+            "memory) still apply.",
+            self._device,
+            blind_for,
+        )
+        append_audit_event(
+            watchdog="io_stall",
+            event="blind_warn",
+            device=self._device,
+            blind_for_s=blind_for,
+            tolerance_s=self.stall_s,
+        )
 
     def _on_trip(self, stalled_for: float) -> None:
         self._tripped = True
         self._stall_at_trip = stalled_for
-        print(
-            f"[io stall watchdog] TRIP: device {self._device!r} stalled "
-            f"for {stalled_for:.1f}s (>= {self.stall_s:.1f}s). "
-            "Aborting sort."
+        _logger.error(
+            "TRIP: device %r stalled for %.1fs (>= %.1fs). Aborting sort.",
+            self._device,
+            stalled_for,
+            self.stall_s,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="io_stall",
-                event="abort",
-                device=self._device,
-                stalled_for_s=stalled_for,
-                tolerance_s=self.stall_s,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="io_stall",
+            event="abort",
+            device=self._device,
+            stalled_for_s=stalled_for,
+            tolerance_s=self.stall_s,
+        )
         with self._lock:
             callbacks = list(self._kill_callbacks)
         for cb in callbacks:
@@ -378,12 +477,28 @@ class IOStallWatchdog:
                 # operator-requested abort. Both must propagate.
                 raise
             except Exception as exc:
-                print(
-                    f"[io stall watchdog] kill_callback raised: {exc!r}; " "continuing."
-                )
+                _logger.error("kill_callback raised: %r; continuing.", exc)
+        # If __exit__ ran while we were mid-cascade (callbacks can
+        # take several seconds), the with-block has already torn
+        # down. Sending interrupt_main() now would land a phantom
+        # KeyboardInterrupt in whatever code is running next — the
+        # next sort, an exception handler, or the interactive
+        # prompt. Skip it.
+        if self._stop_event.is_set():
+            _logger.info(
+                "suppressing interrupt_main: watchdog is already exiting."
+            )
+            return
         try:
             import _thread as _t
 
             _t.interrupt_main()
         except Exception as exc:
-            print(f"[io stall watchdog] failed to interrupt main: {exc}")
+            self._interrupt_main_failed = True
+            _logger.error("failed to interrupt main: %s", exc)
+            append_audit_event(
+                watchdog="io_stall",
+                event="interrupt_delivery_failed",
+                device=self._device,
+                error=repr(exc),
+            )

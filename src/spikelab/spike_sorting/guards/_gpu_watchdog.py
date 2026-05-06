@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import _thread
 import contextvars
+import logging
 import subprocess
 import threading
 import time
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .._exceptions import GpuMemoryWatchdogError, GpuThermalWatchdogError
+from ._audit import append_audit_event
+
+_logger = logging.getLogger(__name__)
 
 # Throttle reason bits we surface as warnings (kernel docs:
 # https://docs.nvidia.com/deploy/nvml-api/group__nvmlClocksThrottleReasons.html).
@@ -193,35 +197,18 @@ def _resolve_device_index(device: Optional[str]) -> int:
 def _read_gpu_memory_pynvml(device_index: int) -> Optional[Tuple[float, float]]:
     """Return ``(used_pct, total_gb)`` for *device_index* via pynvml.
 
-    Returns ``None`` when pynvml is missing or the read fails.
+    Reuses :class:`_PynvmlSession` so the init / shutdown lifecycle
+    is owned by a single class rather than duplicated across the
+    per-call helper. Returns ``None`` when pynvml is missing or the
+    read fails.
     """
-    try:
-        import pynvml
-    except ImportError:
+    session = _PynvmlSession(device_index)
+    if not session.start():
         return None
     try:
-        pynvml.nvmlInit()
-    except Exception:
-        return None
-    try:
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-        except Exception:
-            return None
-        try:
-            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        except Exception:
-            return None
-        total = float(info.total)
-        used = float(info.used)
-        if total <= 0:
-            return None
-        return used / total * 100.0, total / (1024**3)
+        return session.read_memory()
     finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        session.shutdown()
 
 
 def _read_gpu_memory_nvidia_smi(
@@ -294,13 +281,21 @@ def capture_gpu_snapshot(output_path, *, header: str = "") -> Optional[str]:
     lines.append(f"Captured: {_dt.datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
 
-    # nvidia-smi
+    # nvidia-smi. Force the C locale so column labels and units in
+    # the human-readable output are predictable English text — the
+    # snapshot is grepped through after the fact, and operators on
+    # non-English hosts (de_DE, ja_JP, etc.) would otherwise have to
+    # decode localised labels.
+    import os as _os
+
+    smi_env = {**_os.environ, "LANG": "C", "LC_ALL": "C"}
     lines.append("-- nvidia-smi --")
     try:
         out = subprocess.check_output(
             ["nvidia-smi"],
             text=True,
             timeout=10,
+            env=smi_env,
         )
         lines.append(out.rstrip())
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
@@ -331,7 +326,7 @@ def capture_gpu_snapshot(output_path, *, header: str = "") -> Optional[str]:
         target.write_text("\n".join(lines), encoding="utf-8")
         return str(target)
     except Exception as exc:
-        print(f"[gpu snapshot] failed to write {target}: {exc!r}")
+        _logger.error("snapshot failed to write %s: %r", target, exc)
         return None
 
 
@@ -384,7 +379,34 @@ def _try_capture_snapshot_to_results(log_path, header: str) -> None:
         target = results_folder / "gpu_snapshot_at_trip.txt"
         capture_gpu_snapshot(target, header=header)
     except Exception as exc:
-        print(f"[gpu snapshot] failed to capture on trip: {exc!r}")
+        _logger.error("snapshot failed to capture on trip: %r", exc)
+
+
+def _resolve_rt_sort_device(config) -> int:
+    """Resolver for the RT-Sort sorter."""
+    return _resolve_device_index(getattr(config.rt_sort, "device", None))
+
+
+def _resolve_kilosort4_device(config) -> int:
+    """Resolver for the Kilosort4 host sorter."""
+    params = getattr(config.sorter, "sorter_params", None) or {}
+    return _resolve_device_index(params.get("torch_device"))
+
+
+# Registry mapping sorter name (lowercase) to a callable that takes
+# the config and returns the integer device index to monitor.
+# Sorters absent from this registry default to device 0 — the
+# convention KS2-Docker and other CUDA-using sorters that don't
+# expose a configurable device follow.
+#
+# Adding a new GPU-using sorter: write a ``_resolve_<sorter>_device``
+# function that pulls the device index from wherever the sorter
+# config holds it, then add an entry here. No other call site needs
+# updating.
+_DEVICE_RESOLVERS: Dict[str, Callable[[Any], int]] = {
+    "rt_sort": _resolve_rt_sort_device,
+    "kilosort4": _resolve_kilosort4_device,
+}
 
 
 def resolve_active_device(config) -> int:
@@ -397,15 +419,14 @@ def resolve_active_device(config) -> int:
         config (SortingPipelineConfig): Pipeline configuration.
 
     Returns:
-        index (int): Device index to monitor (defaults to 0).
+        index (int): Device index to monitor (defaults to 0 for any
+            sorter not registered in :data:`_DEVICE_RESOLVERS`).
     """
     sorter_name = getattr(config.sorter, "sorter_name", "").lower()
-    if sorter_name == "rt_sort":
-        return _resolve_device_index(getattr(config.rt_sort, "device", None))
-    if sorter_name == "kilosort4":
-        params = getattr(config.sorter, "sorter_params", None) or {}
-        return _resolve_device_index(params.get("torch_device"))
-    return 0
+    resolver = _DEVICE_RESOLVERS.get(sorter_name)
+    if resolver is None:
+        return 0
+    return resolver(config)
 
 
 class GpuMemoryWatchdog:
@@ -483,6 +504,10 @@ class GpuMemoryWatchdog:
             raise ValueError(
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
+        if kill_grace_s < 0.0:
+            raise ValueError(
+                f"kill_grace_s must be non-negative, got {kill_grace_s}."
+            )
         if (
             warn_temp_c is not None
             and abort_temp_c is not None
@@ -522,6 +547,12 @@ class GpuMemoryWatchdog:
         # Captured at ``__enter__`` time on the main thread because
         # ContextVars do not propagate to the polling thread.
         self._snapshot_log_path = None
+        # Set True when the trip cascade ran but
+        # ``_thread.interrupt_main`` raised — the main thread did not
+        # receive the KeyboardInterrupt and will surface a downstream
+        # error instead. Catch sites read this via
+        # :meth:`interrupt_delivery_failed`.
+        self._interrupt_main_failed = False
 
     # ------------------------------------------------------------------
     # Trip-state queries
@@ -530,6 +561,21 @@ class GpuMemoryWatchdog:
     def tripped(self) -> bool:
         """Return True once the watchdog has fired its abort path."""
         return self._tripped
+
+    def interrupt_delivery_failed(self) -> bool:
+        """Return True if the trip fired but ``_thread.interrupt_main`` raised.
+
+        When True, GPU protection ran successfully (subprocesses
+        terminated, kill callbacks invoked) but the main thread did
+        not receive a ``KeyboardInterrupt``. The pipeline's catch
+        site checks this to reclassify a downstream exception caused
+        by the now-dead subprocess.
+
+        Returns:
+            failed (bool): True only when the watchdog tripped and
+                the interrupt delivery raised.
+        """
+        return self._interrupt_main_failed
 
     def used_pct_at_trip(self) -> Optional[float]:
         """Return the used-memory percent at the trip moment, or None."""
@@ -648,10 +694,10 @@ class GpuMemoryWatchdog:
         # cleanly when no GPU info source is available.
         info = read_gpu_memory(self.device_index)
         if info is None:
-            print(
-                f"[gpu memory watchdog] no GPU info available for "
-                f"device {self.device_index} (no pynvml, no nvidia-smi). "
-                "Disabled."
+            _logger.warning(
+                "no GPU info available for device %d (no pynvml, no "
+                "nvidia-smi). Disabled.",
+                self.device_index,
             )
             self._enabled = False
             return self
@@ -682,11 +728,16 @@ class GpuMemoryWatchdog:
                     f" temp_warn>={self.warn_temp_c} "
                     f"abort>={self.abort_temp_c} (now {initial_temp:.1f}C)"
                 )
-        print(
-            f"[gpu memory watchdog] active: device={self.device_index} "
-            f"({total_gb:.1f} GB) start={used_pct:.1f}% "
-            f"warn>={self.warn_pct:.1f}% abort>={self.abort_pct:.1f}% "
-            f"poll={self.poll_interval_s:.1f}s{thermal_str}"
+        _logger.info(
+            "active: device=%d (%.1f GB) start=%.1f%% warn>=%.1f%% "
+            "abort>=%.1f%% poll=%.1fs%s",
+            self.device_index,
+            total_gb,
+            used_pct,
+            self.warn_pct,
+            self.abort_pct,
+            self.poll_interval_s,
+            thermal_str,
         )
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -705,8 +756,10 @@ class GpuMemoryWatchdog:
         if self._token is not None:
             try:
                 _active_gpu_watchdog.reset(self._token)
-            except (LookupError, ValueError):
-                # Another context modified the var between set/reset.
+            except (LookupError, ValueError, RuntimeError):
+                # Another context modified the var between set/reset,
+                # or the token was already consumed (Python 3.10+
+                # raises RuntimeError on re-used tokens).
                 pass
             self._token = None
         if self._session is not None:
@@ -722,14 +775,35 @@ class GpuMemoryWatchdog:
         # Defer the first poll so __enter__ has time to return.
         if self._stop_event.wait(self.poll_interval_s):
             return
+        blind_threshold_s = 5.0 * self.warn_repeat_s
+        # VRAM and thermal/throttle have independent failure modes
+        # (the same _session may succeed for one and fail for the
+        # other on driver corner cases) so they get independent
+        # blindness trackers.
+        vram_blind_started_t: Optional[float] = None
+        vram_blind_warned = False
+        thermal_blind_started_t: Optional[float] = None
+        thermal_blind_warned = False
         while not self._stop_event.is_set():
+            now = time.time()
             # Memory: prefer the cached pynvml session, fall back
             # to the free-function reader (which uses nvidia-smi).
             if self._session is not None:
                 info = self._session.read_memory()
             else:
                 info = read_gpu_memory(self.device_index)
-            if info is not None:
+            if info is None:
+                if vram_blind_started_t is None:
+                    vram_blind_started_t = now
+                elif (
+                    not vram_blind_warned
+                    and now - vram_blind_started_t >= blind_threshold_s
+                ):
+                    self._warn_blind_vram(now - vram_blind_started_t)
+                    vram_blind_warned = True
+            else:
+                vram_blind_started_t = None
+                vram_blind_warned = False
                 used_pct, _total_gb = info
                 if used_pct >= self.abort_pct:
                     self._on_abort(used_pct)
@@ -738,11 +812,21 @@ class GpuMemoryWatchdog:
                     self._maybe_warn(used_pct)
 
             # Thermal + throttle reasons require pynvml; skip when
-            # the session is unavailable.
+            # the session is unavailable. When _session is present
+            # but a configured sub-read returns None, that counts
+            # as thermal blindness for the warning tracker.
             if self._session is not None:
+                thermal_configured = (
+                    self.warn_temp_c is not None
+                    or self.abort_temp_c is not None
+                    or self.monitor_throttle_reasons
+                )
+                thermal_unreadable = False
                 if self.warn_temp_c is not None or self.abort_temp_c is not None:
                     temp_c = self._session.read_temperature_c()
-                    if temp_c is not None:
+                    if temp_c is None:
+                        thermal_unreadable = True
+                    else:
                         if (
                             self.abort_temp_c is not None
                             and temp_c >= self.abort_temp_c
@@ -753,10 +837,25 @@ class GpuMemoryWatchdog:
                             self._maybe_warn_temp(temp_c)
                 if self.monitor_throttle_reasons:
                     mask = self._session.read_throttle_reasons()
-                    if mask is not None and mask & sum(
-                        bit for bit, _ in _THROTTLE_REASON_LABELS
-                    ):
+                    if mask is None:
+                        thermal_unreadable = True
+                    elif mask & sum(bit for bit, _ in _THROTTLE_REASON_LABELS):
                         self._maybe_warn_throttle(mask)
+
+                if thermal_configured and thermal_unreadable:
+                    if thermal_blind_started_t is None:
+                        thermal_blind_started_t = now
+                    elif (
+                        not thermal_blind_warned
+                        and now - thermal_blind_started_t >= blind_threshold_s
+                    ):
+                        self._warn_blind_thermal(
+                            now - thermal_blind_started_t
+                        )
+                        thermal_blind_warned = True
+                else:
+                    thermal_blind_started_t = None
+                    thermal_blind_warned = False
 
             self._stop_event.wait(self.poll_interval_s)
 
@@ -766,25 +865,22 @@ class GpuMemoryWatchdog:
         if now - self._last_warn_t < self.warn_repeat_s:
             return
         self._last_warn_t = now
-        print(
-            f"[gpu memory watchdog] WARNING: device {self.device_index} "
-            f"VRAM at {used_pct:.1f}% (warn={self.warn_pct:.1f}% / "
-            f"abort={self.abort_pct:.1f}%)."
+        _logger.warning(
+            "device %d VRAM at %.1f%% (warn=%.1f%% / abort=%.1f%%).",
+            self.device_index,
+            used_pct,
+            self.warn_pct,
+            self.abort_pct,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="gpu_memory",
-                event="warn",
-                log_path=self._snapshot_log_path,
-                device_index=self.device_index,
-                used_pct=used_pct,
-                warn_pct=self.warn_pct,
-                abort_pct=self.abort_pct,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="gpu_memory",
+            event="warn",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            used_pct=used_pct,
+            warn_pct=self.warn_pct,
+            abort_pct=self.abort_pct,
+        )
 
     def _maybe_warn_temp(self, temp_c: float) -> None:
         """Print a thermal warning if rate-limit allows."""
@@ -793,25 +889,22 @@ class GpuMemoryWatchdog:
             return
         self._last_temp_warn_t = now
         abort = f"{self.abort_temp_c:.1f}" if self.abort_temp_c is not None else "off"
-        print(
-            f"[gpu memory watchdog] WARNING: device {self.device_index} "
-            f"temperature {temp_c:.1f} C "
-            f"(warn>={self.warn_temp_c:.1f} / abort>={abort})."
+        _logger.warning(
+            "device %d temperature %.1f C (warn>=%.1f / abort>=%s).",
+            self.device_index,
+            temp_c,
+            self.warn_temp_c,
+            abort,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="gpu_thermal",
-                event="warn",
-                log_path=self._snapshot_log_path,
-                device_index=self.device_index,
-                temperature_c=temp_c,
-                warn_temp_c=self.warn_temp_c,
-                abort_temp_c=self.abort_temp_c,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="gpu_thermal",
+            event="warn",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            temperature_c=temp_c,
+            warn_temp_c=self.warn_temp_c,
+            abort_temp_c=self.abort_temp_c,
+        )
 
     def _maybe_warn_throttle(self, mask: int) -> None:
         """Print a throttle-reason warning if rate-limit allows."""
@@ -820,23 +913,53 @@ class GpuMemoryWatchdog:
             return
         self._last_throttle_warn_t = now
         reasons = _format_throttle_reasons(mask) or f"mask=0x{mask:x}"
-        print(
-            f"[gpu memory watchdog] WARNING: device {self.device_index} "
-            f"throttling — {reasons}."
+        _logger.warning(
+            "device %d throttling — %s.",
+            self.device_index,
+            reasons,
         )
-        try:
-            from ._audit import append_audit_event
+        append_audit_event(
+            watchdog="gpu_throttle",
+            event="warn",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            throttle_mask=int(mask),
+            throttle_reasons=reasons,
+        )
 
-            append_audit_event(
-                watchdog="gpu_throttle",
-                event="warn",
-                log_path=self._snapshot_log_path,
-                device_index=self.device_index,
-                throttle_mask=int(mask),
-                throttle_reasons=reasons,
-            )
-        except Exception:
-            pass
+    def _warn_blind_vram(self, blind_for: float) -> None:
+        _logger.warning(
+            "VRAM reading for device %d unreadable for %.1fs — "
+            "watchdog is blind to VRAM-pressure aborts until readings "
+            "recover.",
+            self.device_index,
+            blind_for,
+        )
+        append_audit_event(
+            watchdog="gpu_memory",
+            event="blind_warn",
+            source="vram",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            blind_for_s=blind_for,
+        )
+
+    def _warn_blind_thermal(self, blind_for: float) -> None:
+        _logger.warning(
+            "thermal/throttle reading for device %d unreadable for "
+            "%.1fs — watchdog is blind to thermal aborts until "
+            "readings recover.",
+            self.device_index,
+            blind_for,
+        )
+        append_audit_event(
+            watchdog="gpu_memory",
+            event="blind_warn",
+            source="thermal",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            blind_for_s=blind_for,
+        )
 
     def _on_thermal_abort(self, temp_c: float) -> None:
         """Trip on thermal threshold; terminate, run callbacks, raise."""
@@ -844,24 +967,21 @@ class GpuMemoryWatchdog:
         self._tripped_kind = "thermal"
         self._temp_c_at_trip = temp_c
         abort = f"{self.abort_temp_c:.1f}" if self.abort_temp_c is not None else "?"
-        print(
-            f"[gpu memory watchdog] THERMAL ABORT: device "
-            f"{self.device_index} at {temp_c:.1f} C (>= {abort} C). "
-            "Terminating subprocesses and raising into main thread."
+        _logger.error(
+            "THERMAL ABORT: device %d at %.1f C (>= %s C). "
+            "Terminating subprocesses and raising into main thread.",
+            self.device_index,
+            temp_c,
+            abort,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="gpu_thermal",
-                event="abort",
-                log_path=self._snapshot_log_path,
-                device_index=self.device_index,
-                temperature_c=temp_c,
-                abort_temp_c=self.abort_temp_c,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="gpu_thermal",
+            event="abort",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            temperature_c=temp_c,
+            abort_temp_c=self.abort_temp_c,
+        )
         _try_capture_snapshot_to_results(
             self._snapshot_log_path,
             f"GPU thermal watchdog trip — device {self.device_index} at "
@@ -874,24 +994,21 @@ class GpuMemoryWatchdog:
         self._tripped = True
         self._tripped_kind = "memory"
         self._used_pct_at_trip = used_pct
-        print(
-            f"[gpu memory watchdog] ABORT: device {self.device_index} "
-            f"VRAM at {used_pct:.1f}% (>= {self.abort_pct:.1f}%). "
-            "Terminating subprocesses and raising into main thread."
+        _logger.error(
+            "ABORT: device %d VRAM at %.1f%% (>= %.1f%%). Terminating "
+            "subprocesses and raising into main thread.",
+            self.device_index,
+            used_pct,
+            self.abort_pct,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="gpu_memory",
-                event="abort",
-                log_path=self._snapshot_log_path,
-                device_index=self.device_index,
-                used_pct=used_pct,
-                abort_pct=self.abort_pct,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="gpu_memory",
+            event="abort",
+            log_path=self._snapshot_log_path,
+            device_index=self.device_index,
+            used_pct=used_pct,
+            abort_pct=self.abort_pct,
+        )
         _try_capture_snapshot_to_results(
             self._snapshot_log_path,
             f"GPU memory watchdog trip — device {self.device_index} at "
@@ -899,8 +1016,23 @@ class GpuMemoryWatchdog:
         )
         self._kill_targets_and_interrupt()
 
-    def _kill_targets_and_interrupt(self) -> None:
-        """Common subprocess + callback termination shared by abort paths."""
+    def _kill_targets(self) -> None:
+        """Terminate registered subprocesses and run kill callbacks.
+
+        Side-effect-only: returns nothing, raises only the explicit
+        ``SystemExit`` / ``KeyboardInterrupt`` propagation case.
+        Split from :meth:`_kill_targets_and_interrupt` so a future
+        telemetry-only abort path can run the destructive cascade
+        without injecting a ``KeyboardInterrupt`` into the main
+        thread.
+
+        Notes:
+            - When ``entries`` is empty (no subprocesses registered),
+              the ``if entries:`` gate skips the grace sleep — there
+              is nothing to terminate, so callbacks fire immediately.
+              The ``default=self.kill_grace_s`` on the ``max(...)``
+              call is unreachable in that case but kept for clarity.
+        """
         with self._lock:
             entries = list(self._subprocesses)
             callbacks = list(self._kill_callbacks)
@@ -909,9 +1041,10 @@ class GpuMemoryWatchdog:
                 if popen.poll() is None:
                     popen.terminate()
             except Exception as exc:
-                print(
-                    f"[gpu memory watchdog] terminate() failed for pid="
-                    f"{getattr(popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "terminate() failed for pid=%s: %s",
+                    getattr(popen, "pid", "?"),
+                    exc,
                 )
         if entries:
             time.sleep(max((g for _, g in entries), default=self.kill_grace_s))
@@ -920,9 +1053,10 @@ class GpuMemoryWatchdog:
                 if popen.poll() is None:
                     popen.kill()
             except Exception as exc:
-                print(
-                    f"[gpu memory watchdog] kill() failed for pid="
-                    f"{getattr(popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "kill() failed for pid=%s: %s",
+                    getattr(popen, "pid", "?"),
+                    exc,
                 )
         for cb in callbacks:
             try:
@@ -933,11 +1067,37 @@ class GpuMemoryWatchdog:
                 # operator-requested abort. Both must propagate.
                 raise
             except Exception as exc:
-                print(
-                    f"[gpu memory watchdog] kill_callback raised: {exc!r}; "
-                    "continuing."
-                )
+                _logger.error("kill_callback raised: %r; continuing.", exc)
+
+    def _kill_targets_and_interrupt(self) -> None:
+        """Common subprocess + callback termination + interrupt main.
+
+        Used by the abort paths (``_on_abort``, ``_on_thermal_abort``)
+        which both want destructive cleanup followed by
+        ``_thread.interrupt_main`` to convert the daemon-thread trip
+        into a classified main-thread error.
+        """
+        self._kill_targets()
+        # If __exit__ ran while we were mid-cascade (terminate +
+        # grace + callbacks can take several seconds), the with-block
+        # has already torn down. Sending interrupt_main() now would
+        # land a phantom KeyboardInterrupt in whatever code is running
+        # next — the next sort, an exception handler, or the
+        # interactive prompt. Skip it.
+        if self._stop_event.is_set():
+            _logger.info(
+                "suppressing interrupt_main: watchdog is already exiting."
+            )
+            return
         try:
             _thread.interrupt_main()
         except Exception as exc:
-            print(f"[gpu memory watchdog] failed to interrupt main: {exc}")
+            self._interrupt_main_failed = True
+            _logger.error("failed to interrupt main: %s", exc)
+            append_audit_event(
+                watchdog="gpu_memory",
+                event="interrupt_delivery_failed",
+                log_path=self._snapshot_log_path,
+                device_index=self.device_index,
+                error=repr(exc),
+            )

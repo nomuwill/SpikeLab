@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import _thread
 import contextvars
+import logging
 import math
 import subprocess
 import threading
@@ -56,6 +57,9 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 from .._exceptions import HostMemoryWatchdogError
+from ._audit import append_audit_event
+
+_logger = logging.getLogger(__name__)
 
 _active_watchdog: contextvars.ContextVar[Optional["HostMemoryWatchdog"]] = (
     contextvars.ContextVar("active_host_memory_watchdog", default=None)
@@ -124,6 +128,10 @@ class HostMemoryWatchdog:
             raise ValueError(
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
+        if kill_grace_s < 0.0:
+            raise ValueError(
+                f"kill_grace_s must be non-negative, got {kill_grace_s}."
+            )
 
         self.warn_pct = float(warn_pct)
         self.abort_pct = float(abort_pct)
@@ -146,6 +154,13 @@ class HostMemoryWatchdog:
         # Captured at ``__enter__`` time on the main thread because
         # ContextVars do not propagate to the polling thread.
         self._snapshot_log_path = None
+        # Set True when the trip cascade ran but
+        # ``_thread.interrupt_main`` raised — the main thread did not
+        # receive the KeyboardInterrupt and will surface a downstream
+        # error instead of the classified watchdog error. Catch sites
+        # check this via :meth:`interrupt_delivery_failed` to
+        # reclassify the downstream exception.
+        self._interrupt_main_failed = False
 
     # ------------------------------------------------------------------
     # Subprocess registration (called by backends)
@@ -231,6 +246,22 @@ class HostMemoryWatchdog:
         """Return True if the watchdog has fired its abort path."""
         return self._tripped
 
+    def interrupt_delivery_failed(self) -> bool:
+        """Return True if the trip fired but ``_thread.interrupt_main`` raised.
+
+        When True, host protection ran successfully (subprocesses
+        terminated, kill callbacks invoked) but the main thread did
+        not receive a ``KeyboardInterrupt``. The pipeline's catch
+        site checks this to reclassify a downstream
+        ``BrokenPipeError`` / ``RuntimeError`` (caused by the now-dead
+        subprocess) as the appropriate watchdog error.
+
+        Returns:
+            failed (bool): True only when the watchdog tripped and
+                the interrupt delivery raised.
+        """
+        return self._interrupt_main_failed
+
     def percent_at_trip(self) -> Optional[float]:
         """Return the memory percent at the trip moment, or None."""
         return self._percent_at_trip
@@ -282,19 +313,19 @@ class HostMemoryWatchdog:
             self._psutil = psutil
             self._enabled = True
         except ImportError:
-            print(
-                "[host memory watchdog] psutil not installed — "
-                "watchdog disabled. Install psutil to enable host RAM "
-                "monitoring."
+            _logger.warning(
+                "psutil not installed — watchdog disabled. Install "
+                "psutil to enable host RAM monitoring."
             )
             self._enabled = False
             self._token = _active_watchdog.set(self)
             return self
 
-        print(
-            f"[host memory watchdog] active: "
-            f"warn={self.warn_pct:.1f}% abort={self.abort_pct:.1f}% "
-            f"poll={self.poll_interval_s:.1f}s"
+        _logger.info(
+            "active: warn=%.1f%% abort=%.1f%% poll=%.1fs",
+            self.warn_pct,
+            self.abort_pct,
+            self.poll_interval_s,
         )
         self._token = _active_watchdog.set(self)
         self._stop_event.clear()
@@ -312,7 +343,16 @@ class HostMemoryWatchdog:
             self._thread.join(timeout=self.poll_interval_s + 1.0)
             self._thread = None
         if self._token is not None:
-            _active_watchdog.reset(self._token)
+            try:
+                _active_watchdog.reset(self._token)
+            except (LookupError, ValueError, RuntimeError):
+                # Another context modified the var between set/reset,
+                # or the token was already consumed (Python 3.10+
+                # raises RuntimeError on re-used tokens). Matches the
+                # symmetric guards in GpuMemoryWatchdog and
+                # IOStallWatchdog so a degenerate teardown does not
+                # leak the active-watchdog publication.
+                pass
             self._token = None
         with self._lock:
             self._subprocesses.clear()
@@ -331,12 +371,27 @@ class HostMemoryWatchdog:
         # which leaves the with-block in a half-entered state.
         if self._stop_event.wait(self.poll_interval_s):
             return
+        blind_threshold_s = 5.0 * self.warn_repeat_s
+        blind_started_t: Optional[float] = None
+        blind_warned = False
         while not self._stop_event.is_set():
+            now = time.time()
             try:
                 pct = float(self._psutil.virtual_memory().percent)
             except Exception:
                 # psutil on some platforms can transiently fail; skip
                 # this tick rather than tearing down the watchdog.
+                # Track how long the readings have been unavailable so
+                # a sustained psutil failure surfaces a one-time
+                # warning instead of silently disabling the abort path.
+                if blind_started_t is None:
+                    blind_started_t = now
+                elif (
+                    not blind_warned
+                    and now - blind_started_t >= blind_threshold_s
+                ):
+                    self._warn_blind(now - blind_started_t)
+                    blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
                 continue
 
@@ -344,8 +399,21 @@ class HostMemoryWatchdog:
             # silently disable the watchdog. Skip the tick rather than
             # treating it as either a healthy or unhealthy reading.
             if math.isnan(pct):
+                if blind_started_t is None:
+                    blind_started_t = now
+                elif (
+                    not blind_warned
+                    and now - blind_started_t >= blind_threshold_s
+                ):
+                    self._warn_blind(now - blind_started_t)
+                    blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
                 continue
+
+            # Successful reading — clear the blindness tracker so a
+            # later episode is reported afresh.
+            blind_started_t = None
+            blind_warned = False
 
             if pct >= self.abort_pct:
                 self._on_abort(pct)
@@ -362,47 +430,53 @@ class HostMemoryWatchdog:
         if now - self._last_warn_t < self.warn_repeat_s:
             return
         self._last_warn_t = now
-        print(
-            f"[host memory watchdog] WARNING: system memory at "
-            f"{pct:.1f}% (warn={self.warn_pct:.1f}% / "
-            f"abort={self.abort_pct:.1f}%). Free memory or expect an "
-            "abort if pressure keeps climbing."
+        _logger.warning(
+            "system memory at %.1f%% (warn=%.1f%% / abort=%.1f%%). "
+            "Free memory or expect an abort if pressure keeps climbing.",
+            pct,
+            self.warn_pct,
+            self.abort_pct,
         )
-        try:
-            from ._audit import append_audit_event
+        append_audit_event(
+            watchdog="host_memory",
+            event="warn",
+            log_path=self._snapshot_log_path,
+            used_pct=pct,
+            warn_pct=self.warn_pct,
+            abort_pct=self.abort_pct,
+        )
 
-            append_audit_event(
-                watchdog="host_memory",
-                event="warn",
-                log_path=self._snapshot_log_path,
-                used_pct=pct,
-                warn_pct=self.warn_pct,
-                abort_pct=self.abort_pct,
-            )
-        except Exception:
-            pass
+    def _warn_blind(self, blind_for: float) -> None:
+        _logger.warning(
+            "psutil.virtual_memory() unreadable for %.1fs — watchdog "
+            "is blind to RAM-pressure aborts until readings recover.",
+            blind_for,
+        )
+        append_audit_event(
+            watchdog="host_memory",
+            event="blind_warn",
+            source="virtual_memory",
+            log_path=self._snapshot_log_path,
+            blind_for_s=blind_for,
+        )
 
     def _on_abort(self, pct: float) -> None:
         """Terminate registered subprocesses and interrupt the main thread."""
         self._tripped = True
         self._percent_at_trip = pct
-        print(
-            f"[host memory watchdog] ABORT: system memory at {pct:.1f}% "
-            f"(>= {self.abort_pct:.1f}%). Terminating subprocesses and "
-            "raising into main thread."
+        _logger.error(
+            "ABORT: system memory at %.1f%% (>= %.1f%%). Terminating "
+            "subprocesses and raising into main thread.",
+            pct,
+            self.abort_pct,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="host_memory",
-                event="abort",
-                log_path=self._snapshot_log_path,
-                used_pct=pct,
-                abort_pct=self.abort_pct,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="host_memory",
+            event="abort",
+            log_path=self._snapshot_log_path,
+            used_pct=pct,
+            abort_pct=self.abort_pct,
+        )
         # Best-effort GPU snapshot for postmortem analysis. Useful
         # even on host-RAM trips since RT-Sort / KS4 often hold
         # significant GPU state alongside their host buffers.
@@ -417,10 +491,28 @@ class HostMemoryWatchdog:
             pass
         self._terminate_registered()
         self._run_kill_callbacks()
+        # If __exit__ ran while we were mid-cascade (terminate +
+        # grace + callbacks can take several seconds), the with-block
+        # has already torn down. Sending interrupt_main() now would
+        # land a phantom KeyboardInterrupt in whatever code is running
+        # next — the next sort, an exception handler, or the
+        # interactive prompt. Skip it.
+        if self._stop_event.is_set():
+            _logger.info(
+                "suppressing interrupt_main: watchdog is already exiting."
+            )
+            return
         try:
             _thread.interrupt_main()
         except Exception as exc:
-            print(f"[host memory watchdog] failed to interrupt main: {exc}")
+            self._interrupt_main_failed = True
+            _logger.error("failed to interrupt main: %s", exc)
+            append_audit_event(
+                watchdog="host_memory",
+                event="interrupt_delivery_failed",
+                log_path=self._snapshot_log_path,
+                error=repr(exc),
+            )
 
     def _run_kill_callbacks(self) -> None:
         """Invoke every registered kill callback; isolate failures."""
@@ -430,10 +522,7 @@ class HostMemoryWatchdog:
             try:
                 cb()
             except Exception as exc:
-                print(
-                    f"[host memory watchdog] kill_callback raised: {exc!r}; "
-                    "continuing."
-                )
+                _logger.error("kill_callback raised: %r; continuing.", exc)
 
     def _terminate_registered(self) -> None:
         """Best-effort terminate-then-kill of every registered subprocess."""
@@ -447,9 +536,10 @@ class HostMemoryWatchdog:
                 if popen.poll() is None:
                     popen.terminate()
             except Exception as exc:
-                print(
-                    f"[host memory watchdog] terminate() failed for pid="
-                    f"{getattr(popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "terminate() failed for pid=%s: %s",
+                    getattr(popen, "pid", "?"),
+                    exc,
                 )
 
         if entries:
@@ -460,12 +550,13 @@ class HostMemoryWatchdog:
             try:
                 if popen.poll() is None:
                     popen.kill()
-                    print(
-                        f"[host memory watchdog] killed pid="
-                        f"{getattr(popen, 'pid', '?')} (terminate ignored)."
+                    _logger.warning(
+                        "killed pid=%s (terminate ignored).",
+                        getattr(popen, "pid", "?"),
                     )
             except Exception as exc:
-                print(
-                    f"[host memory watchdog] kill() failed for pid="
-                    f"{getattr(popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "kill() failed for pid=%s: %s",
+                    getattr(popen, "pid", "?"),
+                    exc,
                 )

@@ -53,6 +53,35 @@ def _block_imports(monkeypatch, *names):
     monkeypatch.setattr(builtins, "__import__", _patched_import)
 
 
+def _set_present_modules(monkeypatch, *names):
+    """Patch ``importlib.util.find_spec`` to report *names* as importable.
+
+    The RT-Sort dependency loop in ``_check_rt_sort`` uses
+    ``importlib.util.find_spec`` to check for module presence
+    without triggering import side effects (notably torch's lazy
+    CUDA init). This helper makes the listed module names look
+    importable to that probe; modules NOT in *names* return None
+    (treated as missing).
+    """
+    import importlib.util as _importutil
+
+    present = set(names)
+    real_find_spec = _importutil.find_spec
+
+    def _fake_find_spec(name, package=None):
+        if name in present:
+            return _importutil.spec_from_loader(name, loader=None)
+        # Defer to the real implementation for unrelated names so
+        # reentrant calls (e.g. nested imports inside test helpers)
+        # still work correctly.
+        try:
+            return real_find_spec(name, package)
+        except (ImportError, ValueError):
+            return None
+
+    monkeypatch.setattr(_importutil, "find_spec", _fake_find_spec)
+
+
 def _make_cfg(
     *,
     sorter_name: str = "kilosort2",
@@ -415,16 +444,17 @@ class TestCheckRtSort:
         an additional fail finding.
 
         Tests:
-            (Test Case 1) Inject a fake torch with
-                cuda.is_available() == False; assert the
-                cuda-specific finding is present.
+            (Test Case 1) Mark deps as present via ``find_spec``,
+                inject a fake torch with cuda.is_available() == False
+                via sys.modules; assert the cuda-specific finding is
+                present.
         """
+        _set_present_modules(monkeypatch, "torch", "diptest", "sklearn", "h5py", "tqdm")
+        # The cuda branch does ``import torch`` + .cuda.is_available(),
+        # so the actual torch module still needs to be reachable.
         fake_cuda = SimpleNamespace(is_available=lambda: False)
         fake_torch = SimpleNamespace(cuda=fake_cuda)
         monkeypatch.setitem(sys.modules, "torch", fake_torch)
-        # Provide stubs so the other required imports succeed.
-        for name in ("diptest", "sklearn", "h5py", "tqdm"):
-            monkeypatch.setitem(sys.modules, name, SimpleNamespace())
 
         cfg = _make_cfg(sorter_name="rt_sort", rt_device="cuda:0")
         findings = preflight_mod._check_rt_sort(cfg)
@@ -439,14 +469,10 @@ class TestCheckRtSort:
         All required imports succeed and device='cpu' → no findings.
 
         Tests:
-            (Test Case 1) Stub torch + diptest + sklearn + h5py + tqdm
-                in sys.modules; rt_device='cpu' skips the cuda check.
+            (Test Case 1) Mark every required module as present via
+                ``find_spec``; rt_device='cpu' skips the cuda check.
         """
-        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-        for name in ("diptest", "sklearn", "h5py", "tqdm"):
-            monkeypatch.setitem(sys.modules, name, SimpleNamespace())
-
+        _set_present_modules(monkeypatch, "torch", "diptest", "sklearn", "h5py", "tqdm")
         cfg = _make_cfg(sorter_name="rt_sort", rt_device="cpu")
         assert preflight_mod._check_rt_sort(cfg) == []
 
@@ -1157,3 +1183,130 @@ class TestSpikeInterfaceVersionCheck:
                 assert finding is not None
                 assert finding.level == "warn"
                 assert finding.code == "spikeinterface_version_outside_tested_range"
+
+    def test_si_not_installed_returns_none(self, monkeypatch):
+        """
+        ImportError on ``import spikeinterface`` is silently swallowed
+        — the relevant sort backend will fail later with a clearer
+        message, so preflight stays quiet.
+
+        Tests:
+            (Test Case 1) Patched ``__import__`` blocks
+                ``spikeinterface`` → returns ``None``.
+        """
+        monkeypatch.delitem(sys.modules, "spikeinterface", raising=False)
+        _block_imports(monkeypatch, "spikeinterface")
+        assert preflight_mod._check_spikeinterface_version() is None
+
+    def test_missing_dunder_version_returns_none(self):
+        """
+        A spikeinterface module without ``__version__`` returns
+        ``None`` rather than raising — distros that ship SI without a
+        populated version attribute bypass the check silently.
+
+        Tests:
+            (Test Case 1) Stub SI module lacking ``__version__`` →
+                returns ``None``.
+        """
+        fake_si = SimpleNamespace()  # No __version__ attribute.
+        with mock.patch.dict(sys.modules, {"spikeinterface": fake_si}):
+            assert preflight_mod._check_spikeinterface_version() is None
+
+    def test_unparseable_version_returns_none(self):
+        """
+        A version string ``_parse_version`` cannot decode is treated
+        as "do not flag" — the check refuses to guess.
+
+        Tests:
+            (Test Case 1) ``__version__="not-a-version"`` → returns
+                ``None``.
+        """
+        fake_si = SimpleNamespace(__version__="not-a-version")
+        with mock.patch.dict(sys.modules, {"spikeinterface": fake_si}):
+            assert preflight_mod._check_spikeinterface_version() is None
+
+
+class TestDetectGpuDeviceCountExtra:
+    """``_detect_gpu_device_count`` torch-no-cuda + nvidia-smi parse edges."""
+
+    def test_torch_available_but_cuda_unavailable_falls_through(
+        self, monkeypatch
+    ):
+        """
+        With pynvml absent and torch importable but
+        ``cuda.is_available()`` False, the helper falls through to the
+        nvidia-smi path rather than returning torch's device count
+        (which would be misleading at zero on a host without CUDA).
+
+        Tests:
+            (Test Case 1) Patched torch reports cuda unavailable;
+                ``check_output`` returns ``"3\\n"`` → final count is 3
+                (came from nvidia-smi, not torch).
+        """
+        monkeypatch.delitem(sys.modules, "pynvml", raising=False)
+        _block_imports(monkeypatch, "pynvml")
+
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: False,
+                device_count=lambda: 999,  # Should be ignored.
+            )
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setattr(
+            preflight_mod.subprocess,
+            "check_output",
+            lambda *a, **k: "3\n",
+        )
+        assert preflight_mod._detect_gpu_device_count() == 3
+
+    def test_malformed_nvidia_smi_lines_skipped(self, monkeypatch):
+        """
+        ``nvidia-smi --query-gpu=count`` output containing non-integer
+        lines is skipped; the first integer-parsable line wins.
+
+        Tests:
+            (Test Case 1) Mixed garbage + valid lines → returns the
+                first valid integer.
+            (Test Case 2) All-garbage output → returns ``None``.
+        """
+        monkeypatch.delitem(sys.modules, "pynvml", raising=False)
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        _block_imports(monkeypatch, "pynvml", "torch")
+
+        monkeypatch.setattr(
+            preflight_mod.subprocess,
+            "check_output",
+            lambda *a, **k: "garbage\n2\n3\n",
+        )
+        assert preflight_mod._detect_gpu_device_count() == 2
+
+        monkeypatch.setattr(
+            preflight_mod.subprocess,
+            "check_output",
+            lambda *a, **k: "garbage\nmore garbage\n",
+        )
+        assert preflight_mod._detect_gpu_device_count() is None
+
+
+class TestCheckRtSortHappyCuda:
+    """``_check_rt_sort`` happy path on cuda device with all imports present."""
+
+    def test_all_present_cuda_available_yields_empty(self, monkeypatch):
+        """
+        With every required dep importable and torch reporting cuda
+        available, a ``cuda:1`` device produces no findings.
+
+        Tests:
+            (Test Case 1) Mark deps present via ``find_spec``; stub
+                torch in sys.modules so the cuda branch's ``import
+                torch`` resolves; rt_device='cuda:1' yields ``[]``.
+        """
+        _set_present_modules(monkeypatch, "torch", "diptest", "sklearn", "h5py", "tqdm")
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: True)
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        cfg = _make_cfg(sorter_name="rt_sort", rt_device="cuda:1")
+        assert preflight_mod._check_rt_sort(cfg) == []

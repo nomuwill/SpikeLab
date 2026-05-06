@@ -575,3 +575,21 @@ class HostMemoryWatchdogError(ResourceSortFailure):
         super().__init__(message)
         self.percent_at_trip = percent_at_trip
         self.abort_pct = abort_pct
+
+
+# ----------------------------------------------------------------------
+# Classified-failure registry
+# ----------------------------------------------------------------------
+
+# The four top-level branches of the classified-failure hierarchy.
+# Callers that want to re-raise classified failures (e.g. the canary
+# in :mod:`spikelab.spike_sorting.canary`) should reference this tuple
+# directly rather than redefining their own copy — adding a new
+# top-level classified failure should only require updating this
+# one spot.
+CLASSIFIED_FAILURES: tuple = (
+    InsufficientActivityError,
+    BiologicalSortFailure,
+    EnvironmentSortFailure,
+    ResourceSortFailure,
+)

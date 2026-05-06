@@ -22,10 +22,13 @@ raising.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
+
+_logger = logging.getLogger(__name__)
 
 
 def _detect_cgroup_v2_memory_max() -> Optional[Path]:
@@ -121,8 +124,8 @@ def linux_cgroup_v2_memory_cap(frac: float = 0.8) -> Iterator[bool]:
 
     ram_bytes = _read_total_ram_bytes()
     if ram_bytes is None or ram_bytes <= 0:
-        print(
-            "[cgroup cap] cgroup v2 memory.max writable but host RAM not "
+        _logger.warning(
+            "cgroup v2 memory.max writable but host RAM not "
             "detectable; cap not enforced."
         )
         yield False
@@ -133,21 +136,23 @@ def linux_cgroup_v2_memory_cap(frac: float = 0.8) -> Iterator[bool]:
     try:
         prev = target.read_text().strip()
     except OSError as exc:
-        print(f"[cgroup cap] could not read existing memory.max: {exc!r}")
+        _logger.warning("could not read existing memory.max: %r", exc)
         yield False
         return
 
     try:
         target.write_text(str(cap_bytes))
     except OSError as exc:
-        print(f"[cgroup cap] failed to set memory.max: {exc!r}")
+        _logger.warning("failed to set memory.max: %r", exc)
         yield False
         return
 
-    print(
-        f"[cgroup cap] active: memory.max = {cap_bytes / 1e9:.1f} GB "
-        f"(= {frac * 100:.0f}% of {ram_bytes / 1e9:.1f} GB host RAM, "
-        f"cgroup v2)."
+    _logger.info(
+        "active: memory.max = %.1f GB (= %.0f%% of %.1f GB host RAM, "
+        "cgroup v2).",
+        cap_bytes / 1e9,
+        frac * 100,
+        ram_bytes / 1e9,
     )
 
     try:

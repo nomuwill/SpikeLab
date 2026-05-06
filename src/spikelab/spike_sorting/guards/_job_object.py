@@ -27,8 +27,11 @@ fraction of host RAM.
 from __future__ import annotations
 
 import contextlib
+import logging
 import sys
 from typing import Iterator, Optional
+
+_logger = logging.getLogger(__name__)
 
 
 def _get_total_ram_bytes() -> Optional[int]:
@@ -78,7 +81,7 @@ def windows_job_object_cap(frac: float = 0.8) -> Iterator[bool]:
 
     ram_bytes = _get_total_ram_bytes()
     if ram_bytes is None or ram_bytes <= 0:
-        print("[job object] could not detect host RAM; cap not enforced.")
+        _logger.warning("could not detect host RAM; cap not enforced.")
         yield False
         return
 
@@ -89,9 +92,9 @@ def windows_job_object_cap(frac: float = 0.8) -> Iterator[bool]:
         import win32api  # noqa: WPS433
         import win32con  # noqa: WPS433
     except ImportError:
-        print(
-            "[job object] pywin32 not installed; Windows Job Object cap "
-            "is unavailable. Install pywin32 to enable the kernel-"
+        _logger.warning(
+            "pywin32 not installed; Windows Job Object cap is "
+            "unavailable. Install pywin32 to enable the kernel-"
             "enforced memory cap (the userspace watchdog still works)."
         )
         yield False
@@ -118,12 +121,18 @@ def windows_job_object_cap(frac: float = 0.8) -> Iterator[bool]:
         win32job.SetInformationJobObject(
             job, win32job.JobObjectExtendedLimitInformation, info
         )
-        print(
-            f"[job object] active: cap = {cap_bytes / 1e9:.1f} GB "
-            f"(= {frac * 100:.0f}% of {ram_bytes / 1e9:.1f} GB host RAM)."
+        _logger.info(
+            "active: cap = %.1f GB (= %.0f%% of %.1f GB host RAM).",
+            cap_bytes / 1e9,
+            frac * 100,
+            ram_bytes / 1e9,
         )
     except Exception as exc:
-        print(f"[job object] failed to install cap: {exc!r}")
+        _logger.error("failed to install cap: %r", exc)
+        # Early-return path: no Job Object handle was successfully
+        # created (or AssignProcessToJobObject failed), so there is
+        # nothing to close. The yield-False; return is intentional
+        # and does not leak handles.
         yield False
         return
 
@@ -132,7 +141,12 @@ def windows_job_object_cap(frac: float = 0.8) -> Iterator[bool]:
     finally:
         # Releasing the Job Object handle destroys the object and
         # detaches the process. Best-effort cleanup; failures are
-        # cosmetic since process exit cleans up regardless.
+        # cosmetic for short-lived sort processes since process exit
+        # cleans up regardless. In long-running analysis loops that
+        # invoke this context manager many times, repeated CloseHandle
+        # failures could accumulate Job Object handles until process
+        # exit — operators running such loops should monitor handle
+        # counts via Process Explorer / handle.exe.
         try:
             win32api.CloseHandle(job)
         except Exception:

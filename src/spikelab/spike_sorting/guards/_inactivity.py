@@ -37,6 +37,7 @@ from __future__ import annotations
 import _thread
 import contextlib
 import contextvars
+import logging
 import math
 import os
 import subprocess
@@ -46,6 +47,9 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from .._exceptions import SorterTimeoutError
+from ._audit import append_audit_event
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Active-log-path discovery
@@ -176,23 +180,35 @@ def make_in_process_kill_callback(
           inline) lets each backend customise the grace period without
           forking the watchdog.
     """
+    # Validate at construction so a misconfigured grace surfaces early
+    # rather than during the trip cascade — a negative ``time.sleep``
+    # inside the callback would raise into the watchdog's outer except
+    # handler and disable the ``os._exit`` fallback.
+    if interrupt_grace_s < 0.0:
+        raise ValueError(
+            f"interrupt_grace_s must be non-negative, got {interrupt_grace_s}."
+        )
 
     def _callback() -> None:
         try:
             _thread.interrupt_main()
         except Exception as exc:
-            print(
-                f"[inactivity watchdog] interrupt_main failed for " f"{sorter}: {exc}"
-            )
+            _logger.error("interrupt_main failed for %s: %s", sorter, exc)
         # Sleep on a fresh thread is fine here: the watchdog already
         # runs on its own daemon thread, so sleeping does not block
-        # anyone.
+        # anyone. ``time.sleep`` (not ``Event.wait``) is intentional
+        # — this is the nuclear-fallback grace period; once the
+        # cascade has started we want it to complete even if the
+        # watchdog's own ``__exit__`` runs concurrently. An
+        # ``Event.wait`` would let an external "stop" signal cancel
+        # the ``os._exit`` and leave the hung sort alive.
         time.sleep(float(interrupt_grace_s))
-        print(
-            f"[inactivity watchdog] {sorter} did not respond to "
-            f"interrupt_main within {interrupt_grace_s:.1f}s — escalating "
-            "to os._exit(1) to free OS resources. Per-recording pickles "
-            "already on disk are unaffected."
+        _logger.error(
+            "%s did not respond to interrupt_main within %.1fs — "
+            "escalating to os._exit(1) to free OS resources. "
+            "Per-recording pickles already on disk are unaffected.",
+            sorter,
+            interrupt_grace_s,
         )
         os._exit(1)
 
@@ -277,10 +293,10 @@ class LogInactivityWatchdog:
             :func:`make_in_process_kill_callback`.
 
     Notes:
-        - When ``inactivity_s`` is ``None`` / non-positive, OR when
-          neither ``popen`` nor ``kill_callback`` is provided, the
-          watchdog is a no-op context manager. This makes it safe to
-          drop in unconditionally.
+        - When ``inactivity_s`` is ``None``, OR when neither ``popen``
+          nor ``kill_callback`` is provided, the watchdog is a no-op
+          context manager. This makes it safe to drop in
+          unconditionally — pass ``inactivity_s=None`` to disable.
         - The watchdog only trips once. After trip, the polling
           thread exits.
     """
@@ -296,11 +312,21 @@ class LogInactivityWatchdog:
         kill_grace_s: float = 5.0,
         kill_callback: Optional[Callable[[], None]] = None,
     ) -> None:
+        if inactivity_s is not None and inactivity_s <= 0.0:
+            raise ValueError(
+                f"inactivity_s must be positive or None, got {inactivity_s}."
+            )
+        if poll_interval_s <= 0.0:
+            raise ValueError(
+                f"poll_interval_s must be positive, got {poll_interval_s}."
+            )
+        if kill_grace_s < 0.0:
+            raise ValueError(
+                f"kill_grace_s must be non-negative, got {kill_grace_s}."
+            )
         self.log_path = Path(log_path)
         self.popen = popen
-        self.inactivity_s = (
-            None if inactivity_s is None or inactivity_s <= 0 else float(inactivity_s)
-        )
+        self.inactivity_s = float(inactivity_s) if inactivity_s is not None else None
         self.sorter = sorter
         self.poll_interval_s = float(poll_interval_s)
         self.kill_grace_s = float(kill_grace_s)
@@ -314,8 +340,8 @@ class LogInactivityWatchdog:
         self._inactivity_at_trip: Optional[float] = None
         # Disabled when there is no timeout to enforce, or when there
         # is no kill target at all (neither a subprocess nor a
-        # callback). The first three combinations make the watchdog
-        # a no-op.
+        # callback). Either condition makes the watchdog a no-op
+        # context manager.
         has_kill_target = (self.popen is not None) or (self.kill_callback is not None)
         self._enabled = self.inactivity_s is not None and has_kill_target
 
@@ -366,11 +392,12 @@ class LogInactivityWatchdog:
         else:
             self._last_seen_mtime = None
             self._last_seen_size = None
-        print(
-            f"[inactivity watchdog] active: sorter={self.sorter} "
-            f"tolerance={self.inactivity_s:.1f}s "
-            f"poll={self.poll_interval_s:.1f}s "
-            f"log={self.log_path}"
+        _logger.info(
+            "active: sorter=%s tolerance=%.1fs poll=%.1fs log=%s",
+            self.sorter,
+            self.inactivity_s,
+            self.poll_interval_s,
+            self.log_path,
         )
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -411,6 +438,7 @@ class LogInactivityWatchdog:
         # after the configured tolerance.
         last_progress_t = time.time()
         seen_any = self._last_seen_mtime is not None
+        lost_warned = False
 
         while not self._stop_event.is_set():
             signals = self._read_signals()
@@ -432,6 +460,28 @@ class LogInactivityWatchdog:
                     self._last_seen_mtime = cur_mtime
                     self._last_seen_size = cur_size
                     last_progress_t = now
+                # Recovered after a previous lost-file episode.
+                lost_warned = False
+            elif seen_any:
+                # The log file disappeared after we'd seen it (external
+                # log rotation, manual cleanup). Without this branch
+                # the inactivity clock keeps growing and the watchdog
+                # falsely trips on what is actually a "log file gone"
+                # condition. Reset the clock so a healthy sort whose
+                # log was rotated does not get killed; warn once so
+                # the operator knows progress signals are unreliable
+                # for the duration.
+                last_progress_t = now
+                if not lost_warned:
+                    _logger.warning(
+                        "log file %s disappeared while watchdog was "
+                        "active (likely external log rotation). "
+                        "Inactivity clock reset; watchdog is blind to "
+                        "log-progress signals until the file is "
+                        "recreated.",
+                        self.log_path,
+                    )
+                    lost_warned = True
 
             inactivity = now - last_progress_t
             if inactivity >= self.inactivity_s:
@@ -444,45 +494,44 @@ class LogInactivityWatchdog:
         """Record trip state, terminate any subprocess, then run the callback."""
         self._tripped = True
         self._inactivity_at_trip = inactivity_s
-        print(
-            f"[inactivity watchdog] TRIP: {self.sorter} log idle for "
-            f"{inactivity_s:.1f}s (tolerance: {self.inactivity_s:.1f}s)."
+        _logger.error(
+            "TRIP: %s log idle for %.1fs (tolerance: %.1fs).",
+            self.sorter,
+            inactivity_s,
+            self.inactivity_s,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="inactivity",
-                event="abort",
-                log_path=self.log_path,
-                sorter=self.sorter,
-                inactivity_s=inactivity_s,
-                tolerance_s=self.inactivity_s,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="inactivity",
+            event="abort",
+            log_path=self.log_path,
+            sorter=self.sorter,
+            inactivity_s=inactivity_s,
+            tolerance_s=self.inactivity_s,
+        )
 
         if self.popen is not None:
             try:
                 if self.popen.poll() is None:
                     self.popen.terminate()
             except Exception as exc:
-                print(
-                    f"[inactivity watchdog] terminate() failed for pid="
-                    f"{getattr(self.popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "terminate() failed for pid=%s: %s",
+                    getattr(self.popen, "pid", "?"),
+                    exc,
                 )
             time.sleep(self.kill_grace_s)
             try:
                 if self.popen.poll() is None:
                     self.popen.kill()
-                    print(
-                        f"[inactivity watchdog] killed pid="
-                        f"{getattr(self.popen, 'pid', '?')} (terminate ignored)."
+                    _logger.warning(
+                        "killed pid=%s (terminate ignored).",
+                        getattr(self.popen, "pid", "?"),
                     )
             except Exception as exc:
-                print(
-                    f"[inactivity watchdog] kill() failed for pid="
-                    f"{getattr(self.popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "kill() failed for pid=%s: %s",
+                    getattr(self.popen, "pid", "?"),
+                    exc,
                 )
 
         if self.kill_callback is not None:
@@ -495,7 +544,4 @@ class LogInactivityWatchdog:
                 # surfaces here as KeyboardInterrupt — both must propagate.
                 raise
             except Exception as exc:
-                print(
-                    f"[inactivity watchdog] kill_callback raised: {exc!r}; "
-                    "continuing."
-                )
+                _logger.error("kill_callback raised: %r; continuing.", exc)

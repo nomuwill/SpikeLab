@@ -28,9 +28,12 @@ raising.
 from __future__ import annotations
 
 import contextlib
+import logging
 import subprocess
 import sys
 from typing import Iterator, Optional
+
+_logger = logging.getLogger(__name__)
 
 # Windows API constants — defined here to avoid the ctypes import
 # on non-Windows hosts.
@@ -81,29 +84,47 @@ def _prevent_sleep_windows() -> Iterator[bool]:
 
     flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_AWAYMODE_REQUIRED
 
+    # Bind kernel32 explicitly to None before the inner try so the
+    # outer finally never references an unbound name. Previously the
+    # finally relied on a broad ``except Exception`` to mask a
+    # potential ``UnboundLocalError`` if ``ctypes.windll.kernel32``
+    # raised before assignment (ctypes stub on WSL/Wine).
+    kernel32 = None
+    active = False
     try:
         kernel32 = ctypes.windll.kernel32
         prev = kernel32.SetThreadExecutionState(flags)
         if prev == 0:
-            print(
-                "[power state] SetThreadExecutionState returned 0; "
-                "treating sleep prevention as active but the OS may "
-                "not have honoured the request."
+            # MSDN: SetThreadExecutionState returns 0 on failure.
+            # Previously we logged a warning but yielded True, which
+            # told the operator "sleep prevented" when it wasn't.
+            # Yield False so the caller's status check matches reality.
+            _logger.warning(
+                "SetThreadExecutionState returned 0; sleep prevention "
+                "did NOT take effect. Yielding False so the caller "
+                "knows the OS rejected the request."
             )
+            active = False
         else:
-            print("[power state] active (Windows): system sleep prevented.")
+            _logger.info("active (Windows): system sleep prevented.")
+            active = True
     except Exception as exc:
-        print(f"[power state] failed to engage sleep prevention: {exc!r}")
+        _logger.warning("failed to engage sleep prevention: %r", exc)
         yield False
         return
 
     try:
-        yield True
+        yield active
     finally:
-        try:
-            kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
-        except Exception:
-            pass
+        if kernel32 is not None and active:
+            # Only attempt the clear if we successfully engaged in
+            # the first place. If the original call returned 0,
+            # there is nothing to clear and a redundant call risks
+            # the same failure mode.
+            try:
+                kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+            except Exception:
+                pass
 
 
 def _spawn_inhibitor(argv: list, label: str) -> Optional[subprocess.Popen]:
@@ -116,10 +137,10 @@ def _spawn_inhibitor(argv: list, label: str) -> Optional[subprocess.Popen]:
             stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        print(f"[power state] {label} not found; sleep prevention " "unavailable.")
+        _logger.warning("%s not found; sleep prevention unavailable.", label)
         return None
     except Exception as exc:
-        print(f"[power state] failed to spawn {label}: {exc!r}")
+        _logger.warning("failed to spawn %s: %r", label, exc)
         return None
 
 
@@ -150,18 +171,22 @@ def _prevent_sleep_macos() -> Iterator[bool]:
     if proc is None:
         yield False
         return
-    print("[power state] active (macOS): caffeinate -dims engaged.")
+    _logger.info("active (macOS): caffeinate -dims engaged.")
     try:
         yield True
     finally:
         _terminate_inhibitor(proc, "caffeinate")
 
 
-def _prevent_sleep_linux() -> Iterator[bool]:
-    # ``systemd-inhibit`` holds the lock for the lifetime of its
-    # child command; ``sleep infinity`` is the canonical "stay
-    # alive until killed" placeholder.
-    proc = _spawn_inhibitor(
+# Linux inhibitor candidates tried in order. ``systemd-inhibit`` is
+# preferred (most precise: blocks specifically sleep/idle); on
+# non-systemd inits we fall back to softer tools that prevent
+# screensaver / display sleep at the session level. None of the
+# fallbacks blocks system suspend with the precision of
+# ``systemd-inhibit``, but each prevents the most common
+# sort-killer scenarios on its respective stack.
+_LINUX_INHIBITOR_CANDIDATES = (
+    (
         [
             "systemd-inhibit",
             "--what=sleep:idle",
@@ -172,12 +197,53 @@ def _prevent_sleep_linux() -> Iterator[bool]:
             "infinity",
         ],
         "systemd-inhibit",
-    )
+    ),
+    (
+        [
+            "xdg-screensaver",
+            "suspend",
+            # xdg-screensaver requires an X11 window ID. It accepts
+            # the literal "0" to refer to the root window when a
+            # session is present; on headless / Wayland-only hosts
+            # the spawn just exits with a non-zero status which we
+            # treat as "no inhibitor available".
+            "0",
+        ],
+        "xdg-screensaver",
+    ),
+    (
+        [
+            "dbus-send",
+            "--session",
+            "--dest=org.freedesktop.ScreenSaver",
+            "--type=method_call",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver.SimulateUserActivity",
+        ],
+        "dbus-send",
+    ),
+)
+
+
+def _prevent_sleep_linux() -> Iterator[bool]:
+    # ``systemd-inhibit`` holds the lock for the lifetime of its
+    # child command; ``sleep infinity`` is the canonical "stay
+    # alive until killed" placeholder. On non-systemd Linux we
+    # walk the candidate list above until one spawns successfully.
+    proc = None
+    label = ""
+    for argv, candidate_label in _LINUX_INHIBITOR_CANDIDATES:
+        spawned = _spawn_inhibitor(argv, candidate_label)
+        if spawned is not None:
+            proc = spawned
+            label = candidate_label
+            break
+
     if proc is None:
         yield False
         return
-    print("[power state] active (Linux): systemd-inhibit engaged.")
+    _logger.info("active (Linux): %s engaged.", label)
     try:
         yield True
     finally:
-        _terminate_inhibitor(proc, "systemd-inhibit")
+        _terminate_inhibitor(proc, label)

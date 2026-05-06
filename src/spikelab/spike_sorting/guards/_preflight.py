@@ -17,6 +17,8 @@ flips ``"warn"`` findings into ``"fail"`` for stricter deployments.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
 import os
 import re
@@ -26,6 +28,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+_logger = logging.getLogger(__name__)
 
 from .._exceptions import (
     EnvironmentSortFailure,
@@ -59,6 +63,44 @@ class PreflightFinding:
 _GB = 1024**3
 
 
+@contextlib.contextmanager
+def _with_pynvml():
+    """Yield the pynvml module after ``nvmlInit()`` and call ``nvmlShutdown`` on exit.
+
+    Centralises the init / shutdown lifecycle so callers do not
+    independently re-implement the per-call pattern. The helper
+    yields ``None`` when pynvml is missing or initialisation fails;
+    callers branch on that and fall back to alternative detection
+    (``nvidia-smi``, ``torch.cuda``).
+
+    Exceptions raised inside the with-block propagate; the
+    ``finally`` always runs ``nvmlShutdown`` so the NVML context
+    is never leaked even when ``nvmlDeviceGetMemoryInfo`` (or
+    similar) raises with the handle still open.
+
+    Yields:
+        pynvml (module or None): The imported and initialised
+            pynvml module, or ``None`` when unavailable.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        yield None
+        return
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        yield None
+        return
+    try:
+        yield pynvml
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
 def _disk_free_gb(path: Path) -> Optional[float]:
     """Return free disk space in GB at *path*'s nearest existing parent."""
     p = Path(path)
@@ -83,25 +125,26 @@ def _available_ram_gb() -> Optional[float]:
 def _free_vram_gb() -> Optional[float]:
     """Return free GPU memory (sum across devices) in GB.
 
-    Tries ``pynvml`` first, falls back to parsing ``nvidia-smi``. Returns
-    ``None`` when no GPU/driver is detectable.
+    Tries ``pynvml`` first via :func:`_with_pynvml` (which guarantees
+    ``nvmlShutdown`` runs even when a per-device read raises mid-loop),
+    falls back to parsing ``nvidia-smi``. Returns ``None`` when no
+    GPU/driver is detectable.
     """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            count = pynvml.nvmlDeviceGetCount()
-            free_total = 0
-            for i in range(count):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                free_total += info.free
-            return free_total / _GB
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
+    with _with_pynvml() as pynvml:
+        if pynvml is not None:
+            try:
+                count = pynvml.nvmlDeviceGetCount()
+                free_total = 0
+                for i in range(count):
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    free_total += info.free
+                return free_total / _GB
+            except Exception:
+                # ``_with_pynvml`` finally still runs ``nvmlShutdown``
+                # even though we swallow this exception; the handle is
+                # not leaked.
+                pass
 
     try:
         out = subprocess.check_output(
@@ -222,6 +265,16 @@ def _rt_sort_disk_finding(
     only know the path — to keep the check cheap we accept that the
     estimate is ``None`` for inputs given as paths/strings instead of
     pre-loaded recordings).
+
+    Notes:
+        - Compares the *largest* single-recording estimate against the
+          *smallest* free-disk among intermediate folders. This is
+          correct only when each intermediate folder hosts at most
+          one recording at a time. If multiple recordings share an
+          intermediate volume, the cumulative footprint may still
+          exceed free disk while no individual recording does — a
+          per-volume sum would be more precise but is left as a
+          future enhancement.
     """
     if getattr(config.sorter, "sorter_name", "").lower() != "rt_sort":
         return None
@@ -456,8 +509,79 @@ def _validate_recording_inputs(
     return findings
 
 
-_TESTED_SI_VERSION_RANGE = ("0.100.0", "0.110.0")
-_TESTED_KILOSORT4_VERSION_RANGE = ("4.0.0", "5.0.0")
+# Hard-coded fallbacks used when ``pyproject.toml`` cannot be
+# located (installed package may not ship its own pyproject) or
+# when the ``[tool.spikelab.tested_versions]`` section is missing.
+_FALLBACK_TESTED_SI_VERSION_RANGE = ("0.100.0", "0.110.0")
+_FALLBACK_TESTED_KILOSORT4_VERSION_RANGE = ("4.0.0", "5.0.0")
+
+
+def _load_tested_version_ranges() -> Tuple[Tuple[str, str], Tuple[str, str]]:
+    """Return ``(si_range, ks4_range)`` sourced from pyproject.toml when available.
+
+    Walks parents from this module's location to find the project
+    root's ``pyproject.toml`` and reads
+    ``[tool.spikelab.tested_versions]``. Falls back to the
+    hard-coded constants when the file is not accessible (installed
+    package, frozen wheel, etc.) or the section is missing — keeps
+    the version-range source-of-truth aligned with the dependency
+    pins without breaking installs that don't ship pyproject.toml.
+
+    Returns:
+        ranges (tuple): ``((si_low, si_high), (ks4_low, ks4_high))``
+            of dotted version strings.
+    """
+    try:
+        import tomllib  # type: ignore[import-not-found]  # py311+
+    except ImportError:
+        try:
+            import tomli as tomllib  # type: ignore[import-not-found]
+        except ImportError:
+            return (
+                _FALLBACK_TESTED_SI_VERSION_RANGE,
+                _FALLBACK_TESTED_KILOSORT4_VERSION_RANGE,
+            )
+
+    # Walk up from this file looking for pyproject.toml — the
+    # source layout is ``SpikeLab/src/spikelab/spike_sorting/guards/_preflight.py``
+    # and the pyproject lives at ``SpikeLab/pyproject.toml``.
+    here = Path(__file__).resolve()
+    for ancestor in [here, *here.parents]:
+        candidate = ancestor.parent / "pyproject.toml"
+        if candidate.is_file():
+            try:
+                with open(candidate, "rb") as f:
+                    data = tomllib.load(f)
+            except Exception:
+                break
+            tested = (
+                data.get("tool", {})
+                .get("spikelab", {})
+                .get("tested_versions", {})
+            )
+            si = tested.get("spikeinterface")
+            ks4 = tested.get("kilosort4")
+            si_range = (
+                tuple(si)
+                if isinstance(si, list) and len(si) == 2
+                else _FALLBACK_TESTED_SI_VERSION_RANGE
+            )
+            ks4_range = (
+                tuple(ks4)
+                if isinstance(ks4, list) and len(ks4) == 2
+                else _FALLBACK_TESTED_KILOSORT4_VERSION_RANGE
+            )
+            return si_range, ks4_range  # type: ignore[return-value]
+
+    return (
+        _FALLBACK_TESTED_SI_VERSION_RANGE,
+        _FALLBACK_TESTED_KILOSORT4_VERSION_RANGE,
+    )
+
+
+_TESTED_SI_VERSION_RANGE, _TESTED_KILOSORT4_VERSION_RANGE = (
+    _load_tested_version_ranges()
+)
 
 
 def _check_kilosort2_host(config: Any) -> List[PreflightFinding]:
@@ -473,7 +597,10 @@ def _check_kilosort2_host(config: Any) -> List[PreflightFinding]:
 
     Returns:
         findings (list[PreflightFinding]): Up to two fail-level
-            findings (missing matlab, missing/invalid KILOSORT_PATH).
+            findings — one for missing ``matlab``, plus at most one
+            for the source directory (either ``KILOSORT_PATH`` is
+            unset, the configured directory does not exist, or the
+            directory exists but is missing ``master_kilosort.m``).
     """
     findings: List[PreflightFinding] = []
 
@@ -596,9 +723,9 @@ def _check_kilosort4_host(config: Any) -> List[PreflightFinding]:
     version = getattr(_ks4, "__version__", None)
     if version is None:
         return []
-    parsed = _parse_version_tuple(version)
-    low = _parse_version_tuple(_TESTED_KILOSORT4_VERSION_RANGE[0])
-    high = _parse_version_tuple(_TESTED_KILOSORT4_VERSION_RANGE[1])
+    parsed = _parse_version(version)
+    low = _parse_version(_TESTED_KILOSORT4_VERSION_RANGE[0])
+    high = _parse_version(_TESTED_KILOSORT4_VERSION_RANGE[1])
     if parsed is None or low is None or high is None:
         return []
     if low <= parsed < high:
@@ -623,6 +750,129 @@ def _check_kilosort4_host(config: Any) -> List[PreflightFinding]:
     ]
 
 
+def _ping_docker_daemon() -> Tuple[bool, Optional[PreflightFinding]]:
+    """Confirm the Docker daemon is reachable.
+
+    Tries the docker-py path first (when the package is installed),
+    falls back to the ``docker info`` subprocess. Either path returns
+    a ``(daemon_ok, finding)`` pair: ``daemon_ok`` is True only when
+    the daemon responded; ``finding`` is non-None only when a
+    fail-level finding should be surfaced.
+
+    Returns:
+        result (tuple): ``(daemon_ok, finding)``. The finding is
+            None on success.
+    """
+    try:
+        import docker as _docker  # type: ignore[import-not-found]
+
+        try:
+            _docker.from_env().ping()
+            return True, None
+        except Exception as exc:
+            return False, PreflightFinding(
+                level="fail",
+                code="sorter_dependency_missing",
+                category="environment",
+                message=f"Docker daemon ping failed via docker-py: {exc!r}.",
+                remediation=(
+                    "Start Docker Desktop / the docker service, or "
+                    "switch to a host-path sorter (set "
+                    "SorterConfig.use_docker=False)."
+                ),
+            )
+    except ImportError:
+        pass
+
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            check=True,
+            timeout=5,
+            capture_output=True,
+        )
+        return True, None
+    except (
+        subprocess.SubprocessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        return False, PreflightFinding(
+            level="fail",
+            code="sorter_dependency_missing",
+            category="environment",
+            message=(
+                f"Docker daemon is not reachable: `docker info` "
+                f"failed ({exc!r})."
+            ),
+            remediation=(
+                "Start Docker Desktop / the docker service, or "
+                "switch to a host-path sorter (set "
+                "SorterConfig.use_docker=False)."
+            ),
+        )
+
+
+def _check_image_cached(image_tag: str) -> bool:
+    """Return True when *image_tag* is in the local Docker image cache.
+
+    Mirrors the daemon-ping helper's docker-py-then-subprocess
+    fallback. Returns False on any failure mode (image missing,
+    docker subprocess error, timeout); the caller decides how to
+    surface that.
+    """
+    try:
+        import docker as _docker  # type: ignore[import-not-found]
+
+        try:
+            _docker.from_env().images.get(image_tag)
+            return True
+        except Exception:
+            return False
+    except ImportError:
+        pass
+
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", image_tag],
+            check=True,
+            timeout=5,
+            capture_output=True,
+        )
+        return True
+    except (
+        subprocess.SubprocessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+    ):
+        return False
+
+
+def _read_image_digest(image_tag: str) -> Optional[str]:
+    """Return the local image's RepoDigest, or None if unavailable.
+
+    Used to validate against ``config.execution.docker_image_expected_digest``
+    when digest pinning is configured. Returns None when docker-py
+    is not importable, when the image is missing, when no digests
+    are recorded for the local image, or on any other failure —
+    callers should treat None as "could not validate".
+    """
+    try:
+        import docker as _docker  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        image = _docker.from_env().images.get(image_tag)
+    except Exception:
+        return None
+    digests = getattr(image, "attrs", {}).get("RepoDigests") or []
+    if not digests:
+        return None
+    # Each entry is "repo@sha256:HEX"; return the first digest part.
+    first = digests[0]
+    return first.split("@", 1)[-1] if "@" in first else first
+
+
 def _check_docker_sorter(config: Any) -> List[PreflightFinding]:
     """Probe Docker-backed sorter dependencies (daemon + image cache).
 
@@ -634,67 +884,29 @@ def _check_docker_sorter(config: Any) -> List[PreflightFinding]:
     first use if the image is missing, but we surface a warn-level
     finding so the operator knows ahead of time.
 
+    When ``config.execution.docker_image_expected_digest`` is set,
+    the locally-cached image's RepoDigest is validated against the
+    pinned value — a mismatch is surfaced as a fail-level finding so
+    a tampered or accidentally-replaced image is caught before the
+    sort runs.
+
     Parameters:
-        config (SortingPipelineConfig): Pipeline configuration.
+        config (SortingPipelineConfig): Pipeline configuration. The
+            caller is expected to gate on ``use_docker=True`` —
+            ``get_docker_image`` may raise for sorters that have no
+            Docker image registered (e.g. ``"rt_sort"``) when
+            ``use_docker`` is False.
 
     Returns:
         findings (list[PreflightFinding]): Daemon failures are
-            ``level="fail"``; missing local image is ``level="warn"``.
+            ``level="fail"``; missing local image is ``level="warn"``;
+            digest mismatch is ``level="fail"``.
     """
     findings: List[PreflightFinding] = []
 
-    daemon_ok = False
-    try:
-        import docker as _docker  # type: ignore[import-not-found]
-
-        try:
-            _docker.from_env().ping()
-            daemon_ok = True
-        except Exception as exc:
-            findings.append(
-                PreflightFinding(
-                    level="fail",
-                    code="sorter_dependency_missing",
-                    category="environment",
-                    message=(f"Docker daemon ping failed via docker-py: " f"{exc!r}."),
-                    remediation=(
-                        "Start Docker Desktop / the docker service, or "
-                        "switch to a host-path sorter (set "
-                        "SorterConfig.use_docker=False)."
-                    ),
-                )
-            )
-    except ImportError:
-        try:
-            subprocess.run(
-                ["docker", "info"],
-                check=True,
-                timeout=5,
-                capture_output=True,
-            )
-            daemon_ok = True
-        except (
-            subprocess.SubprocessError,
-            FileNotFoundError,
-            subprocess.TimeoutExpired,
-        ) as exc:
-            findings.append(
-                PreflightFinding(
-                    level="fail",
-                    code="sorter_dependency_missing",
-                    category="environment",
-                    message=(
-                        f"Docker daemon is not reachable: `docker info` "
-                        f"failed ({exc!r})."
-                    ),
-                    remediation=(
-                        "Start Docker Desktop / the docker service, or "
-                        "switch to a host-path sorter (set "
-                        "SorterConfig.use_docker=False)."
-                    ),
-                )
-            )
-
+    daemon_ok, daemon_finding = _ping_docker_daemon()
+    if daemon_finding is not None:
+        findings.append(daemon_finding)
     if not daemon_ok:
         return findings
 
@@ -725,32 +937,7 @@ def _check_docker_sorter(config: Any) -> List[PreflightFinding]:
         )
         return findings
 
-    cached = False
-    try:
-        import docker as _docker  # type: ignore[import-not-found]
-
-        try:
-            _docker.from_env().images.get(image_tag)
-            cached = True
-        except Exception:
-            cached = False
-    except ImportError:
-        try:
-            subprocess.run(
-                ["docker", "image", "inspect", image_tag],
-                check=True,
-                timeout=5,
-                capture_output=True,
-            )
-            cached = True
-        except (
-            subprocess.SubprocessError,
-            FileNotFoundError,
-            subprocess.TimeoutExpired,
-        ):
-            cached = False
-
-    if not cached:
+    if not _check_image_cached(image_tag):
         findings.append(
             PreflightFinding(
                 level="warn",
@@ -769,6 +956,57 @@ def _check_docker_sorter(config: Any) -> List[PreflightFinding]:
                 ),
             )
         )
+        # Skip digest validation when the image isn't even cached;
+        # the warn above is the actionable finding.
+        return findings
+
+    execution = getattr(config, "execution", None)
+    expected_digest = (
+        getattr(execution, "docker_image_expected_digest", None)
+        if execution is not None
+        else None
+    )
+    if expected_digest:
+        actual_digest = _read_image_digest(image_tag)
+        if actual_digest is None:
+            findings.append(
+                PreflightFinding(
+                    level="warn",
+                    code="docker_image_digest_unverified",
+                    category="environment",
+                    message=(
+                        f"Docker image {image_tag!s} is cached locally "
+                        f"but its RepoDigest could not be read; "
+                        f"expected_digest pin "
+                        f"({expected_digest}) was not validated."
+                    ),
+                    remediation=(
+                        "Install docker-py (`pip install docker`) so "
+                        "preflight can read the image's RepoDigest, or "
+                        "drop ``docker_image_expected_digest`` from the "
+                        "config to silence the warning."
+                    ),
+                )
+            )
+        elif actual_digest != expected_digest:
+            findings.append(
+                PreflightFinding(
+                    level="fail",
+                    code="docker_image_digest_mismatch",
+                    category="environment",
+                    message=(
+                        f"Docker image {image_tag!s} digest "
+                        f"({actual_digest}) does not match the pinned "
+                        f"expected_digest ({expected_digest})."
+                    ),
+                    remediation=(
+                        "The locally-cached image has been replaced or "
+                        "tampered with. Re-pull the pinned tag, or "
+                        "update ``docker_image_expected_digest`` to "
+                        "the new digest if the change is intentional."
+                    ),
+                )
+            )
 
     return findings
 
@@ -792,6 +1030,7 @@ def _check_rt_sort(config: Any) -> List[PreflightFinding]:
             but ``torch.cuda.is_available()`` is False.
     """
     findings: List[PreflightFinding] = []
+    torch_missing = False
 
     required = [
         ("torch", "PyTorch — required for the DL detection model"),
@@ -800,10 +1039,26 @@ def _check_rt_sort(config: Any) -> List[PreflightFinding]:
         ("h5py", "intermediate scaled-traces I/O"),
         ("tqdm", "progress bars"),
     ]
+    # ``importlib.util.find_spec`` checks for importability without
+    # actually executing the module. Some optional deps (notably
+    # torch) perform lazy CUDA init at import time; ``__import__``
+    # would trigger that side effect just to confirm presence.
+    import importlib.util as _importutil
+
     for module_name, role in required:
         try:
-            __import__(module_name)
-        except ImportError as exc:
+            spec = _importutil.find_spec(module_name)
+        except (ImportError, ValueError) as exc:
+            spec = None
+            spec_error: Optional[BaseException] = exc
+        else:
+            spec_error = None
+        if spec is None:
+            if module_name == "torch":
+                torch_missing = True
+            reason = (
+                repr(spec_error) if spec_error is not None else "module not found"
+            )
             findings.append(
                 PreflightFinding(
                     level="fail",
@@ -811,7 +1066,7 @@ def _check_rt_sort(config: Any) -> List[PreflightFinding]:
                     category="environment",
                     message=(
                         f"RT-Sort requires `{module_name}` ({role}) but "
-                        f"it is not importable: {exc}."
+                        f"it is not importable: {reason}."
                     ),
                     remediation=(
                         f"Install the missing dependency, e.g. "
@@ -821,7 +1076,11 @@ def _check_rt_sort(config: Any) -> List[PreflightFinding]:
             )
 
     device = str(getattr(config.rt_sort, "device", "") or "")
-    if device.startswith("cuda"):
+    # Short-circuit the cuda probe when torch is already known
+    # missing — the dependency-missing finding above already covers
+    # the operator-actionable case, and re-importing torch here
+    # would always hit the inner ImportError branch unreachably.
+    if device.startswith("cuda") and not torch_missing:
         try:
             import torch as _torch
 
@@ -907,23 +1166,20 @@ def _resolve_target_device_index(config: Any) -> int:
 def _detect_gpu_device_count() -> Optional[int]:
     """Return the number of CUDA devices visible to the host.
 
-    Tries pynvml first (cheapest, no torch import cost), then
-    ``torch.cuda.device_count()``, then ``nvidia-smi``. Returns
-    ``None`` when none of the three is available — callers should
-    treat that as "cannot validate" and stay silent rather than
-    emit noise (the existing ``vram_unknown`` finding already
-    flags the broader detection gap).
+    Tries pynvml first (cheapest, no torch import cost) via
+    :func:`_with_pynvml`, then ``torch.cuda.device_count()``, then
+    ``nvidia-smi``. Returns ``None`` when none of the three is
+    available — callers should treat that as "cannot validate" and
+    stay silent rather than emit noise (the existing
+    ``vram_unknown`` finding already flags the broader detection
+    gap).
     """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            return int(pynvml.nvmlDeviceGetCount())
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
+    with _with_pynvml() as pynvml:
+        if pynvml is not None:
+            try:
+                return int(pynvml.nvmlDeviceGetCount())
+            except Exception:
+                pass
 
     try:
         import torch
@@ -970,6 +1226,14 @@ def _check_gpu_device_present(config: Any) -> Optional[PreflightFinding]:
             index is valid or when the device count cannot be
             detected (silent skip — already covered by
             ``vram_unknown``).
+
+    Notes:
+        - Multi-GPU configs like ``"cuda:0,1"`` are not formally
+          supported. ``_resolve_target_device_index`` parses only
+          the leading index, so multi-GPU strings silently resolve
+          to device 0 and skip the multi-device check. If a future
+          sorter needs proper multi-GPU validation, the resolver
+          must be updated alongside this helper.
     """
     target = _resolve_target_device_index(config)
     count = _detect_gpu_device_count()
@@ -1044,6 +1308,12 @@ def _check_recording_sample_rate(
     not load the recording for preflight; the existing
     :func:`_validate_recording_inputs` only confirms the file exists.
 
+    When ``_expected_sample_rate_window`` returns ``None`` for the
+    configured sorter+probe combination (e.g. an RT-Sort probe value
+    we don't have a nominal rate for), the helper logs an INFO line
+    noting that the rate was not checked — silent-skip would leave
+    operators unsure whether validation ran.
+
     Parameters:
         config (SortingPipelineConfig): Pipeline configuration.
         recording_files (sequence): Per-recording inputs.
@@ -1056,6 +1326,14 @@ def _check_recording_sample_rate(
     """
     window = _expected_sample_rate_window(config)
     if window is None:
+        sorter_name = getattr(config.sorter, "sorter_name", "").lower()
+        if sorter_name == "rt_sort":
+            probe = getattr(config.rt_sort, "probe", "")
+            _logger.info(
+                "sample-rate check skipped: no nominal rate defined "
+                "for RT-Sort probe %r.",
+                probe,
+            )
         return []
     low_hz, high_hz, label = window
 
@@ -1066,7 +1344,15 @@ def _check_recording_sample_rate(
             continue
         try:
             fs_hz = float(get_fs())
-        except Exception:
+        except Exception as exc:
+            # Broad catch is intentional: preflight is a milliseconds-
+            # cheap probe, so a flaky recording loader should not
+            # block the whole preflight. Logged at debug so genuine
+            # loader bugs are still observable to operators who
+            # enable verbose logging.
+            _logger.debug(
+                "skipping sample-rate check for %r: %r", rec, exc
+            )
             continue
         # NaN comparisons are always False, so without an explicit
         # check a NaN sampling rate would silently fall into the
@@ -1118,6 +1404,38 @@ def _parse_version_tuple(version: str) -> Optional[Tuple[int, ...]]:
     return tuple(nums)
 
 
+def _parse_version(version: str) -> Optional[Tuple[int, ...]]:
+    """Parse a version string to a comparable 3-tuple of ints.
+
+    Prefers ``packaging.version.Version`` so PEP 440 pre-release,
+    post-release, and dev-tag decorations on otherwise-valid versions
+    (``"4.0.0rc1"``, ``"0.100.0.post1"``) are dropped via ``Version.release``
+    rather than tripping the manual digit-stripper. Falls back to
+    :func:`_parse_version_tuple` when ``packaging`` is unavailable so
+    the check still works in minimal environments.
+
+    Parameters:
+        version (str): The version string to parse (e.g. ``"4.1.2"``,
+            ``"4.0.0rc1"``).
+
+    Returns:
+        parsed (tuple[int, ...] or None): A length-3 tuple of release
+            ints (post/pre/dev tags ignored), or ``None`` when neither
+            parser can extract a version.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        return _parse_version_tuple(version)
+    try:
+        release = Version(version).release
+    except InvalidVersion:
+        return _parse_version_tuple(version)
+    nums = list(release[:3])
+    nums.extend([0] * (3 - len(nums)))
+    return tuple(nums)
+
+
 def _check_spikeinterface_version() -> Optional[PreflightFinding]:
     """Warn when SpikeInterface's version is outside the tested range.
 
@@ -1137,9 +1455,9 @@ def _check_spikeinterface_version() -> Optional[PreflightFinding]:
     version = getattr(_si, "__version__", None)
     if version is None:
         return None
-    parsed = _parse_version_tuple(version)
-    low = _parse_version_tuple(_TESTED_SI_VERSION_RANGE[0])
-    high = _parse_version_tuple(_TESTED_SI_VERSION_RANGE[1])
+    parsed = _parse_version(version)
+    low = _parse_version(_TESTED_SI_VERSION_RANGE[0])
+    high = _parse_version(_TESTED_SI_VERSION_RANGE[1])
     if parsed is None or low is None or high is None:
         return None
     if low <= parsed < high:
@@ -1359,7 +1677,10 @@ def run_preflight(
 
     Parameters:
         config (SortingPipelineConfig): Pipeline configuration. Reads
-            thresholds from ``config.execution``.
+            thresholds from ``config.execution``; sorter selection
+            from ``config.sorter``; recording-side overrides from
+            ``config.recording``; RT-Sort device + probe from
+            ``config.rt_sort``.
         recording_files (sequence): Recording inputs (used for length
             sanity in future checks; currently unused but kept in the
             signature for forward compatibility).
@@ -1373,14 +1694,80 @@ def run_preflight(
         findings (list[PreflightFinding]): All findings produced by
             the checks. May be empty when the host has plenty of
             headroom.
+
+    Raises:
+        ValueError: If any of ``config.execution.preflight_min_*_gb``
+            is ``None``. The thresholds must be numeric.
+
+    Notes:
+        - Empty ``recording_files``, ``intermediate_folders``, or
+          ``results_folders`` produce a fail-level "environment"
+          finding (codes ``no_recordings``, ``no_intermediate_folders``,
+          ``no_results_folders``) but do not short-circuit — the host
+          and dependency checks still run.
     """
     exe = config.execution
     findings: List[PreflightFinding] = []
 
+    threshold_fields = (
+        "preflight_min_free_inter_gb",
+        "preflight_min_free_results_gb",
+        "preflight_min_available_ram_gb",
+        "preflight_min_free_vram_gb",
+    )
+    for field_name in threshold_fields:
+        if getattr(exe, field_name) is None:
+            raise ValueError(
+                f"config.execution.{field_name} must be a float, got None. "
+                "Set a numeric threshold or rely on the dataclass default."
+            )
     min_free_inter = float(exe.preflight_min_free_inter_gb)
     min_free_results = float(exe.preflight_min_free_results_gb)
     min_avail_ram = float(exe.preflight_min_available_ram_gb)
     min_free_vram = float(exe.preflight_min_free_vram_gb)
+
+    if not recording_files:
+        findings.append(
+            PreflightFinding(
+                level="fail",
+                code="no_recordings",
+                message="run_preflight called with an empty recording_files sequence.",
+                remediation=(
+                    "Pass at least one recording (path or pre-loaded "
+                    "BaseRecording) to the sort pipeline."
+                ),
+                category="environment",
+            )
+        )
+    if not intermediate_folders:
+        findings.append(
+            PreflightFinding(
+                level="fail",
+                code="no_intermediate_folders",
+                message=(
+                    "run_preflight called with an empty intermediate_folders sequence."
+                ),
+                remediation=(
+                    "Pass one intermediate folder per recording to the sort "
+                    "pipeline."
+                ),
+                category="environment",
+            )
+        )
+    if not results_folders:
+        findings.append(
+            PreflightFinding(
+                level="fail",
+                code="no_results_folders",
+                message=(
+                    "run_preflight called with an empty results_folders sequence."
+                ),
+                remediation=(
+                    "Pass one results folder per recording to the sort pipeline."
+                ),
+                category="environment",
+            )
+        )
 
     # ---------- Disk -----------------------------------------------------
     for folder in intermediate_folders:
@@ -1560,19 +1947,26 @@ def report_findings(
             ``"environment"``.
         ResourceSortFailure: If a finding has ``level == "fail"`` (or
             ``"warn"`` under *strict*) and category ``"resource"``.
+        ValueError: If any finding has ``level`` other than ``"warn"``
+            or ``"fail"``.
     """
     if not findings:
-        print("[preflight] all checks passed")
+        _logger.info("all checks passed")
         return
 
-    print("[preflight] findings:")
+    _logger.info("findings:")
     fatal: List[PreflightFinding] = []
     for f in findings:
+        if f.level not in {"warn", "fail"}:
+            raise ValueError(
+                f"Unknown PreflightFinding level: {f.level!r} "
+                f"(code={f.code!r}). Must be 'warn' or 'fail'."
+            )
         effective_level = "fail" if (strict and f.level == "warn") else f.level
-        marker = "FAIL" if effective_level == "fail" else "WARN"
-        print(f"  [{marker}] {f.code}: {f.message}")
+        log_method = _logger.error if effective_level == "fail" else _logger.warning
+        log_method("  [%s] %s: %s", effective_level.upper(), f.code, f.message)
         if f.remediation:
-            print(f"         -> {f.remediation}")
+            log_method("         -> %s", f.remediation)
         if effective_level == "fail":
             fatal.append(f)
 

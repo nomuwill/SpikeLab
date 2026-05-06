@@ -22,6 +22,7 @@ which folder to clean up.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -32,6 +33,9 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from .._exceptions import DiskExhaustionError
+from ._audit import append_audit_event
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -129,6 +133,18 @@ def _top_consumers(
     Walks at most *max_depth* directories deep to keep the cost
     bounded on very deep trees. Errors are swallowed; the partial
     list is returned rather than raising.
+
+    The default ``max_depth=4`` is a cost-vs-coverage trade. Typical
+    sorter outputs nest up to ~3 levels (KS2 produces
+    ``<inter>/sorter_output/output/...``; RT-Sort intermediates
+    nest ~2 levels). A depth of 4 covers the common case while
+    keeping the bounded walk cheap on a near-full disk where the
+    abort path needs to fire promptly. Pathological deep trees
+    (sorter caches with many nested ``temp_wh.dat`` files) may
+    miss the actual top consumer in exchange for not stalling the
+    abort path on a multi-million-file walk; the entry-time
+    snapshot already provides a fallback when the trip-time walk
+    runs out of time.
     """
     folder = Path(folder)
     if not folder.exists():
@@ -219,6 +235,10 @@ class DiskUsageWatchdog:
             raise ValueError(
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
+        if kill_grace_s < 0.0:
+            raise ValueError(
+                f"kill_grace_s must be non-negative, got {kill_grace_s}."
+            )
 
         self.folder = Path(folder)
         self.warn_free_gb = float(warn_free_gb)
@@ -235,6 +255,7 @@ class DiskUsageWatchdog:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._baseline_thread: Optional[threading.Thread] = None
         self._tripped = False
         self._last_warn_t = 0.0
         self._free_at_trip: Optional[float] = None
@@ -288,21 +309,26 @@ class DiskUsageWatchdog:
     def __enter__(self) -> "DiskUsageWatchdog":
         if not self._enabled:
             return self
-        # Snapshot the baseline folder size so we can later report
-        # how much THIS sort consumed (vs starting near-full).
-        self._initial_folder_size = _folder_size_bytes(self.folder)
-        # Snapshot the initial top consumers so we have a fallback
-        # ready if the trip-time walk on a near-full disk is too
-        # slow (millions-of-files trees can stall the os.walk).
-        try:
-            self._initial_top_consumers = _top_consumers(self.folder)
-        except Exception:
-            self._initial_top_consumers = []
-        print(
-            f"[disk watchdog] active: folder={self.folder} "
-            f"warn<={self.warn_free_gb:.1f}GB "
-            f"abort<={self.abort_free_gb:.1f}GB "
-            f"poll={self.poll_interval_s:.1f}s"
+        # Kick the baseline walk off in a daemon thread so __enter__
+        # returns immediately. On a multi-million-file intermediate
+        # folder a synchronous walk could block the sort start by
+        # several seconds. ``_initial_folder_size`` stays None until
+        # the walk completes; ``_build_report`` treats None as "no
+        # baseline yet" and falls back to a zero-consumed estimate.
+        self._initial_folder_size = None
+        self._initial_top_consumers = []
+        self._baseline_thread = threading.Thread(
+            target=self._compute_baseline,
+            name=f"DiskUsageWatchdog[{self.folder.name}]:baseline",
+            daemon=True,
+        )
+        self._baseline_thread.start()
+        _logger.info(
+            "active: folder=%s warn<=%.1fGB abort<=%.1fGB poll=%.1fs",
+            self.folder,
+            self.warn_free_gb,
+            self.abort_free_gb,
+            self.poll_interval_s,
         )
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -313,11 +339,36 @@ class DiskUsageWatchdog:
         self._thread.start()
         return self
 
+    def _compute_baseline(self) -> None:
+        """Compute folder-size + top-consumers baseline in a daemon thread."""
+        try:
+            size = _folder_size_bytes(self.folder)
+        except Exception:
+            size = 0.0
+        try:
+            top = _top_consumers(self.folder)
+        except Exception:
+            top = []
+        # Single attribute writes are atomic in CPython; no lock
+        # needed. ``_build_report`` reads each attribute once and
+        # tolerates either the pre-baseline (None / []) or
+        # post-baseline (numeric / list) value.
+        self._initial_folder_size = size
+        self._initial_top_consumers = top
+
     def __exit__(self, exc_type, exc, tb) -> None:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self.poll_interval_s + 1.0)
             self._thread = None
+        # Best-effort join the baseline thread so a slow walk does
+        # not outlive the watchdog. Daemon ⇒ the process exit will
+        # kill it anyway, but a clean join keeps tests + analysis
+        # loops tidy.
+        baseline_thread = getattr(self, "_baseline_thread", None)
+        if baseline_thread is not None:
+            baseline_thread.join(timeout=0.5)
+            self._baseline_thread = None
 
     # ------------------------------------------------------------------
     # Internals
@@ -328,11 +379,31 @@ class DiskUsageWatchdog:
         # Defer the first measurement so __enter__ has time to return.
         if self._stop_event.wait(self.poll_interval_s):
             return
+        blind_threshold_s = 5.0 * self.warn_repeat_s
+        blind_started_t: Optional[float] = None
+        blind_warned = False
         while not self._stop_event.is_set():
             free_gb = _disk_free_gb(self.folder)
+            now = time.time()
             if free_gb is None:
+                # Cannot read free disk this poll. Track how long we
+                # have been blind so we can warn once if it persists —
+                # a sustained flaky network mount silently disables
+                # the abort path otherwise.
+                if blind_started_t is None:
+                    blind_started_t = now
+                elif (
+                    not blind_warned
+                    and now - blind_started_t >= blind_threshold_s
+                ):
+                    self._warn_blind(now - blind_started_t)
+                    blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
                 continue
+            # Successful read clears the blindness tracker so a later
+            # episode is reported afresh.
+            blind_started_t = None
+            blind_warned = False
 
             if free_gb <= self.abort_free_gb:
                 self._on_trip(free_gb)
@@ -347,46 +418,57 @@ class DiskUsageWatchdog:
         if now - self._last_warn_t < self.warn_repeat_s:
             return
         self._last_warn_t = now
-        print(
-            f"[disk watchdog] WARNING: free disk on {self.folder} = "
-            f"{free_gb:.2f} GB (warn<={self.warn_free_gb:.1f} / "
-            f"abort<={self.abort_free_gb:.1f}). Free space soon or "
-            "the sort will be aborted."
+        _logger.warning(
+            "free disk on %s = %.2f GB (warn<=%.1f / abort<=%.1f). "
+            "Free space soon or the sort will be aborted.",
+            self.folder,
+            free_gb,
+            self.warn_free_gb,
+            self.abort_free_gb,
         )
-        try:
-            from ._audit import append_audit_event
+        append_audit_event(
+            watchdog="disk",
+            event="warn",
+            folder=str(self.folder),
+            free_gb=free_gb,
+            warn_free_gb=self.warn_free_gb,
+            abort_free_gb=self.abort_free_gb,
+        )
 
-            append_audit_event(
-                watchdog="disk",
-                event="warn",
-                folder=str(self.folder),
-                free_gb=free_gb,
-                warn_free_gb=self.warn_free_gb,
-                abort_free_gb=self.abort_free_gb,
-            )
-        except Exception:
-            pass
+    def _warn_blind(self, blind_for: float) -> None:
+        _logger.warning(
+            "free-disk reading for %s unreadable for %.1fs — watchdog "
+            "is blind to disk-pressure aborts until readings recover. "
+            "Likely a flaky network mount or a folder whose ancestor "
+            "vanished mid-sort.",
+            self.folder,
+            blind_for,
+        )
+        append_audit_event(
+            watchdog="disk",
+            event="blind_warn",
+            source="disk_free",
+            folder=str(self.folder),
+            blind_for_s=blind_for,
+        )
 
     def _on_trip(self, free_gb: float) -> None:
         """Build the report, terminate any subprocess, then run the callback."""
         self._tripped = True
         self._free_at_trip = free_gb
-        print(
-            f"[disk watchdog] TRIP: free disk on {self.folder} = "
-            f"{free_gb:.2f} GB (<= {self.abort_free_gb:.2f} GB)."
+        _logger.error(
+            "TRIP: free disk on %s = %.2f GB (<= %.2f GB).",
+            self.folder,
+            free_gb,
+            self.abort_free_gb,
         )
-        try:
-            from ._audit import append_audit_event
-
-            append_audit_event(
-                watchdog="disk",
-                event="abort",
-                folder=str(self.folder),
-                free_gb=free_gb,
-                abort_free_gb=self.abort_free_gb,
-            )
-        except Exception:
-            pass
+        append_audit_event(
+            watchdog="disk",
+            event="abort",
+            folder=str(self.folder),
+            free_gb=free_gb,
+            abort_free_gb=self.abort_free_gb,
+        )
 
         # Build the report on the watchdog thread before killing
         # anything — once the kill_callback fires (os._exit) we lose
@@ -397,29 +479,31 @@ class DiskUsageWatchdog:
             top_summary = f"{top_path} ({round(top_gb, 2)} GB)"
         else:
             top_summary = "(none found)"
-        print(f"[disk watchdog] report: top consumer = {top_summary}")
+        _logger.error("report: top consumer = %s", top_summary)
 
         if self.popen is not None:
             try:
                 if self.popen.poll() is None:
                     self.popen.terminate()
             except Exception as exc:
-                print(
-                    f"[disk watchdog] terminate() failed for pid="
-                    f"{getattr(self.popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "terminate() failed for pid=%s: %s",
+                    getattr(self.popen, "pid", "?"),
+                    exc,
                 )
             time.sleep(self.kill_grace_s)
             try:
                 if self.popen.poll() is None:
                     self.popen.kill()
-                    print(
-                        f"[disk watchdog] killed pid="
-                        f"{getattr(self.popen, 'pid', '?')} (terminate ignored)."
+                    _logger.warning(
+                        "killed pid=%s (terminate ignored).",
+                        getattr(self.popen, "pid", "?"),
                     )
             except Exception as exc:
-                print(
-                    f"[disk watchdog] kill() failed for pid="
-                    f"{getattr(self.popen, 'pid', '?')}: {exc}"
+                _logger.error(
+                    "kill() failed for pid=%s: %s",
+                    getattr(self.popen, "pid", "?"),
+                    exc,
                 )
 
         if self.kill_callback is not None:
@@ -431,7 +515,7 @@ class DiskUsageWatchdog:
                 # swallow either kind of intentional interrupt.
                 raise
             except Exception as exc:
-                print(f"[disk watchdog] kill_callback raised: {exc!r}; continuing.")
+                _logger.error("kill_callback raised: %r; continuing.", exc)
 
     def _top_consumers_with_timeout(
         self, timeout_s: float
@@ -443,6 +527,14 @@ class DiskUsageWatchdog:
         caller is expected to fall back to the entry-time snapshot
         in the ``None`` case so a hung os.walk does not block the
         kill path on a stalled filesystem.
+
+        Notes:
+            - Deliberate daemon-thread leak: when the timeout fires,
+              the worker keeps running until the underlying os.walk
+              eventually returns or the Python process exits. This is
+              acceptable on the abort path because the process is
+              about to terminate anyway. In ``os._exit`` paths the
+              worker is killed with the rest of the process.
         """
         result: List[Optional[List[Tuple[str, float]]]] = [None]
 
@@ -478,9 +570,9 @@ class DiskUsageWatchdog:
         if top is None:
             top = list(self._initial_top_consumers)
             if top:
-                print(
-                    "[disk watchdog] live top-consumer walk timed out; "
-                    "falling back to entry-time snapshot."
+                _logger.info(
+                    "live top-consumer walk timed out; falling back "
+                    "to entry-time snapshot."
                 )
 
         suggestions: List[str] = []

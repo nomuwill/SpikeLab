@@ -951,10 +951,35 @@ def _process_recording_body(
                 return err
             raise
         except MemoryError as e:
+            # If a watchdog tripped (host RAM, GPU, I/O stall) prefer
+            # its classified error — the MemoryError is most likely a
+            # downstream symptom of the trip.
+            wd = find_tripped_global_watchdog()
+            if wd is not None:
+                err = wd.make_error()
+                print(f"Recording aborted by watchdog: {err}")
+                return err
             print(f"Recording aborted due to MemoryError: {e!r}")
             print("Moving on to next recording")
             return e
         except Exception as e:
+            # Misclassification guard: if a watchdog tripped but
+            # ``_thread.interrupt_main`` failed to deliver the
+            # KeyboardInterrupt, the main thread continues and
+            # eventually surfaces a downstream error (typically
+            # ``BrokenPipeError`` / ``RuntimeError`` from a now-dead
+            # subprocess). Reclassify those as the watchdog's error
+            # so the caller sees the same classified failure as the
+            # KeyboardInterrupt path.
+            wd = find_tripped_global_watchdog()
+            if wd is not None and wd.interrupt_delivery_failed():
+                err = wd.make_error()
+                print(
+                    f"Recording aborted by watchdog "
+                    f"(interrupt_main failed; reclassified "
+                    f"from {type(e).__name__}): {err}"
+                )
+                return err
             print(f"Recording failed in post-sort pipeline: {e!r}")
             print("Moving on to next recording")
             return e

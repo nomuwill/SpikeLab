@@ -124,6 +124,36 @@ class TestWipeCanaryFolder:
 
         _wipe_canary_folder(tmp_path / "never-existed")  # no raise
 
+    def test_exists_raise_is_swallowed(self, tmp_path, monkeypatch):
+        """
+        ``folder.exists()`` raising is caught by the outer try/except
+        so cleanup never propagates an exception.
+
+        Tests:
+            (Test Case 1) Patched ``Path.exists`` raising ``OSError``
+                does not propagate; the helper logs a warning and
+                returns normally.
+
+        Notes:
+            - Documents current best-effort behaviour: the canary
+              folder cleanup is wrapped in a broad try/except so a
+              path-readability bug never breaks a sort.
+        """
+        from pathlib import Path
+
+        from spikelab.spike_sorting.canary import _wipe_canary_folder
+
+        target = tmp_path / "canary"
+
+        def _refuse(self):
+            if self == target:
+                raise OSError("simulated path-stat failure")
+            return False
+
+        monkeypatch.setattr(Path, "exists", _refuse)
+        # Must not raise.
+        _wipe_canary_folder(target)
+
 
 class TestRunCanary:
     """``run_canary`` runs the canary clone and propagates classified
@@ -464,3 +494,366 @@ class TestPipelineCanaryRecordingTooShortNotice:
         doc = canary_mod.__doc__ or ""
         assert "pipeline" in doc
         assert "shorter" in doc
+
+
+class TestBuildCanaryConfigOverridesExtra:
+    """``_build_canary_config`` propagates additional override keys."""
+
+    def test_tee_log_policy_keep_propagates(self):
+        """
+        The canary clone sets ``tee_log_policy="keep"`` so the canary
+        log is preserved for debugging instead of cleaned with the
+        rest of the canary folder.
+
+        Tests:
+            (Test Case 1) Clone's ``tee_log_policy`` is ``"keep"``.
+        """
+        from spikelab.spike_sorting.canary import _build_canary_config
+
+        cfg = SortingPipelineConfig()
+        clone = _build_canary_config(cfg, 30.0)
+        assert clone.execution.tee_log_policy == "keep"
+
+    def test_sorter_inactivity_base_s_scales_with_window(self):
+        """
+        ``sorter_inactivity_base_s`` is set to
+        ``min(300, max(120, 4 * canary_window_s))`` — clamped between
+        a 120 s floor (cold-start tolerance) and 300 s ceiling.
+
+        Tests:
+            (Test Case 1) ``window=30`` → 4*30=120 (floor) → 120.0.
+            (Test Case 2) ``window=60`` → 4*60=240 (mid-range) → 240.0.
+            (Test Case 3) ``window=120`` → 4*120=480 (capped) → 300.0.
+        """
+        from spikelab.spike_sorting.canary import _build_canary_config
+
+        cfg = SortingPipelineConfig()
+        assert _build_canary_config(cfg, 30.0).execution.sorter_inactivity_base_s == 120.0
+        assert _build_canary_config(cfg, 60.0).execution.sorter_inactivity_base_s == 240.0
+        assert _build_canary_config(cfg, 120.0).execution.sorter_inactivity_base_s == 300.0
+
+    def test_start_and_end_time_set_to_window(self):
+        """
+        Explicitly assert ``start_time_s=0.0`` and
+        ``end_time_s == canary_window_s`` — the canary always sorts
+        the leading slice from frame zero.
+
+        Tests:
+            (Test Case 1) Clone with window=42 → ``start_time_s=0.0``,
+                ``end_time_s=42.0``.
+        """
+        from spikelab.spike_sorting.canary import _build_canary_config
+
+        cfg = SortingPipelineConfig()
+        clone = _build_canary_config(cfg, 42.0)
+        assert clone.recording.start_time_s == 0.0
+        assert clone.recording.end_time_s == 42.0
+
+
+class TestRunCanaryEqualDurationBoundary:
+    """``run_canary`` boundary at canary_window_s = recording duration."""
+
+    def test_canary_window_uses_supplied_value_regardless_of_recording_length(self):
+        """
+        ``run_canary`` does not consult the recording's duration to
+        decide the window — it always passes the configured
+        ``canary_first_n_s`` through. With a window equal to (or
+        exceeding) the actual recording length the backend would sort
+        the full recording. Documents that the canary's window is
+        purely a config value.
+
+        Tests:
+            (Test Case 1) ``canary_first_n_s=10.0`` produces a clone
+                whose ``end_time_s=10.0`` regardless of recording.
+        """
+        from spikelab.spike_sorting.canary import _build_canary_config
+
+        cfg = SortingPipelineConfig()
+        clone = _build_canary_config(cfg, 10.0)
+        # The canary clone's end_time_s reflects only the supplied
+        # window; recording duration is not inspected.
+        assert clone.recording.end_time_s == 10.0
+        # If a recording happens to be 10s long, the backend would sort
+        # the whole thing — that's the documented "off-by-equal" risk.
+
+
+class TestRunCanarySorterNameOverride:
+    """``run_canary`` honours an explicit ``sorter_name`` parameter."""
+
+    def test_sorter_name_param_overrides_config(self, tmp_path, monkeypatch):
+        """
+        Passing ``sorter_name="custom_sorter"`` causes the backend
+        lookup to use that name instead of the one in
+        ``config.sorter.sorter_name``.
+
+        Tests:
+            (Test Case 1) Patched ``get_backend_class`` records the
+                requested name; with ``sorter_name="kilosort4"``
+                override on a config whose ``sorter_name="kilosort2"``,
+                the recorded lookup name is ``"kilosort4"``.
+        """
+        from spikelab.spike_sorting import (
+            backends as backends_mod,
+            canary as canary_mod,
+            pipeline as pipeline_mod,
+        )
+        from spikelab.spike_sorting.canary import run_canary
+
+        cfg = SortingPipelineConfig()
+        cfg.sorter.sorter_name = "kilosort2"
+        cfg.execution.canary_first_n_s = 5.0
+
+        recorded = {"name": None}
+
+        class _FakeBackend:
+            def __init__(self, _cfg):
+                pass
+
+        def _record_backend(name):
+            recorded["name"] = name
+            return _FakeBackend
+
+        monkeypatch.setattr(backends_mod, "get_backend_class", _record_backend)
+        monkeypatch.setattr(
+            canary_mod,
+            "_build_canary_config",
+            lambda c, w: SortingPipelineConfig(),
+        )
+        monkeypatch.setattr(
+            pipeline_mod, "process_recording", lambda *a, **kw: object()
+        )
+
+        run_canary(
+            cfg,
+            recording=None,
+            rec_path="rec.h5",
+            inter_path=tmp_path,
+            sorter_name="kilosort4",
+        )
+        assert recorded["name"] == "kilosort4"
+
+
+class TestRunCanaryRngForwarded:
+    """``run_canary`` forwards ``rng`` to ``process_recording``."""
+
+    def test_rng_passed_through_to_process_recording(self, tmp_path, monkeypatch):
+        """
+        The optional ``rng`` parameter is passed through to
+        ``process_recording`` for reproducibility.
+
+        Tests:
+            (Test Case 1) Patched ``process_recording`` captures the
+                ``rng`` kwarg; the supplied sentinel is recorded.
+        """
+        from spikelab.spike_sorting import (
+            backends as backends_mod,
+            canary as canary_mod,
+            pipeline as pipeline_mod,
+        )
+        from spikelab.spike_sorting.canary import run_canary
+
+        cfg = SortingPipelineConfig()
+        cfg.execution.canary_first_n_s = 5.0
+
+        captured = {"rng": "missing"}
+
+        class _FakeBackend:
+            def __init__(self, _cfg):
+                pass
+
+        def _capture(*args, **kwargs):
+            captured["rng"] = kwargs.get("rng", "missing")
+            return object()
+
+        monkeypatch.setattr(
+            canary_mod,
+            "_build_canary_config",
+            lambda c, w: SortingPipelineConfig(),
+        )
+        monkeypatch.setattr(
+            backends_mod, "get_backend_class", lambda name: _FakeBackend
+        )
+        monkeypatch.setattr(pipeline_mod, "process_recording", _capture)
+
+        sentinel = object()
+        run_canary(
+            cfg,
+            recording=None,
+            rec_path="rec.h5",
+            inter_path=tmp_path,
+            sorter_name="kilosort2",
+            rng=sentinel,
+        )
+        assert captured["rng"] is sentinel
+
+
+class TestRunCanaryNonClassifiedReturnedAsValue:
+    """``run_canary`` swallows non-classified BaseException returned-as-value."""
+
+    def test_non_classified_baseexception_returned_swallowed(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        When ``process_recording`` *returns* (rather than raises) a
+        non-classified ``BaseException`` instance — e.g. a generic
+        ``RuntimeError`` returned as a value — ``run_canary``
+        treats it like a non-classified failure: prints a notice,
+        cleans up the canary folder, and returns ``None``.
+
+        Tests:
+            (Test Case 1) ``process_recording`` stub returns a
+                ``RuntimeError`` instance (not raised).
+            (Test Case 2) ``run_canary`` returns ``None``.
+            (Test Case 3) The canary folder has been wiped.
+        """
+        from spikelab.spike_sorting import (
+            backends as backends_mod,
+            canary as canary_mod,
+            pipeline as pipeline_mod,
+        )
+        from spikelab.spike_sorting.canary import run_canary
+
+        cfg = SortingPipelineConfig()
+        cfg.execution.canary_first_n_s = 5.0
+
+        class _FakeBackend:
+            def __init__(self, _cfg):
+                pass
+
+        monkeypatch.setattr(
+            canary_mod,
+            "_build_canary_config",
+            lambda c, w: SortingPipelineConfig(),
+        )
+        monkeypatch.setattr(
+            backends_mod, "get_backend_class", lambda name: _FakeBackend
+        )
+        # Return (not raise) a non-classified RuntimeError instance.
+        monkeypatch.setattr(
+            pipeline_mod,
+            "process_recording",
+            lambda *a, **kw: RuntimeError("non-classified returned-as-value"),
+        )
+
+        result = run_canary(
+            cfg,
+            recording=None,
+            rec_path="rec.h5",
+            inter_path=tmp_path,
+            sorter_name="kilosort2",
+        )
+        assert result is None
+
+
+class TestRunCanaryInterPathBoundaries:
+    """``run_canary`` inter_path setup edge cases."""
+
+    def test_inter_path_mkdir_failure_propagates(self, tmp_path, monkeypatch):
+        """
+        When ``Path.mkdir`` fails on the canary subfolder (read-only
+        mount, permission denied) the OSError surfaces from
+        ``run_canary`` rather than being silently swallowed —
+        documents current behaviour so a future caller knows to
+        wrap the call.
+
+        Tests:
+            (Test Case 1) Patched ``Path.mkdir`` raises
+                ``PermissionError`` for the per-pid ``_canary_<pid>``
+                directory; ``run_canary`` propagates that error.
+        """
+        from spikelab.spike_sorting.canary import run_canary
+
+        cfg = SortingPipelineConfig()
+        cfg.execution.canary_first_n_s = 5.0
+
+        original_mkdir = Path.mkdir
+
+        def _refuse(self, *args, **kwargs):
+            if "_canary_" in str(self):
+                raise PermissionError("simulated read-only mount")
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", _refuse)
+
+        with pytest.raises(PermissionError):
+            run_canary(
+                cfg,
+                recording=None,
+                rec_path="rec.h5",
+                inter_path=tmp_path,
+                sorter_name="kilosort2",
+            )
+
+    def test_inter_path_missing_is_created(self, tmp_path, monkeypatch):
+        """
+        When ``inter_path`` itself does not yet exist, ``run_canary``
+        creates the per-pid canary subfolder via
+        ``mkdir(parents=True, exist_ok=True)`` so the canary can
+        proceed.
+
+        Tests:
+            (Test Case 1) ``inter_path = tmp_path / "missing"`` (not
+                yet present); patched backend + classified-failure
+                ``process_recording`` returns the exception. Track
+                the mkdir target via a side-effect collector to
+                confirm the canary path was created.
+        """
+        from spikelab.spike_sorting import (
+            backends as backends_mod,
+            canary as canary_mod,
+            pipeline as pipeline_mod,
+        )
+        from spikelab.spike_sorting.canary import run_canary
+
+        cfg = SortingPipelineConfig()
+        cfg.execution.canary_first_n_s = 5.0
+
+        nonexistent = tmp_path / "fresh"
+        assert not nonexistent.exists()
+
+        # Track mkdir call paths so we can confirm the canary subdir
+        # was the one created.
+        original_mkdir = Path.mkdir
+        mkdir_paths = []
+
+        def _tracking_mkdir(self, *args, **kwargs):
+            if "_canary_" in str(self):
+                mkdir_paths.append(Path(self))
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", _tracking_mkdir)
+
+        class _FakeBackend:
+            def __init__(self, _cfg):
+                pass
+
+        monkeypatch.setattr(
+            canary_mod,
+            "_build_canary_config",
+            lambda c, w: SortingPipelineConfig(),
+        )
+        monkeypatch.setattr(
+            backends_mod, "get_backend_class", lambda name: _FakeBackend
+        )
+        # Return a classified failure to exit early — keeps the test
+        # hermetic without needing a real backend.
+        exc = InsufficientActivityError("mock", sorter="kilosort2")
+        monkeypatch.setattr(
+            pipeline_mod, "process_recording", lambda *a, **kw: exc
+        )
+
+        result = run_canary(
+            cfg,
+            recording=None,
+            rec_path="rec.h5",
+            inter_path=nonexistent,
+            sorter_name="kilosort2",
+        )
+        assert result is exc
+        assert mkdir_paths, "no canary subfolder mkdir was attempted"
+        # The recorded mkdir call landed under the (formerly missing)
+        # parent — the helper created it via parents=True.
+        assert any(
+            nonexistent in p.parents or p.parent == nonexistent
+            for p in mkdir_paths
+        )

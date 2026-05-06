@@ -46,26 +46,17 @@ Edge cases
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Optional
 
-from ._exceptions import (
-    BiologicalSortFailure,
-    EnvironmentSortFailure,
-    InsufficientActivityError,
-    ResourceSortFailure,
-)
+from ._exceptions import CLASSIFIED_FAILURES as _CLASSIFIED_FAILURES
 
-# Exceptions whose appearance in the canary indicates the full sort
-# would have hit the same wall — propagated to the caller.
-_CLASSIFIED_FAILURES: tuple = (
-    InsufficientActivityError,
-    BiologicalSortFailure,
-    EnvironmentSortFailure,
-    ResourceSortFailure,
-)
+_logger = logging.getLogger(__name__)
 
 
 def _build_canary_config(config: Any, canary_window_s: float) -> Any:
@@ -91,6 +82,12 @@ def _build_canary_config(config: Any, canary_window_s: float) -> Any:
         canary_config (SortingPipelineConfig): Deep copy with canary
             overrides applied.
     """
+    # Scale the inactivity baseline with the canary window: a 30s
+    # smoke test should not wait the same 5 min as a multi-hour sort
+    # before flagging a hang. The floor (120s) absorbs Docker / MEX
+    # cold-start; the ceiling (300s) caps the timeout at the original
+    # full-sort default for unusually large windows.
+    canary_inactivity_base_s = min(300.0, max(120.0, 4.0 * canary_window_s))
     overrides = {
         # Restrict to the leading window; clear any rec_chunks that
         # would otherwise force the loader into a multi-segment path.
@@ -101,6 +98,11 @@ def _build_canary_config(config: Any, canary_window_s: float) -> Any:
         # Skip curation — too few units in a 30 s window is normal.
         "curate_first": False,
         "curate_second": False,
+        # ``tee_log_policy="keep"`` preserves the canary's tee log
+        # for debugging. The tee log lives outside the per-pid
+        # ``_canary_<pid>/`` folder, so ``_wipe_canary_folder`` does
+        # not clean it up — operators should sweep stale canary tee
+        # logs from the parent results folder periodically.
         # Skip post-sort exporters — canary outputs are discarded.
         "compile_single_recording": False,
         "compile_to_mat": False,
@@ -117,21 +119,34 @@ def _build_canary_config(config: Any, canary_window_s: float) -> Any:
         # is debuggable.
         "preflight": False,
         "tee_log_policy": "keep",
-        # Half the inactivity baseline so a hung canary doesn't sit
-        # for 10 minutes before tripping; still well above the time
-        # any non-pathological smoke test needs.
-        "sorter_inactivity_base_s": 300.0,
+        "sorter_inactivity_base_s": canary_inactivity_base_s,
     }
     return config.override(**overrides)
 
 
-def _wipe_canary_folder(folder: Path) -> None:
-    """Best-effort cleanup of the canary's intermediate folder."""
+def _wipe_canary_folder(folder: Path, *, strict: bool = False) -> None:
+    """Best-effort cleanup of the canary's intermediate folder.
+
+    Parameters:
+        folder (Path): Folder to wipe.
+        strict (bool): When True, raises if the wipe fails. Used at
+            entry-time so a permission-denied wipe is surfaced
+            rather than silently running the canary against a
+            partially-cleaned folder. Defaults to False (best-effort
+            cleanup) for the post-canary cleanup call site.
+    """
     try:
         if folder.exists():
-            shutil.rmtree(folder, ignore_errors=True)
+            if strict:
+                # ignore_errors=False — any failure raises so the
+                # caller can decide how to surface it.
+                shutil.rmtree(folder)
+            else:
+                shutil.rmtree(folder, ignore_errors=True)
     except Exception as exc:
-        print(f"[canary] cleanup of {folder!s} failed: {exc!r}")
+        if strict:
+            raise
+        _logger.warning("cleanup of %s failed: %r", folder, exc)
 
 
 def run_canary(
@@ -184,18 +199,29 @@ def run_canary(
         return None
 
     canary_config = _build_canary_config(config, canary_window_s)
-    canary_root = Path(inter_path) / "_canary"
-    _wipe_canary_folder(canary_root)
+    # Per-pid subfolder so two direct callers of run_canary against
+    # the same inter_path cannot race on the wipe + mkdir. The
+    # standard pipeline flow already serialises via acquire_sort_lock
+    # on inter_path, but run_canary is also exposed as a public
+    # function and direct callers have no such protection.
+    canary_root = Path(inter_path) / f"_canary_{os.getpid()}"
+    # Strict wipe at entry — running the canary against a
+    # partially-cleaned folder could mask sorter behaviour. The
+    # cleanup-phase wipe at exit stays best-effort.
+    _wipe_canary_folder(canary_root, strict=True)
     canary_root.mkdir(parents=True, exist_ok=True)
     canary_inter = canary_root / "inter"
     canary_results = canary_root / "results"
 
     sorter = sorter_name or getattr(config.sorter, "sorter_name", "")
-    print(
-        f"[canary] running {canary_window_s:.1f}s smoke test for "
-        f"{rec_name} via {sorter}"
+    _logger.info(
+        "running %.1fs smoke test for %s via %s",
+        canary_window_s,
+        rec_name,
+        sorter,
     )
 
+    started_t = time.monotonic()
     try:
         from .backends import get_backend_class
         from .pipeline import process_recording
@@ -216,7 +242,9 @@ def run_canary(
             rng=rng,
         )
     except _CLASSIFIED_FAILURES as exc:
-        print(f"[canary] classified failure: {type(exc).__name__}: {exc}")
+        _logger.warning(
+            "classified failure: %s: %s", type(exc).__name__, exc
+        )
         _wipe_canary_folder(canary_root)
         return exc
     except (KeyboardInterrupt, SystemExit):
@@ -229,15 +257,19 @@ def run_canary(
         # Unexpected failure — the canary is a smoke test, not a
         # hard gate. Log and let the full sort proceed; live
         # watchdogs handle resource-shaped issues at runtime.
-        print(
-            f"[canary] non-classified failure ({type(exc).__name__}: {exc}); "
-            "proceeding with the full sort."
+        _logger.warning(
+            "non-classified failure (%s: %s); proceeding with the "
+            "full sort.",
+            type(exc).__name__,
+            exc,
         )
         _wipe_canary_folder(canary_root)
         return None
 
     if isinstance(result, _CLASSIFIED_FAILURES):
-        print(f"[canary] classified failure: {type(result).__name__}: {result}")
+        _logger.warning(
+            "classified failure: %s: %s", type(result).__name__, result
+        )
         _wipe_canary_folder(canary_root)
         return result
     if isinstance(result, (KeyboardInterrupt, SystemExit)):
@@ -246,14 +278,47 @@ def run_canary(
         _wipe_canary_folder(canary_root)
         raise result
     if isinstance(result, BaseException):
-        print(
-            f"[canary] non-classified failure "
-            f"({type(result).__name__}: {result}); "
-            "proceeding with the full sort."
+        _logger.warning(
+            "non-classified failure (%s: %s); proceeding with the "
+            "full sort.",
+            type(result).__name__,
+            result,
         )
         _wipe_canary_folder(canary_root)
         return None
 
-    print("[canary] passed; proceeding with the full sort")
+    elapsed_s = time.monotonic() - started_t
+    n_units = _extract_unit_count(result)
+    if n_units is None:
+        _logger.info(
+            "passed in %.1fs; proceeding with the full sort.",
+            elapsed_s,
+        )
+    else:
+        _logger.info(
+            "passed: produced %d unit(s) in %.1fs; proceeding with "
+            "the full sort.",
+            n_units,
+            elapsed_s,
+        )
     _wipe_canary_folder(canary_root)
+    return None
+
+
+def _extract_unit_count(result: Any) -> Optional[int]:
+    """Best-effort unit count from a ``process_recording`` success result.
+
+    ``process_recording`` returns either a single ``SpikeData`` or a
+    ``(sd, sd_curated)`` tuple depending on
+    ``ExecutionConfig.save_raw_pkl``. When neither shape matches, or
+    when the object lacks ``N`` (number of units), returns ``None``
+    so the caller falls back to a unit-count-less log line.
+    """
+    candidate = result
+    if isinstance(result, tuple) and result:
+        # Prefer the curated SpikeData if present (last entry).
+        candidate = result[-1]
+    n = getattr(candidate, "N", None)
+    if isinstance(n, int):
+        return n
     return None

@@ -70,16 +70,25 @@ def find_tripped_global_watchdog():
     """Return the first tripped global-scope watchdog, or ``None``.
 
     Walks the watchdogs whose lifetime spans the whole sort
-    (host memory, GPU memory + thermal) in priority order and
-    returns the first one whose ``tripped()`` is True. The caller
-    typically uses the return value to convert a
+    (host memory, GPU memory + thermal, I/O stall) in priority
+    order and returns the first one whose ``tripped()`` is True.
+    The caller typically uses the return value to convert a
     :class:`KeyboardInterrupt` (delivered by the watchdog's
     ``_thread.interrupt_main`` call) into the corresponding
     classified error via ``make_error()``.
 
-    Per-recording watchdogs (disk, I/O stall, log inactivity) are
-    not consulted here — those are handled at narrower catch
-    sites where the local watchdog reference is in scope.
+    Priority order is **host → gpu → io_stall**, ranked by
+    likelihood of being the *root cause* when multiple watchdogs
+    trip simultaneously. Host-RAM exhaustion typically cascades
+    into GPU writes stalling and I/O stalling on swap; reporting
+    the host trip first surfaces the most actionable diagnosis
+    for the operator. The other tripped watchdogs are usually
+    downstream symptoms — the audit log captures all three trip
+    events independently for postmortem.
+
+    Per-recording watchdogs (disk, log inactivity) are not
+    consulted here — those are handled at narrower catch sites
+    where the local watchdog reference is in scope.
 
     Returns:
         watchdog: A tripped watchdog instance, or ``None`` when no
@@ -123,6 +132,7 @@ __all__ = [
     "read_gpu_memory",
     "resolve_active_device",
     "find_tripped_global_watchdog",
+    "linux_cgroup_v2_memory_cap",
     "PreflightFinding",
     "run_preflight",
     "report_findings",

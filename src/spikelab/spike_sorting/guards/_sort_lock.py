@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import socket
 from datetime import datetime
@@ -32,6 +33,7 @@ from typing import Iterator, Optional
 
 from .._exceptions import ConcurrentSortError
 
+_logger = logging.getLogger(__name__)
 _LOCK_FILENAME = ".spikelab_sort.lock"
 
 
@@ -52,6 +54,12 @@ def _pid_alive(pid: int) -> bool:
         return psutil.pid_exists(int(pid))
     except ImportError:
         pass
+    except Exception:
+        # ``psutil.pid_exists`` itself raised (e.g. psutil bug on
+        # Windows under WSL). Honour the documented conservative-true
+        # contract so a flaky liveness probe refuses a sort that
+        # might race rather than clobbering a possibly-live one.
+        return True
 
     if hasattr(os, "kill"):
         try:
@@ -81,23 +89,33 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-# Allow a small skew between the lock's recorded ``started_at`` and the
+# Allow skew between the lock's recorded ``started_at`` and the
 # OS-reported process start time before we treat the live PID as a
-# reused one. Five seconds is well under what NTP / monotonic-clock
-# wobble produces on a healthy system.
-_PID_REUSE_SKEW_S = 5.0
+# reused one. Sixty seconds absorbs VM clock drift (Hyper-V,
+# hibernate-resume) without making PID-reuse detection meaningfully
+# slower — a same-PID process that started a full minute after the
+# lock holder is overwhelmingly likely to be a fresh process.
+_PID_REUSE_SKEW_S = 60.0
 
 
 def _pid_holds_lock(pid: int, started_at: Optional[str]) -> bool:
     """Return True if *pid* is the original lock holder (not a PID reuse).
 
     Distinct from :func:`_pid_alive`: when psutil is available, this
-    additionally compares the lock's recorded ``started_at`` against
-    ``psutil.Process(pid).create_time()``. If the live process
-    started materially *after* the lock was acquired, it is almost
-    certainly a different process that happened to inherit the
-    holder's PID — common on Linux after the holder crashed and the
-    PID counter wrapped — and the lock is treated as stale.
+    runs two stale-lock checks before treating the live PID as the
+    holder.
+
+    1. **Cross-boot:** if the lock's ``started_at`` predates the
+       current ``psutil.boot_time()``, the machine has rebooted
+       since the lock was acquired. PIDs do not survive a reboot,
+       so the lock is unambiguously stale.
+    2. **PID reuse within the same boot:** the lock's ``started_at``
+       is compared against ``psutil.Process(pid).create_time()``.
+       If the live process started materially *after* the lock was
+       written (more than ``_PID_REUSE_SKEW_S``), it is almost
+       certainly a different process that inherited the holder's
+       PID — common on Linux after a crash + PID-counter wrap —
+       and the lock is treated as stale.
 
     Falls back to :func:`_pid_alive` semantics when psutil is
     missing, when ``started_at`` is unparseable, or when process
@@ -134,6 +152,16 @@ def _pid_holds_lock(pid: int, started_at: Optional[str]) -> bool:
         lock_t = datetime.fromisoformat(started_at).timestamp()
     except (TypeError, ValueError):
         return _pid_alive(pid)
+
+    # Cross-boot: PIDs do not persist across reboots, so a lock
+    # acquired before the current boot is unambiguously stale.
+    try:
+        if lock_t < float(psutil.boot_time()):
+            return False
+    except Exception:
+        # boot_time() unavailable — fall through to the create_time
+        # comparison below, which still catches most PID-reuse cases.
+        pass
 
     try:
         proc = psutil.Process(int(pid))
@@ -185,6 +213,16 @@ def acquire_sort_lock(folder: Path) -> Iterator[Path]:
     deleted. ``os._exit`` paths leave the lock behind, which is
     correctly reclaimed on the next sort because the holding PID
     will no longer be alive.
+
+    Notes:
+        - The retry loop after stale-lock reclaim handles the race
+          where two processes simultaneously detect the same stale
+          lock: each tries to ``unlink()``, the first succeeds, the
+          second's ``unlink`` raises ``FileNotFoundError`` and the
+          ``except OSError`` re-raises it as ``ConcurrentSortError``.
+          The losing process therefore aborts safely. The retry loop
+          itself only ever serves the first reclaim — in the racing
+          scenario it never iterates a second time.
 
     Parameters:
         folder (Path): The folder to lock — typically the
@@ -249,9 +287,10 @@ def acquire_sort_lock(folder: Path) -> Iterator[Path]:
                 )
 
             # Stale lock: previous sort crashed. Reclaim.
-            print(
-                f"[sort lock] reclaiming stale lock at {lock_path} "
-                f"(holder PID {holder_pid} no longer alive)."
+            _logger.info(
+                "reclaiming stale lock at %s (holder PID %s no longer alive).",
+                lock_path,
+                holder_pid,
             )
             try:
                 lock_path.unlink()
@@ -269,37 +308,45 @@ def acquire_sort_lock(folder: Path) -> Iterator[Path]:
 
     assert fd is not None
     try:
+        # Wrap the fd in a buffered text file so ``json.dump`` benefits
+        # from Python's short-write retry loop in ``BufferedWriter``.
+        # Once ``os.fdopen`` succeeds the wrapper owns the fd and will
+        # close it; null out our reference so the outer ``finally`` does
+        # not double-close.
+        f = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
         try:
             payload = {
                 "pid": os.getpid(),
                 "hostname": this_host,
                 "started_at": datetime.now().isoformat(timespec="seconds"),
             }
-            os.write(fd, json.dumps(payload, indent=2).encode("utf-8"))
-            # fsync so a crash between write and the next sort cannot
-            # leave behind an unparseable empty/partial lock file
-            # (which would force a manual cleanup).
             try:
-                os.fsync(fd)
-            except OSError:
-                # Some filesystems (e.g. tmpfs on macOS) reject fsync
-                # on a regular fd; best-effort.
-                pass
-        except BaseException:
-            # Write failed mid-flight (disk full, signal, etc.). The
-            # O_EXCL create succeeded, so the lock file exists but is
-            # empty/partial — unlink it so the next sort sees a clean
-            # slate rather than an unparseable lock requiring manual
-            # cleanup.
-            try:
-                os.close(fd)
-            finally:
-                fd = None
+                json.dump(payload, f, indent=2)
+                f.flush()
+                # fsync so a crash between write and the next sort
+                # cannot leave behind an unparseable empty/partial
+                # lock file (which would force a manual cleanup).
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Some filesystems (e.g. tmpfs on macOS) reject
+                    # fsync on a regular fd; best-effort.
+                    pass
+            except BaseException:
+                # Write failed mid-flight (disk full, signal, etc.).
+                # The O_EXCL create succeeded, so the lock file exists
+                # but is empty/partial — unlink it so the next sort
+                # sees a clean slate rather than an unparseable lock
+                # requiring manual cleanup. The enclosing ``finally``
+                # closes ``f``.
                 try:
                     lock_path.unlink()
                 except OSError:
                     pass
-            raise
+                raise
+        finally:
+            f.close()
     finally:
         if fd is not None:
             os.close(fd)

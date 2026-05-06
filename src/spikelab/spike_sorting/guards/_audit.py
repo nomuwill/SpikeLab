@@ -66,10 +66,14 @@ def append_audit_event(
     Notes:
         - Writes are serialised through a module-level lock so
           multiple watchdog threads can append safely.
-        - The event line is appended atomically (single ``write``
-          call) — short JSON lines are atomic up to PIPE_BUF on
-          POSIX and within a sector on Windows; corruption
-          requires a system-level failure mid-write.
+        - The event line is appended atomically for short JSON lines
+          — atomic up to PIPE_BUF on POSIX (typically 4096 bytes)
+          and within a sector on Windows. Lines longer than PIPE_BUF
+          may be interleaved by the OS under concurrent writers from
+          different processes (the in-process module lock protects
+          against intra-process interleave). Callers should keep
+          payload fields small; a multi-KB stack trace as a payload
+          would not be safe under heavy cross-process contention.
     """
     try:
         if log_path is None:

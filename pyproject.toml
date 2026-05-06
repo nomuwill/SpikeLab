@@ -180,4 +180,13 @@ filterwarnings = [
     "ignore:__array_wrap__ must accept context:DeprecationWarning",
 ]
 
+# Version ranges SpikeLab is tested against. Used by
+# guards/_preflight.py:_check_spikeinterface_version and
+# _check_kilosort4_host. Keep in sync with the dependency pins
+# above; bumping a pin should be paired with bumping the upper
+# bound here.
+[tool.spikelab.tested_versions]
+spikeinterface = ["0.100.0", "0.110.0"]
+kilosort4 = ["4.0.0", "5.0.0"]
+
 

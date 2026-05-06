@@ -2989,6 +2989,89 @@ class SpikeData:
 
         return avg_rate
 
+    def plot_unit_footprints(
+        self,
+        unit_ids: Sequence[int],
+        *,
+        min_amplitude_uv: float = 5.0,
+        **kwargs,
+    ):
+        """Plot the spatial waveform footprint for one or more units.
+
+        Thin wrapper around
+        :func:`spikelab.spikedata.plot_utils.plot_unit_footprints` that
+        extracts the per-unit ``template_full`` arrays and primary
+        channels from ``neuron_attributes``, and ``channel_locations``
+        from ``metadata``.
+
+        Required attributes on each unit's ``neuron_attributes`` entry:
+            - ``template_full`` (ndarray, shape ``(n_samples, n_channels)``)
+            - ``channel`` (int): primary channel index.
+
+        Required entry in ``metadata``:
+            - ``channel_locations`` (ndarray, shape ``(n_channels, 2)``):
+              channel positions in micrometres.
+
+        Both are populated automatically by the SpikeLab sorting pipeline.
+
+        Parameters:
+            unit_ids (sequence of int): Units to plot. Each must match a
+                ``unit_id`` in ``self.neuron_attributes``.
+            min_amplitude_uv (float): Per-channel peak-to-peak amplitude
+                threshold (µV). Channels below this are omitted (the
+                primary channel is always kept as anchor).
+            **kwargs: Forwarded to
+                :func:`spikelab.spikedata.plot_utils.plot_unit_footprints`
+                (e.g. ``waveform_box_um``, ``n_cols_grid``, ``fig``,
+                ``axes``, ``save_path``, ``show``).
+
+        Returns:
+            fig (matplotlib.figure.Figure): One subplot per unit.
+        """
+        from .plot_utils import plot_unit_footprints
+
+        if self.neuron_attributes is None:
+            raise ValueError("neuron_attributes is None — cannot plot unit footprints.")
+        if self.metadata is None or "channel_locations" not in self.metadata:
+            raise ValueError(
+                "metadata['channel_locations'] is required for footprint "
+                "plotting (shape (n_channels, 2), in micrometres)."
+            )
+
+        unit_ids = list(unit_ids)
+        if len(unit_ids) == 0:
+            raise ValueError("unit_ids must be a non-empty sequence.")
+
+        uid_to_row = {
+            int(attr["unit_id"]): i
+            for i, attr in enumerate(self.neuron_attributes)
+            if "unit_id" in attr
+        }
+        if not uid_to_row:
+            raise ValueError(
+                "neuron_attributes entries must carry a 'unit_id' key for "
+                "footprint plotting."
+            )
+        missing = [u for u in unit_ids if int(u) not in uid_to_row]
+        if missing:
+            raise ValueError(f"unit_ids not present in this SpikeData: {missing}")
+
+        templates_full = []
+        primary_channels = []
+        for uid in unit_ids:
+            attr = self.neuron_attributes[uid_to_row[int(uid)]]
+            templates_full.append(attr.get("template_full"))
+            primary_channels.append(int(attr.get("channel", -1)))
+
+        return plot_unit_footprints(
+            channel_xy=self.metadata["channel_locations"],
+            templates_full=templates_full,
+            primary_channels=primary_channels,
+            unit_labels=unit_ids,
+            min_amplitude_uv=min_amplitude_uv,
+            **kwargs,
+        )
+
     # ------------------------------------------------------------------
     # Curation
     # ------------------------------------------------------------------

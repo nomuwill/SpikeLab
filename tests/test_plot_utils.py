@@ -23,6 +23,7 @@ from spikelab.spikedata.plot_utils import (
     plot_aligned_slice_single_unit,
     plot_manifold,
     plot_spatial_network,
+    plot_unit_footprints,
     _style_axes,
     _style_axes_heatmap,
 )
@@ -3987,3 +3988,302 @@ class TestCoverageGaps:
         with pytest.raises(IndexError):
             plot_scatter(ax, x, y, groups=groups, group_colors=["red"])
         plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# plot_unit_footprints tests
+# ---------------------------------------------------------------------------
+
+
+def _make_footprint_inputs(
+    n_channels=12, n_samples=41, n_units=2, peak_uv=20.0, primary_pitch_um=20.0
+):
+    """Build channel positions, per-unit template_full arrays, primary chans.
+
+    Channel layout: a 2D rectangular grid roughly square, spaced at
+    ``primary_pitch_um``. Each unit has a single dominant channel with a
+    biphasic template; neighbors decay with distance from the primary.
+    """
+    rng = np.random.default_rng(0)
+    n_cols = int(np.ceil(np.sqrt(n_channels)))
+    n_rows = int(np.ceil(n_channels / n_cols))
+    coords = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if len(coords) < n_channels:
+                coords.append((c * primary_pitch_um, r * primary_pitch_um))
+    chan_xy = np.array(coords, dtype=float)
+
+    # Biphasic waveform on a sample axis
+    t = np.linspace(-1.0, 3.0, n_samples)
+    base = -np.exp(-((t - 0.0) ** 2) / 0.05) + 0.4 * np.exp(-((t - 0.6) ** 2) / 0.4)
+    base /= max(np.max(np.abs(base)), 1e-9)
+
+    templates_full = []
+    primary_channels = []
+    rng_choices = rng.choice(n_channels, size=n_units, replace=False)
+    for u in range(n_units):
+        primary = int(rng_choices[u])
+        # decay = peak amplitude per channel based on distance to primary
+        d = np.linalg.norm(chan_xy - chan_xy[primary], axis=1)
+        decay = np.exp(-d / (1.5 * primary_pitch_um))
+        per_channel_amp = peak_uv * decay
+        tf = base[:, None] * per_channel_amp[None, :]
+        templates_full.append(tf.astype(np.float32))
+        primary_channels.append(primary)
+    return chan_xy, templates_full, primary_channels
+
+
+class TestPlotUnitFootprints:
+    """Tests for plot_unit_footprints (spatial waveform-footprint plotter)."""
+
+    def test_main_usage_returns_figure_with_one_subplot_per_unit(self):
+        """
+        Main usage: figure has one visible axes per unit, each with a
+        primary-channel trace and reference dots.
+
+        Tests:
+            (Test Case 1) Returns a Figure with len(unit_ids) visible axes.
+            (Test Case 2) Each axes has at least one Line2D (primary trace)
+                          and one PathCollection (reference dots).
+        """
+        chan_xy, templates_full, primary = _make_footprint_inputs(
+            n_channels=12, n_units=3
+        )
+        fig = plot_unit_footprints(
+            chan_xy, templates_full, primary, min_amplitude_uv=2.0
+        )
+        assert isinstance(fig, matplotlib.figure.Figure)
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) == 3
+        for ax in visible_axes:
+            assert len(ax.lines) >= 1
+            assert len(ax.collections) >= 1
+
+    def test_threshold_filters_below_amplitude_channels(self):
+        """
+        Channels below ``min_amplitude_uv`` are not drawn (other than the
+        primary anchor). Raising the threshold reduces the count of drawn
+        traces while keeping the primary trace.
+
+        Tests:
+            (Test Case 1) High threshold leaves only the primary trace.
+            (Test Case 2) Low threshold draws strictly more traces.
+        """
+        chan_xy, templates_full, primary = _make_footprint_inputs(
+            n_channels=12, n_units=1, peak_uv=20.0
+        )
+        # Disable the scale bar so the line count reflects waveforms only.
+        fig_low = plot_unit_footprints(
+            chan_xy,
+            templates_full,
+            primary,
+            min_amplitude_uv=0.5,
+            show_amplitude_scale_bar=False,
+        )
+        fig_high = plot_unit_footprints(
+            chan_xy,
+            templates_full,
+            primary,
+            min_amplitude_uv=1e6,
+            show_amplitude_scale_bar=False,
+        )
+        n_low = len(fig_low.axes[0].lines)
+        n_high = len(fig_high.axes[0].lines)
+        assert n_high == 1  # only the primary anchor remains
+        assert n_low > n_high
+
+    def test_external_axes_are_used(self):
+        """
+        When the caller passes ``axes``, the function plots into them and
+        does not create a new figure.
+
+        Tests:
+            (Test Case 1) The returned figure is the same as the axes' figure.
+            (Test Case 2) Each provided axes has at least the primary trace
+                          drawn on it.
+        """
+        chan_xy, templates_full, primary = _make_footprint_inputs(n_units=2)
+        fig, ax_arr = plt.subplots(1, 2)
+        out = plot_unit_footprints(
+            chan_xy,
+            templates_full,
+            primary,
+            axes=list(ax_arr),
+            min_amplitude_uv=0.5,
+        )
+        assert out is fig
+        for ax in ax_arr:
+            assert len(ax.lines) >= 1
+
+    def test_axes_length_mismatch_raises(self):
+        """
+        Passing ``axes`` of the wrong length raises ValueError.
+
+        Tests:
+            (Test Case 1) axes shorter than n_units raises ValueError.
+        """
+        chan_xy, templates_full, primary = _make_footprint_inputs(n_units=2)
+        fig, ax_arr = plt.subplots(1, 1)
+        with pytest.raises(ValueError):
+            plot_unit_footprints(chan_xy, templates_full, primary, axes=[ax_arr])
+
+    def test_empty_unit_list_raises(self):
+        """
+        An empty templates_full sequence is invalid.
+
+        Tests:
+            (Test Case 1) Empty templates_full raises ValueError.
+        """
+        chan_xy = np.zeros((4, 2))
+        with pytest.raises(ValueError):
+            plot_unit_footprints(chan_xy, [], [])
+
+    def test_bad_channel_xy_shape_raises(self):
+        """
+        channel_xy must have shape (n_channels, 2).
+
+        Tests:
+            (Test Case 1) 1-D channel_xy raises ValueError.
+            (Test Case 2) 3-column channel_xy raises ValueError.
+        """
+        templates_full = [np.zeros((10, 4), dtype=np.float32)]
+        with pytest.raises(ValueError):
+            plot_unit_footprints(np.zeros(8), templates_full, [0], min_amplitude_uv=0.0)
+        with pytest.raises(ValueError):
+            plot_unit_footprints(
+                np.zeros((4, 3)), templates_full, [0], min_amplitude_uv=0.0
+            )
+
+    def test_template_channel_mismatch_warns_and_skips(self):
+        """
+        A unit whose ``template_full`` second-axis does not match
+        ``n_channels`` is skipped with a warning; that subplot is hidden.
+
+        Tests:
+            (Test Case 1) Bad-shape unit triggers UserWarning.
+            (Test Case 2) Its subplot is invisible; the good unit's subplot
+                          remains visible.
+        """
+        chan_xy, _, _ = _make_footprint_inputs(n_channels=12, n_units=1)
+        good_tf = _make_footprint_inputs(n_channels=12, n_units=1)[1][0]
+        bad_tf = np.zeros((10, 7), dtype=np.float32)  # wrong n_channels
+        with pytest.warns(UserWarning):
+            fig = plot_unit_footprints(
+                chan_xy,
+                [good_tf, bad_tf],
+                [0, 0],
+                min_amplitude_uv=0.5,
+            )
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) == 1
+
+    def test_primary_channel_out_of_range_warns_and_skips(self):
+        """
+        Primary channel index outside [0, n_channels) leads to a warning
+        and a hidden subplot.
+
+        Tests:
+            (Test Case 1) Out-of-range primary triggers UserWarning.
+            (Test Case 2) Subplot for that unit is invisible.
+        """
+        chan_xy, templates_full, _ = _make_footprint_inputs(n_channels=12, n_units=1)
+        with pytest.warns(UserWarning):
+            fig = plot_unit_footprints(
+                chan_xy,
+                templates_full,
+                [999],  # out of range
+                min_amplitude_uv=0.5,
+            )
+        assert all(not ax.get_visible() for ax in fig.axes)
+
+
+class TestSpikeDataPlotUnitFootprints:
+    """Tests for the SpikeData.plot_unit_footprints wrapper."""
+
+    def _make_sd_with_footprints(self, n_channels=12, n_units=3):
+        chan_xy, templates_full, primary = _make_footprint_inputs(
+            n_channels=n_channels, n_units=n_units
+        )
+        rng = np.random.default_rng(1)
+        trains = [
+            sorted(rng.uniform(0, 100.0, size=5).tolist()) for _ in range(n_units)
+        ]
+        neuron_attributes = [
+            {
+                "unit_id": u,
+                "channel": int(primary[u]),
+                "template_full": templates_full[u],
+            }
+            for u in range(n_units)
+        ]
+        sd = SpikeData(
+            trains,
+            N=n_units,
+            length=100.0,
+            metadata={"channel_locations": chan_xy},
+            neuron_attributes=neuron_attributes,
+        )
+        return sd
+
+    def test_wrapper_dispatches_to_plot_utils(self):
+        """
+        Calling SpikeData.plot_unit_footprints returns a matplotlib figure
+        with one visible axes per requested unit.
+
+        Tests:
+            (Test Case 1) Returns a Figure.
+            (Test Case 2) The number of visible axes equals len(unit_ids).
+        """
+        sd = self._make_sd_with_footprints(n_units=2)
+        fig = sd.plot_unit_footprints([0, 1], min_amplitude_uv=0.5)
+        assert isinstance(fig, matplotlib.figure.Figure)
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) == 2
+
+    def test_wrapper_raises_for_missing_unit(self):
+        """
+        Requesting a unit_id that is not in neuron_attributes raises
+        ValueError.
+
+        Tests:
+            (Test Case 1) Unknown unit_id raises ValueError.
+        """
+        sd = self._make_sd_with_footprints(n_units=2)
+        with pytest.raises(ValueError):
+            sd.plot_unit_footprints([99])
+
+    def test_wrapper_raises_when_channel_locations_missing(self):
+        """
+        SpikeData without metadata['channel_locations'] cannot be plotted.
+
+        Tests:
+            (Test Case 1) Missing channel_locations raises ValueError.
+        """
+        sd = self._make_sd_with_footprints(n_units=1)
+        sd.metadata.pop("channel_locations", None)
+        with pytest.raises(ValueError):
+            sd.plot_unit_footprints([0])
+
+    def test_wrapper_raises_when_neuron_attributes_missing(self):
+        """
+        SpikeData with neuron_attributes=None cannot be plotted.
+
+        Tests:
+            (Test Case 1) None neuron_attributes raises ValueError.
+        """
+        sd = self._make_sd_with_footprints(n_units=1)
+        sd.neuron_attributes = None
+        with pytest.raises(ValueError):
+            sd.plot_unit_footprints([0])
+
+    def test_wrapper_empty_unit_list_raises(self):
+        """
+        An empty unit_ids list is invalid.
+
+        Tests:
+            (Test Case 1) Empty unit_ids raises ValueError.
+        """
+        sd = self._make_sd_with_footprints(n_units=1)
+        with pytest.raises(ValueError):
+            sd.plot_unit_footprints([])

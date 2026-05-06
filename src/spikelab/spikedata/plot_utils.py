@@ -14,6 +14,8 @@ and ``plot_spatial_network`` for MEA spatial network visualisation.
 Requires ``matplotlib`` (optional dependency).
 """
 
+import warnings
+
 import numpy as np
 
 
@@ -2483,3 +2485,318 @@ def plot_spatial_network(
         )
 
     return sc
+
+
+def plot_unit_footprints(
+    channel_xy,
+    templates_full,
+    primary_channels,
+    *,
+    unit_labels=None,
+    min_amplitude_uv=5.0,
+    waveform_box_um=None,
+    waveform_color="black",
+    waveform_alpha=0.85,
+    waveform_lw=0.8,
+    primary_color="tab:red",
+    bg_dot_color="lightgray",
+    bg_dot_size=4.0,
+    bg_dot_alpha=0.4,
+    n_cols_grid=None,
+    fig=None,
+    axes=None,
+    pad_um=60.0,
+    view_radius_um=None,
+    title_fontsize=11,
+    title_format="unit {label}  (primary ch {primary}, "
+    "{n_kept} ch ≥ {min_amp:g} µV)",
+    show_amplitude_scale_bar=True,
+    waveform_scale_uv=None,
+    scale_bar_color="black",
+    scale_bar_lw=2.0,
+    scale_bar_fontsize=9,
+    save_path=None,
+    show=False,
+):
+    """Plot the spatial waveform footprint of one or more sorted units.
+
+    For each unit, draws the unit's average waveform at every recording
+    channel where the per-channel peak-to-peak amplitude exceeds
+    ``min_amplitude_uv``. Each waveform glyph is anchored at the channel's
+    (x, y) position. Channels below threshold are not drawn. The unit's
+    primary channel waveform is drawn in ``primary_color`` for emphasis,
+    and every channel position is marked with a small reference dot.
+
+    Each unit gets its own subplot; the grid auto-sizes to roughly square.
+
+    Parameters:
+        channel_xy (np.ndarray): Channel positions, shape ``(n_channels, 2)``,
+            in micrometres.
+        templates_full (sequence of np.ndarray): One average-waveform array
+            per unit, each shape ``(n_samples, n_channels)``, in microvolts.
+            Pass ``None`` for a unit to skip it (the corresponding subplot
+            is hidden and a warning is emitted).
+        primary_channels (sequence of int): Primary-channel index for each
+            unit. Out-of-range entries cause that unit to be skipped with
+            a warning.
+        unit_labels (sequence or None): Labels used in subplot titles. If
+            ``None``, units are titled by index.
+        min_amplitude_uv (float): Per-channel peak-to-peak amplitude
+            threshold in microvolts. Channels below this are omitted (the
+            primary channel is always kept as anchor).
+        waveform_box_um (tuple of float or None): ``(width, height)`` of
+            each embedded waveform glyph in micrometres. Defaults to
+            ``0.8 * median_inter_channel_pitch``.
+        waveform_color (str): Colour for non-primary waveform traces.
+        waveform_alpha (float): Alpha for waveform traces.
+        waveform_lw (float): Line width for waveform traces.
+        primary_color (str): Colour for the primary-channel waveform.
+        bg_dot_color (str): Colour for channel-position reference dots.
+        bg_dot_size (float): Marker size for reference dots.
+        bg_dot_alpha (float): Alpha for reference dots.
+        n_cols_grid (int or None): Number of subplot columns. Defaults to
+            ``ceil(sqrt(n_units))``.
+        fig (matplotlib.figure.Figure or None): External figure. When
+            given without ``axes``, a new grid of axes is added to it.
+        axes (sequence of Axes or None): External axes (one per unit).
+            Length must equal the number of units.
+        pad_um (float): Padding in micrometres around the bounding box of
+            the plotted channels for each subplot. Ignored when
+            ``view_radius_um`` is set.
+        view_radius_um (float or None): When set, each subplot is forced
+            to a window of ``primary_x ± view_radius_um`` by
+            ``primary_y ± view_radius_um`` centred on that unit's primary
+            channel. Useful for keeping every footprint at the same
+            spatial scale regardless of how many channels pass the
+            amplitude threshold.
+        title_fontsize (int): Title font size for each subplot.
+        title_format (str): Format string for each subplot title. Available
+            keys: ``label`` (the unit label), ``primary`` (primary channel
+            index), ``n_kept`` (number of channels above threshold),
+            ``min_amp`` (the threshold). Pass ``"unit {label}"`` for the
+            minimal title or ``""`` to suppress.
+        show_amplitude_scale_bar (bool): If True, draw a vertical scale
+            bar in the lower-right of each subplot whose visual length
+            equals half the waveform glyph height (``box_h / 2``) and
+            whose label is the µV value that height represents — i.e.
+            the bar represents 0 → ``ymax`` µV (per-subplot ``ymax`` by
+            default, or ``waveform_scale_uv`` when set).
+        waveform_scale_uv (float or None): Forces all subplots to use
+            this value (in µV) as the y-scaling reference, so that the
+            same physical voltage maps to the same visual height in
+            every subplot. Combined with ``show_amplitude_scale_bar``,
+            this gives a consistent-size scale bar across the whole
+            figure. Strong waveforms may overflow their glyph box. When
+            ``None`` (default), each subplot scales to its own peak
+            amplitude.
+        scale_bar_color (str): Colour for the scale bar and label.
+        scale_bar_lw (float): Line width for the scale bar.
+        scale_bar_fontsize (int): Font size for the scale-bar label.
+        save_path (str or None): Save the figure to this path and close it.
+        show (bool): Call ``plt.show()`` when ``save_path`` is None.
+
+    Returns:
+        fig (matplotlib.figure.Figure): The figure containing one subplot
+            per unit.
+
+    Notes:
+        - Per-channel amplitude is the peak-to-peak of the average waveform
+          on that channel. This selects the spatial extent of the unit's
+          signal independently of any unit-level SNR threshold.
+        - The primary channel is always drawn as the anchor, even if it
+          would fall below ``min_amplitude_uv``.
+    """
+    plt, _ = _import_matplotlib()
+
+    channel_xy = np.asarray(channel_xy)
+    if channel_xy.ndim != 2 or channel_xy.shape[1] != 2:
+        raise ValueError(
+            f"channel_xy must have shape (n_channels, 2); " f"got {channel_xy.shape}."
+        )
+    n_channels = channel_xy.shape[0]
+
+    templates_full = list(templates_full)
+    primary_channels = list(primary_channels)
+    n_units = len(templates_full)
+    if n_units == 0:
+        raise ValueError("templates_full must be a non-empty sequence.")
+    if len(primary_channels) != n_units:
+        raise ValueError(
+            f"primary_channels length ({len(primary_channels)}) must match "
+            f"templates_full ({n_units})."
+        )
+    if unit_labels is None:
+        unit_labels = list(range(n_units))
+    elif len(unit_labels) != n_units:
+        raise ValueError(
+            f"unit_labels length ({len(unit_labels)}) must match "
+            f"templates_full ({n_units})."
+        )
+
+    # Default glyph size: 80% of median nearest-neighbour channel pitch
+    if waveform_box_um is None:
+        if n_channels >= 2:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(channel_xy)
+            dd, _ = tree.query(channel_xy, k=2)
+            median_pitch = float(np.median(dd[:, 1]))
+        else:
+            median_pitch = 17.5
+        box_w = box_h = 0.8 * max(median_pitch, 1.0)
+    else:
+        box_w, box_h = float(waveform_box_um[0]), float(waveform_box_um[1])
+
+    # Resolve subplot grid
+    if axes is not None:
+        ax_list = list(axes)
+        if len(ax_list) != n_units:
+            raise ValueError(
+                f"axes length ({len(ax_list)}) must equal n_units " f"({n_units})."
+            )
+        fig = ax_list[0].figure
+    else:
+        n_cols = int(n_cols_grid) if n_cols_grid else int(np.ceil(np.sqrt(n_units)))
+        n_rows = int(np.ceil(n_units / n_cols))
+        if fig is None:
+            fig, ax_arr = plt.subplots(
+                n_rows,
+                n_cols,
+                figsize=(4.5 * n_cols, 4.0 * n_rows),
+                squeeze=False,
+            )
+        else:
+            ax_arr = fig.subplots(n_rows, n_cols, squeeze=False)
+        ax_list = [ax_arr[r, c] for r in range(n_rows) for c in range(n_cols)]
+        for ax in ax_list[n_units:]:
+            ax.set_visible(False)
+        ax_list = ax_list[:n_units]
+
+    for ax, label, tf, primary_chan in zip(
+        ax_list, unit_labels, templates_full, primary_channels
+    ):
+        if tf is None:
+            warnings.warn(f"unit {label}: template_full is None; skipping.")
+            ax.set_visible(False)
+            continue
+        tf = np.asarray(tf)
+        if tf.ndim != 2 or tf.shape[1] != n_channels:
+            warnings.warn(
+                f"unit {label}: template_full shape {tf.shape} does not "
+                f"match channel_xy n_channels={n_channels}; skipping."
+            )
+            ax.set_visible(False)
+            continue
+        primary_chan = int(primary_chan)
+        if primary_chan < 0 or primary_chan >= n_channels:
+            warnings.warn(
+                f"unit {label}: primary channel {primary_chan} out of "
+                f"range [0, {n_channels}); skipping."
+            )
+            ax.set_visible(False)
+            continue
+
+        # Per-channel peak-to-peak amplitude
+        p2p = tf.max(axis=0) - tf.min(axis=0)
+        keep = np.where(p2p > min_amplitude_uv)[0]
+        if primary_chan not in keep:
+            keep = np.unique(np.append(keep, primary_chan))
+
+        # Reference dots: every channel position
+        ax.scatter(
+            channel_xy[:, 0],
+            channel_xy[:, 1],
+            s=bg_dot_size,
+            c=bg_dot_color,
+            alpha=bg_dot_alpha,
+            zorder=1,
+            linewidths=0,
+        )
+
+        # Waveforms anchored at channel positions. The y-scaling reference
+        # is either the per-subplot peak amplitude (default) or a fixed
+        # waveform_scale_uv shared across subplots.
+        if waveform_scale_uv is not None:
+            ymax = float(waveform_scale_uv)
+        elif keep.size:
+            ymax = float(np.max(np.abs(tf[:, keep])))
+        else:
+            ymax = 1.0
+        ymax = max(ymax, 1e-6)
+        n_samples = tf.shape[0]
+        t_axis = np.linspace(-box_w / 2.0, box_w / 2.0, n_samples)
+        for ch in keep:
+            ch = int(ch)
+            cx, cy = channel_xy[ch]
+            wf = tf[:, ch]
+            ys = (wf / ymax) * (box_h / 2.0)
+            color = primary_color if ch == primary_chan else waveform_color
+            lw = waveform_lw * (1.6 if ch == primary_chan else 1.0)
+            ax.plot(
+                cx + t_axis,
+                cy + ys,
+                color=color,
+                alpha=waveform_alpha,
+                linewidth=lw,
+                zorder=3 if ch == primary_chan else 2,
+            )
+
+        if view_radius_um is not None:
+            cx, cy = channel_xy[primary_chan]
+            r = float(view_radius_um)
+            ax.set_xlim(cx - r, cx + r)
+            ax.set_ylim(cy - r, cy + r)
+        elif keep.size:
+            xs = channel_xy[keep, 0]
+            ys_pos = channel_xy[keep, 1]
+            ax.set_xlim(xs.min() - pad_um - box_w, xs.max() + pad_um + box_w)
+            ax.set_ylim(ys_pos.min() - pad_um - box_h, ys_pos.max() + pad_um + box_h)
+        ax.set_aspect("equal", adjustable="box")
+
+        # Amplitude scale bar in the lower-right corner: visual length =
+        # half the waveform glyph height, label = ymax \u00b5V.
+        if show_amplitude_scale_bar:
+            xlim_lo, xlim_hi = ax.get_xlim()
+            ylim_lo, ylim_hi = ax.get_ylim()
+            x_span = xlim_hi - xlim_lo
+            y_span = ylim_hi - ylim_lo
+            bar_x = xlim_hi - 0.06 * x_span
+            bar_y_lo = ylim_lo + 0.06 * y_span
+            bar_y_hi = bar_y_lo + (box_h / 2.0)
+            ax.plot(
+                [bar_x, bar_x],
+                [bar_y_lo, bar_y_hi],
+                color=scale_bar_color,
+                linewidth=scale_bar_lw,
+                solid_capstyle="butt",
+                clip_on=False,
+            )
+            ax.text(
+                bar_x - 0.02 * x_span,
+                (bar_y_lo + bar_y_hi) / 2.0,
+                f"{ymax:.0f} \u00b5V",
+                ha="right",
+                va="center",
+                fontsize=scale_bar_fontsize,
+                color=scale_bar_color,
+            )
+
+        if title_format:
+            ax.set_title(
+                title_format.format(
+                    label=label,
+                    primary=primary_chan,
+                    n_kept=int(keep.size),
+                    min_amp=min_amplitude_uv,
+                ),
+                fontsize=title_fontsize,
+            )
+        ax.set_xlabel("x (\u00b5m)")
+        ax.set_ylabel("y (\u00b5m)")
+
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+        plt.close(fig)
+    elif show:
+        plt.show()
+    return fig

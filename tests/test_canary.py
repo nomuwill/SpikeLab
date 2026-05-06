@@ -528,9 +528,15 @@ class TestBuildCanaryConfigOverridesExtra:
         from spikelab.spike_sorting.canary import _build_canary_config
 
         cfg = SortingPipelineConfig()
-        assert _build_canary_config(cfg, 30.0).execution.sorter_inactivity_base_s == 120.0
-        assert _build_canary_config(cfg, 60.0).execution.sorter_inactivity_base_s == 240.0
-        assert _build_canary_config(cfg, 120.0).execution.sorter_inactivity_base_s == 300.0
+        assert (
+            _build_canary_config(cfg, 30.0).execution.sorter_inactivity_base_s == 120.0
+        )
+        assert (
+            _build_canary_config(cfg, 60.0).execution.sorter_inactivity_base_s == 240.0
+        )
+        assert (
+            _build_canary_config(cfg, 120.0).execution.sorter_inactivity_base_s == 300.0
+        )
 
     def test_start_and_end_time_set_to_window(self):
         """
@@ -838,9 +844,7 @@ class TestRunCanaryInterPathBoundaries:
         # Return a classified failure to exit early — keeps the test
         # hermetic without needing a real backend.
         exc = InsufficientActivityError("mock", sorter="kilosort2")
-        monkeypatch.setattr(
-            pipeline_mod, "process_recording", lambda *a, **kw: exc
-        )
+        monkeypatch.setattr(pipeline_mod, "process_recording", lambda *a, **kw: exc)
 
         result = run_canary(
             cfg,
@@ -854,6 +858,5 @@ class TestRunCanaryInterPathBoundaries:
         # The recorded mkdir call landed under the (formerly missing)
         # parent — the helper created it via parents=True.
         assert any(
-            nonexistent in p.parents or p.parent == nonexistent
-            for p in mkdir_paths
+            nonexistent in p.parents or p.parent == nonexistent for p in mkdir_paths
         )

@@ -321,9 +321,7 @@ class LogInactivityWatchdog:
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
         if kill_grace_s < 0.0:
-            raise ValueError(
-                f"kill_grace_s must be non-negative, got {kill_grace_s}."
-            )
+            raise ValueError(f"kill_grace_s must be non-negative, got {kill_grace_s}.")
         self.log_path = Path(log_path)
         self.popen = popen
         self.inactivity_s = float(inactivity_s) if inactivity_s is not None else None

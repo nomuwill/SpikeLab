@@ -554,11 +554,7 @@ def _load_tested_version_ranges() -> Tuple[Tuple[str, str], Tuple[str, str]]:
                     data = tomllib.load(f)
             except Exception:
                 break
-            tested = (
-                data.get("tool", {})
-                .get("spikelab", {})
-                .get("tested_versions", {})
-            )
+            tested = data.get("tool", {}).get("spikelab", {}).get("tested_versions", {})
             si = tested.get("spikeinterface")
             ks4 = tested.get("kilosort4")
             si_range = (
@@ -802,8 +798,7 @@ def _ping_docker_daemon() -> Tuple[bool, Optional[PreflightFinding]]:
             code="sorter_dependency_missing",
             category="environment",
             message=(
-                f"Docker daemon is not reachable: `docker info` "
-                f"failed ({exc!r})."
+                f"Docker daemon is not reachable: `docker info` " f"failed ({exc!r})."
             ),
             remediation=(
                 "Start Docker Desktop / the docker service, or "
@@ -1056,9 +1051,7 @@ def _check_rt_sort(config: Any) -> List[PreflightFinding]:
         if spec is None:
             if module_name == "torch":
                 torch_missing = True
-            reason = (
-                repr(spec_error) if spec_error is not None else "module not found"
-            )
+            reason = repr(spec_error) if spec_error is not None else "module not found"
             findings.append(
                 PreflightFinding(
                     level="fail",
@@ -1350,9 +1343,7 @@ def _check_recording_sample_rate(
             # block the whole preflight. Logged at debug so genuine
             # loader bugs are still observable to operators who
             # enable verbose logging.
-            _logger.debug(
-                "skipping sample-rate check for %r: %r", rec, exc
-            )
+            _logger.debug("skipping sample-rate check for %r: %r", rec, exc)
             continue
         # NaN comparisons are always False, so without an explicit
         # check a NaN sampling rate would silently fall into the

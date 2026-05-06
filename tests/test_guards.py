@@ -899,7 +899,9 @@ class TestReportFindings:
             (Test Case 1) report_findings([]) does not raise.
             (Test Case 2) Logs the "all checks passed" line.
         """
-        with caplog.at_level(logging.INFO, logger="spikelab.spike_sorting.guards._preflight"):
+        with caplog.at_level(
+            logging.INFO, logger="spikelab.spike_sorting.guards._preflight"
+        ):
             report_findings([])
         assert any("all checks passed" in r.getMessage() for r in caplog.records)
 
@@ -912,7 +914,9 @@ class TestReportFindings:
             (Test Case 2) A WARNING-level record is emitted.
         """
         findings = [PreflightFinding(level="warn", code="low_ram", message="m")]
-        with caplog.at_level(logging.WARNING, logger="spikelab.spike_sorting.guards._preflight"):
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._preflight"
+        ):
             report_findings(findings, strict=False)
         assert any(r.levelname == "WARNING" for r in caplog.records)
 
@@ -3816,9 +3820,7 @@ class TestWindowsJobObjectCap:
 
         with (
             mock.patch.object(job_mod.sys, "platform", "win32"),
-            mock.patch.object(
-                job_mod, "_get_total_ram_bytes", return_value=ram_bytes
-            ),
+            mock.patch.object(job_mod, "_get_total_ram_bytes", return_value=ram_bytes),
             mock.patch("builtins.__import__", _fake_import),
         ):
             with windows_job_object_cap(0.5) as active:
@@ -4585,9 +4587,7 @@ class TestPreventSleepMacos:
 
         proc = mock.Mock(spec=subprocess.Popen)
         captured: list = []
-        monkeypatch.setattr(
-            ps, "_spawn_inhibitor", lambda argv, label: proc
-        )
+        monkeypatch.setattr(ps, "_spawn_inhibitor", lambda argv, label: proc)
         monkeypatch.setattr(
             ps,
             "_terminate_inhibitor",
@@ -4899,8 +4899,7 @@ class TestFormatThrottleReasons:
         )
 
         assert (
-            _format_throttle_reasons(0x4 | 0x40)
-            == "SW power cap, HW thermal slowdown"
+            _format_throttle_reasons(0x4 | 0x40) == "SW power cap, HW thermal slowdown"
         )
         assert (
             _format_throttle_reasons(0x4 | 0x8 | 0x80)
@@ -4935,9 +4934,7 @@ class TestGetTotalRamBytes:
         from spikelab.spike_sorting import sorting_utils
         from spikelab.spike_sorting.guards._job_object import _get_total_ram_bytes
 
-        monkeypatch.setattr(
-            sorting_utils, "get_system_ram_bytes", lambda: 16 * 1024**3
-        )
+        monkeypatch.setattr(sorting_utils, "get_system_ram_bytes", lambda: 16 * 1024**3)
         assert _get_total_ram_bytes() == 16 * 1024**3
 
     def test_returns_none_on_underlying_exception(self, monkeypatch):
@@ -5094,9 +5091,7 @@ class TestIOStallWatchdogProperties:
 class TestIOStallWatchdogMaybeWarn:
     """``IOStallWatchdog._maybe_warn`` logs a warning + audit event."""
 
-    def test_logs_warning_message_with_device_and_thresholds(
-        self, tmp_path, caplog
-    ):
+    def test_logs_warning_message_with_device_and_thresholds(self, tmp_path, caplog):
         """
         ``_maybe_warn`` emits a WARNING log record naming the device
         and the configured stall tolerance.
@@ -5307,9 +5302,7 @@ class TestDiskUsageWatchdogMaybeWarn:
         assert captured[0]["event"] == "warn"
         assert captured[0]["free_gb"] == 3.5
 
-    def test_repeat_within_window_is_suppressed(
-        self, tmp_path, caplog, monkeypatch
-    ):
+    def test_repeat_within_window_is_suppressed(self, tmp_path, caplog, monkeypatch):
         """
         A second ``_maybe_warn`` call within ``warn_repeat_s`` of
         the first emits no record and no audit event.
@@ -5346,9 +5339,7 @@ class TestDiskUsageWatchdogMaybeWarn:
         assert not records, "expected the second call to be rate-limited"
         assert len(captured) == 1, "audit event should fire only on the first call"
 
-    def test_call_after_window_emits_again(
-        self, tmp_path, caplog, monkeypatch
-    ):
+    def test_call_after_window_emits_again(self, tmp_path, caplog, monkeypatch):
         """
         Reset the ``_last_warn_t`` to before the window and verify a
         subsequent ``_maybe_warn`` is allowed through.
@@ -5388,9 +5379,7 @@ class TestDiskUsageWatchdogMaybeWarn:
 class TestTopConsumersWithTimeout:
     """``DiskUsageWatchdog._top_consumers_with_timeout`` is bounded."""
 
-    def test_returns_walk_result_when_timeout_not_exceeded(
-        self, tmp_path, monkeypatch
-    ):
+    def test_returns_walk_result_when_timeout_not_exceeded(self, tmp_path, monkeypatch):
         """
         Walk completes inside ``timeout_s`` → returns the result.
 
@@ -5552,7 +5541,14 @@ def _make_fake_pynvml(
     ``_init_calls`` / ``_shutdown_calls`` so tests can assert that
     cleanup actually ran.
     """
-    counters = {"init": 0, "shutdown": 0, "handle": 0, "mem": 0, "temp": 0, "throttle": 0}
+    counters = {
+        "init": 0,
+        "shutdown": 0,
+        "handle": 0,
+        "mem": 0,
+        "temp": 0,
+        "throttle": 0,
+    }
     handle_sentinel = object()
     info = SimpleNamespace(used=mem_used, total=mem_total)
 
@@ -5658,9 +5654,7 @@ class TestPynvmlSession:
         assert fake._counters["init"] == 1
         assert fake._counters["handle"] == 0
 
-    def test_start_returns_false_on_handle_failure_and_shuts_down(
-        self, monkeypatch
-    ):
+    def test_start_returns_false_on_handle_failure_and_shuts_down(self, monkeypatch):
         """
         ``nvmlDeviceGetHandleByIndex`` raising → ``start()`` returns
         False and runs ``nvmlShutdown`` so the NVML context is not
@@ -6051,9 +6045,7 @@ class TestGpuMemoryWatchdogThermalProperties:
         assert wd.trip_kind() is None
         assert wd.temperature_c_at_trip() is None
 
-    def test_memory_trip_sets_kind_to_memory_and_leaves_temp_none(
-        self, monkeypatch
-    ):
+    def test_memory_trip_sets_kind_to_memory_and_leaves_temp_none(self, monkeypatch):
         """
         After ``_on_abort`` (VRAM trip), ``trip_kind`` is "memory"
         and ``temperature_c_at_trip`` remains None.
@@ -6078,9 +6070,7 @@ class TestGpuMemoryWatchdogThermalProperties:
         assert wd.trip_kind() == "memory"
         assert wd.temperature_c_at_trip() is None
 
-    def test_thermal_trip_sets_kind_to_thermal_and_records_temp(
-        self, monkeypatch
-    ):
+    def test_thermal_trip_sets_kind_to_thermal_and_records_temp(self, monkeypatch):
         """
         After ``_on_thermal_abort``, ``trip_kind`` is "thermal" and
         ``temperature_c_at_trip`` carries the at-trip reading.
@@ -6205,9 +6195,7 @@ class TestGpuMemoryWatchdogMaybeWarnTemp:
 class TestGpuMemoryWatchdogMaybeWarnThrottle:
     """``_maybe_warn_throttle`` rate-limits + audits NVML throttle bits."""
 
-    def test_first_call_logs_warning_with_decoded_reasons(
-        self, caplog, monkeypatch
-    ):
+    def test_first_call_logs_warning_with_decoded_reasons(self, caplog, monkeypatch):
         """
         First call emits a WARNING with the decoded throttle reasons
         and appends a ``gpu_throttle warn`` audit event carrying
@@ -6538,9 +6526,7 @@ class TestGpuMemoryWatchdogKillTargetsSubprocess:
         popen.kill.assert_called_once()
         assert sleeps == [2.0]
 
-    def test_terminate_exception_logged_and_continues(
-        self, caplog, monkeypatch
-    ):
+    def test_terminate_exception_logged_and_continues(self, caplog, monkeypatch):
         """
         ``popen.terminate()`` raising is logged at ERROR and does
         not block the rest of the kill cascade.
@@ -6569,9 +6555,7 @@ class TestGpuMemoryWatchdogKillTargetsSubprocess:
         ):
             wd._kill_targets_and_interrupt()
         records = [r for r in caplog.records if r.levelname == "ERROR"]
-        assert any(
-            "terminate() failed" in r.getMessage() for r in records
-        )
+        assert any("terminate() failed" in r.getMessage() for r in records)
 
     def test_per_callback_exception_isolated(self, caplog, monkeypatch):
         """
@@ -6642,9 +6626,7 @@ class TestDiskUsageWatchdogOnTripSubprocess:
         )
         wd._on_trip(0.5)
         # Look for an abort event among the captured calls.
-        abort_events = [
-            e for e in captured if e.get("event") == "abort"
-        ]
+        abort_events = [e for e in captured if e.get("event") == "abort"]
         assert abort_events, "expected an abort audit event"
         ev = abort_events[0]
         assert ev["watchdog"] == "disk"
@@ -6654,9 +6636,7 @@ class TestDiskUsageWatchdogOnTripSubprocess:
         # Kill callback runs after the audit/report.
         assert kill_called == [True]
 
-    def test_terminates_popen_then_kills_after_grace(
-        self, tmp_path, monkeypatch
-    ):
+    def test_terminates_popen_then_kills_after_grace(self, tmp_path, monkeypatch):
         """
         Registered popen is terminated, then killed after the
         grace period.
@@ -6723,9 +6703,7 @@ class TestDiskUsageWatchdogOnTripSubprocess:
         )
         popen.kill.assert_called_once()
 
-    def test_kill_callback_system_exit_propagates(
-        self, tmp_path, monkeypatch
-    ):
+    def test_kill_callback_system_exit_propagates(self, tmp_path, monkeypatch):
         """
         ``kill_callback`` raising ``SystemExit`` propagates out of
         ``_on_trip`` (the operator-requested abort must not be
@@ -6756,9 +6734,7 @@ class TestDiskUsageWatchdogOnTripSubprocess:
 class TestDiskUsageWatchdogBuildReport:
     """``DiskUsageWatchdog._build_report`` produces the trip report."""
 
-    def test_consumed_clamped_at_zero_when_folder_shrunk(
-        self, tmp_path, monkeypatch
-    ):
+    def test_consumed_clamped_at_zero_when_folder_shrunk(self, tmp_path, monkeypatch):
         """
         If the folder is smaller at trip than at entry (sorter
         cleaned up before crashing), ``bytes_consumed_during_sort``
@@ -6770,12 +6746,8 @@ class TestDiskUsageWatchdogBuildReport:
         """
         from spikelab.spike_sorting.guards import _disk_watchdog as disk_mod
 
-        monkeypatch.setattr(
-            disk_mod, "_folder_size_bytes", lambda folder: 200.0
-        )
-        monkeypatch.setattr(
-            disk_mod, "_top_consumers", lambda folder: []
-        )
+        monkeypatch.setattr(disk_mod, "_folder_size_bytes", lambda folder: 200.0)
+        monkeypatch.setattr(disk_mod, "_top_consumers", lambda folder: [])
         wd = DiskUsageWatchdog(
             folder=tmp_path,
             warn_free_gb=5.0,
@@ -6801,12 +6773,8 @@ class TestDiskUsageWatchdogBuildReport:
         """
         from spikelab.spike_sorting.guards import _disk_watchdog as disk_mod
 
-        monkeypatch.setattr(
-            disk_mod, "_folder_size_bytes", lambda folder: 0.0
-        )
-        monkeypatch.setattr(
-            disk_mod, "_top_consumers", lambda folder: []
-        )
+        monkeypatch.setattr(disk_mod, "_folder_size_bytes", lambda folder: 0.0)
+        monkeypatch.setattr(disk_mod, "_top_consumers", lambda folder: [])
 
         # Projection-based path.
         wd_with_proj = DiskUsageWatchdog(
@@ -6819,9 +6787,7 @@ class TestDiskUsageWatchdogBuildReport:
         wd_with_proj._initial_folder_size = 0.0
         wd_with_proj._initial_top_consumers = []
         report = wd_with_proj._build_report(free_gb=2.0)
-        assert any(
-            "projects ~15.0 GB" in s for s in report.suggested_actions
-        )
+        assert any("projects ~15.0 GB" in s for s in report.suggested_actions)
 
         # Generic path (no projection).
         wd_generic = DiskUsageWatchdog(
@@ -6833,9 +6799,7 @@ class TestDiskUsageWatchdogBuildReport:
         wd_generic._initial_folder_size = 0.0
         wd_generic._initial_top_consumers = []
         report = wd_generic._build_report(free_gb=2.0)
-        assert any(
-            "Free at least 5.0 GB" in s for s in report.suggested_actions
-        )
+        assert any("Free at least 5.0 GB" in s for s in report.suggested_actions)
 
     def test_falls_back_to_initial_top_consumers_on_timeout(
         self, tmp_path, monkeypatch
@@ -6852,9 +6816,7 @@ class TestDiskUsageWatchdogBuildReport:
         """
         from spikelab.spike_sorting.guards import _disk_watchdog as disk_mod
 
-        monkeypatch.setattr(
-            disk_mod, "_folder_size_bytes", lambda folder: 0.0
-        )
+        monkeypatch.setattr(disk_mod, "_folder_size_bytes", lambda folder: 0.0)
         wd = DiskUsageWatchdog(
             folder=tmp_path,
             warn_free_gb=5.0,
@@ -6924,9 +6886,7 @@ class TestLogInactivityWatchdogOnTripSubprocess:
         """
         from spikelab.spike_sorting.guards import _inactivity as inactivity_mod
 
-        monkeypatch.setattr(
-            inactivity_mod, "append_audit_event", lambda **kw: None
-        )
+        monkeypatch.setattr(inactivity_mod, "append_audit_event", lambda **kw: None)
         monkeypatch.setattr(inactivity_mod.time, "sleep", lambda s: None)
 
         popen = mock.Mock(spec=subprocess.Popen)
@@ -6966,9 +6926,7 @@ class TestLogInactivityWatchdogOnTripSubprocess:
         """
         from spikelab.spike_sorting.guards import _inactivity as inactivity_mod
 
-        monkeypatch.setattr(
-            inactivity_mod, "append_audit_event", lambda **kw: None
-        )
+        monkeypatch.setattr(inactivity_mod, "append_audit_event", lambda **kw: None)
         monkeypatch.setattr(inactivity_mod.time, "sleep", lambda s: None)
 
         def _raise():
@@ -7356,22 +7314,14 @@ class TestPreflightWslconfigMultipleSections:
             _parse_wslconfig_memory_gb,
         )
 
-        text = (
-            "[wsl2]\n"
-            "memory=8GB\n"
-            "\n"
-            "[wsl2]\n"
-            "memory=32GB\n"
-        )
+        text = "[wsl2]\n" "memory=8GB\n" "\n" "[wsl2]\n" "memory=32GB\n"
         assert _parse_wslconfig_memory_gb(text) == 8.0
 
 
 class TestSortLockEmptyHostname:
     """``acquire_sort_lock`` handles empty hostnames."""
 
-    def test_same_empty_hostname_treated_as_same_host(
-        self, tmp_path, monkeypatch
-    ):
+    def test_same_empty_hostname_treated_as_same_host(self, tmp_path, monkeypatch):
         """
         Empty-string hostname (some containerised environments
         report ``""``) compares equal to itself, so the same-host
@@ -7538,9 +7488,7 @@ class TestDiskUsageWatchdogContextEdges:
         """
         from spikelab.spike_sorting.guards import _disk_watchdog as disk_mod
 
-        monkeypatch.setattr(
-            disk_mod, "_folder_size_bytes", lambda folder: 1234.0
-        )
+        monkeypatch.setattr(disk_mod, "_folder_size_bytes", lambda folder: 1234.0)
         monkeypatch.setattr(
             disk_mod,
             "_top_consumers",
@@ -7800,9 +7748,7 @@ class TestCheckResourceRlimitsHealthy:
         from spikelab.spike_sorting.guards import _preflight as pf
 
         # Patch both calls (one per RLIMIT) to return generous limits.
-        monkeypatch.setattr(
-            _resource, "getrlimit", lambda _name: (65536, 65536)
-        )
+        monkeypatch.setattr(_resource, "getrlimit", lambda _name: (65536, 65536))
 
         cfg = SimpleNamespace(rt_sort=None)
         findings = pf._check_resource_rlimits(cfg)
@@ -8018,9 +7964,7 @@ class TestEstimateRtSortIntermediateGbEdges:
             estimate_rt_sort_intermediate_gb,
         )
 
-        result = estimate_rt_sort_intermediate_gb(
-            n_channels=0, n_samples=1_000_000
-        )
+        result = estimate_rt_sort_intermediate_gb(n_channels=0, n_samples=1_000_000)
         assert result == 0.0
 
     def test_negative_inputs_return_negative_gb(self):
@@ -8038,9 +7982,7 @@ class TestEstimateRtSortIntermediateGbEdges:
             estimate_rt_sort_intermediate_gb,
         )
 
-        result = estimate_rt_sort_intermediate_gb(
-            n_channels=-100, n_samples=1_000_000
-        )
+        result = estimate_rt_sort_intermediate_gb(n_channels=-100, n_samples=1_000_000)
         assert result < 0
 
 
@@ -8186,9 +8128,7 @@ class TestFolderSizeBytesEdges:
 class TestCleanupTempFilesUnlinkFailure:
     """``cleanup_temp_files`` increments a failed counter when unlink raises."""
 
-    def test_unlink_failure_does_not_propagate(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_unlink_failure_does_not_propagate(self, tmp_path, monkeypatch, caplog):
         """
         A per-file ``unlink`` failure is swallowed and counted in the
         ``failed`` total rather than aborting the sweep. Subsequent
@@ -8228,8 +8168,7 @@ class TestCleanupTempFilesUnlinkFailure:
         # The summary log line was emitted with a non-zero failed count.
         messages = [r.getMessage() for r in caplog.records]
         assert any(
-            "swept 0 stale temp file(s)" in m and "2 failed" in m
-            for m in messages
+            "swept 0 stale temp file(s)" in m and "2 failed" in m for m in messages
         )
 
 
@@ -8396,9 +8335,7 @@ class TestHdf5PluginFindingEdges:
 class TestListMarkerFilesRglobError:
     """``_list_marker_files`` swallows ``OSError`` raised by ``rglob``."""
 
-    def test_rglob_oserror_inside_marker_subdir_swallowed(
-        self, tmp_path, monkeypatch
-    ):
+    def test_rglob_oserror_inside_marker_subdir_swallowed(self, tmp_path, monkeypatch):
         """
         When a marker-named directory raises ``OSError`` from
         ``rglob`` (e.g. permission denied descending into a subtree)
@@ -8620,9 +8557,7 @@ class TestCleanupTempFilesGetTempDirRaises:
 class TestCheckKilosort2HostKsDirIsFile:
     """``_check_kilosort2_host`` fails when ``KILOSORT_PATH`` points to a file."""
 
-    def test_ks_dir_is_file_yields_missing_dir_finding(
-        self, tmp_path, monkeypatch
-    ):
+    def test_ks_dir_is_file_yields_missing_dir_finding(self, tmp_path, monkeypatch):
         """
         A ``KILOSORT_PATH`` that exists but is a regular file fails
         ``ks_dir.is_dir()`` and yields the ``does not exist`` fail
@@ -8839,9 +8774,7 @@ class TestLogInactivityMakeErrorCustomMessage:
 class TestSortLockCleanupOnExitSwallow:
     """``acquire_sort_lock`` swallows ``OSError`` on lock-removal at exit."""
 
-    def test_unlink_failure_at_exit_does_not_propagate(
-        self, tmp_path, monkeypatch
-    ):
+    def test_unlink_failure_at_exit_does_not_propagate(self, tmp_path, monkeypatch):
         """
         When the final ``lock_path.unlink()`` in the cleanup ``finally``
         raises ``OSError`` (e.g. an external process removed the lock
@@ -8896,9 +8829,7 @@ class TestHostMemoryWatchdogMaybeWarn:
             (Test Case 1) Two back-to-back ``_maybe_warn`` calls →
                 exactly one WARNING log record.
         """
-        wd = HostMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, warn_repeat_s=300.0
-        )
+        wd = HostMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, warn_repeat_s=300.0)
         with caplog.at_level(
             logging.WARNING,
             logger="spikelab.spike_sorting.guards._watchdog",
@@ -8906,9 +8837,7 @@ class TestHostMemoryWatchdogMaybeWarn:
             wd._maybe_warn(75.0)
             wd._maybe_warn(76.0)
 
-        warnings = [
-            r for r in caplog.records if "system memory at" in r.getMessage()
-        ]
+        warnings = [r for r in caplog.records if "system memory at" in r.getMessage()]
         assert len(warnings) == 1
 
     def test_audit_event_appended_on_warn(self, monkeypatch):
@@ -8942,9 +8871,7 @@ class TestHostMemoryWatchdogMaybeWarn:
 class TestHostMemoryWatchdogOnAbortPlumbing:
     """``HostMemoryWatchdog._on_abort`` wiring of callbacks + snapshot swallow."""
 
-    def test_kill_callbacks_run_alongside_subprocess_termination(
-        self, monkeypatch
-    ):
+    def test_kill_callbacks_run_alongside_subprocess_termination(self, monkeypatch):
         """
         ``_on_abort`` runs registered kill callbacks via
         ``_run_kill_callbacks`` in addition to terminating registered
@@ -9078,9 +9005,7 @@ class TestHostMemoryWatchdogTerminateRegistered:
         # to terminate.
         good.terminate.assert_called_once()
         # The first's failure was logged.
-        assert any(
-            "terminate() failed" in r.getMessage() for r in caplog.records
-        )
+        assert any("terminate() failed" in r.getMessage() for r in caplog.records)
 
     def test_kill_exception_logged_does_not_propagate(self, caplog):
         """
@@ -9162,18 +9087,14 @@ class TestGpuMemoryWatchdogMaybeWarn:
             wd._maybe_warn(75.0)
             wd._maybe_warn(80.0)
 
-        vram_warnings = [
-            r for r in caplog.records if "VRAM at" in r.getMessage()
-        ]
+        vram_warnings = [r for r in caplog.records if "VRAM at" in r.getMessage()]
         assert len(vram_warnings) == 1
 
 
 class TestIOStallPollLoopBaselineAndWarn:
     """``IOStallWatchdog._poll_loop`` initial baseline + 50% warn branch."""
 
-    def test_initial_last_bytes_none_seeds_baseline_without_tripping(
-        self, tmp_path
-    ):
+    def test_initial_last_bytes_none_seeds_baseline_without_tripping(self, tmp_path):
         """
         When the very first inside-loop read of the byte counter
         returns ``None`` (transient between ``__enter__``'s probe and
@@ -9244,9 +9165,7 @@ class TestIOStallPollLoopBaselineAndWarn:
                 with wd:
                     deadline = time.time() + 0.85
                     while time.time() < deadline:
-                        if any(
-                            "idle for" in r.getMessage() for r in caplog.records
-                        ):
+                        if any("idle for" in r.getMessage() for r in caplog.records):
                             break
                         time.sleep(0.05)
 
@@ -9276,12 +9195,8 @@ class TestRunPreflightMultiFinding:
         )
         # Mute the v2 dispatchers used in the existing TestRunPreflight
         # autouse fixture so this standalone class behaves the same.
-        monkeypatch.setattr(
-            preflight_mod, "_check_sorter_dependencies", lambda c: []
-        )
-        monkeypatch.setattr(
-            preflight_mod, "_check_gpu_device_present", lambda c: None
-        )
+        monkeypatch.setattr(preflight_mod, "_check_sorter_dependencies", lambda c: [])
+        monkeypatch.setattr(preflight_mod, "_check_gpu_device_present", lambda c: None)
         monkeypatch.setattr(
             preflight_mod, "_check_recording_sample_rate", lambda c, recs: []
         )
@@ -9868,9 +9783,7 @@ class TestDiskUsageWatchdogPollLoopWarnThenTrip:
                 while time.time() < deadline and not wd.tripped():
                     time.sleep(0.05)
 
-        warn_records = [
-            r for r in caplog.records if "free disk" in r.getMessage()
-        ]
+        warn_records = [r for r in caplog.records if "free disk" in r.getMessage()]
         assert len(warn_records) >= 1
         assert wd.tripped()
 
@@ -10175,9 +10088,7 @@ class TestCleanupTempFilesPostSweepExceptionSwallow:
             with cleanup_temp_files(enabled=True):
                 pass  # Body runs cleanly.
 
-        assert any(
-            "sweep failed" in r.getMessage() for r in caplog.records
-        )
+        assert any("sweep failed" in r.getMessage() for r in caplog.records)
 
 
 class TestRunKillCallbacksEmpty:
@@ -10256,17 +10167,13 @@ class TestRunCanaryRecNameInBanner:
                 rec_name="my_special_recording_007",
             )
 
-        assert any(
-            "my_special_recording_007" in r.getMessage() for r in caplog.records
-        )
+        assert any("my_special_recording_007" in r.getMessage() for r in caplog.records)
 
 
 class TestRunCanaryEmptySorterNameFallsBackToConfig:
     """``run_canary`` empty ``sorter_name`` falls back to the config value."""
 
-    def test_empty_sorter_name_uses_config_sorter_name(
-        self, tmp_path, monkeypatch
-    ):
+    def test_empty_sorter_name_uses_config_sorter_name(self, tmp_path, monkeypatch):
         """
         Passing ``sorter_name=""`` (falsy) makes ``sorter_name or
         getattr(config.sorter, "sorter_name", "")`` return the config
@@ -10451,9 +10358,7 @@ class TestGpuMemoryWatchdogPollLoopCachedVsFallback:
             shutdown=lambda: None,
         )
 
-        wd = GpuMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05
-        )
+        wd = GpuMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05)
         with wd:
             wd._session = fake_session
             # After session injection, the next-poll calls go through
@@ -10484,9 +10389,7 @@ class TestGpuMemoryWatchdogPollLoopCachedVsFallback:
         monkeypatch.setattr(gpu_mod, "read_gpu_memory", lambda i: (10.0, 16.0))
         monkeypatch.setattr(gpu_mod._PynvmlSession, "start", lambda self: False)
 
-        wd = GpuMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05
-        )
+        wd = GpuMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05)
         with wd:
             assert wd._session is None
             # Now patch the module-level reader to count calls.
@@ -10513,12 +10416,8 @@ class TestRunPreflightFindingOrdering:
             sorter_name="kilosort4",
             hdf5_plugin_path="/totally/missing/plugin/dir",
         )
-        monkeypatch.setattr(
-            preflight_mod, "_check_sorter_dependencies", lambda c: []
-        )
-        monkeypatch.setattr(
-            preflight_mod, "_check_gpu_device_present", lambda c: None
-        )
+        monkeypatch.setattr(preflight_mod, "_check_sorter_dependencies", lambda c: [])
+        monkeypatch.setattr(preflight_mod, "_check_gpu_device_present", lambda c: None)
         monkeypatch.setattr(
             preflight_mod, "_check_recording_sample_rate", lambda c, recs: []
         )
@@ -10531,9 +10430,7 @@ class TestRunPreflightFindingOrdering:
         codes = [f.code for f in findings]
 
         # Disk findings come before RAM findings.
-        disk_idx = next(
-            i for i, c in enumerate(codes) if c.startswith("low_disk")
-        )
+        disk_idx = next(i for i, c in enumerate(codes) if c.startswith("low_disk"))
         ram_idx = codes.index("low_ram")
         vram_idx = codes.index("low_vram")
         hdf5_idx = codes.index("hdf5_plugin_missing")
@@ -10544,9 +10441,7 @@ class TestRunPreflightFindingOrdering:
 class TestAcquireSortLockRetryAfterStaleReclaim:
     """``acquire_sort_lock`` retries the create after reclaiming a stale lock."""
 
-    def test_stale_lock_reclaim_then_acquire_succeeds(
-        self, tmp_path, monkeypatch
-    ):
+    def test_stale_lock_reclaim_then_acquire_succeeds(self, tmp_path, monkeypatch):
         """
         With a stale lock present (dead PID, same host), the helper
         reclaims it via ``unlink()`` then retries the ``O_EXCL``
@@ -10563,10 +10458,12 @@ class TestAcquireSortLockRetryAfterStaleReclaim:
         # Place a stale lock that will be reclaimed.
         stale = tmp_path / ".spikelab_sort.lock"
         stale.write_text(
-            json.dumps({
-                "pid": 99999,
-                "hostname": "fake-host",  # different host → would raise
-            }),
+            json.dumps(
+                {
+                    "pid": 99999,
+                    "hostname": "fake-host",  # different host → would raise
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -10679,9 +10576,7 @@ class TestMakeInProcessKillCallbackGraceValidation:
 class TestLogInactivityPollLoopLogDisappears:
     """``LogInactivityWatchdog._poll_loop`` resets clock when log file vanishes."""
 
-    def test_log_deleted_mid_sort_does_not_falsely_trip(
-        self, tmp_path, caplog
-    ):
+    def test_log_deleted_mid_sort_does_not_falsely_trip(self, tmp_path, caplog):
         """
         When the log file is deleted mid-sort (external log rotation,
         manual cleanup) after the watchdog has already seen the file,
@@ -10727,8 +10622,7 @@ class TestLogInactivityPollLoopLogDisappears:
 
         # Log-disappearance warning emitted exactly once.
         disappear_warnings = [
-            r for r in caplog.records
-            if "disappeared" in r.getMessage()
+            r for r in caplog.records if "disappeared" in r.getMessage()
         ]
         assert len(disappear_warnings) == 1
 
@@ -10774,9 +10668,7 @@ class TestDiskUsageOnTripDeadPopenKillCallback:
         wd._build_report = lambda free: SimpleNamespace(top_consumers=[])
 
         sleep_args = []
-        monkeypatch.setattr(
-            dw.time, "sleep", lambda s: sleep_args.append(s)
-        )
+        monkeypatch.setattr(dw.time, "sleep", lambda s: sleep_args.append(s))
 
         wd._on_trip(0.5)
 
@@ -10787,9 +10679,7 @@ class TestDiskUsageOnTripDeadPopenKillCallback:
 class TestRunCanaryMissingRecPath:
     """``run_canary`` classification when ``rec_path`` does not exist."""
 
-    def test_classified_failure_from_loader_returned(
-        self, tmp_path, monkeypatch
-    ):
+    def test_classified_failure_from_loader_returned(self, tmp_path, monkeypatch):
         """
         With ``recording=None`` and a non-existent ``rec_path``, the
         backend loader's ``EnvironmentSortFailure`` is classified and
@@ -11178,9 +11068,7 @@ class TestInterruptDeliveryReclassificationChain:
 class TestInterruptDeliveryFailedFlag:
     """``interrupt_delivery_failed()`` is True when ``_thread.interrupt_main`` raises."""
 
-    def test_host_memory_watchdog_sets_flag_on_interrupt_failure(
-        self, monkeypatch
-    ):
+    def test_host_memory_watchdog_sets_flag_on_interrupt_failure(self, monkeypatch):
         """
         ``HostMemoryWatchdog._on_abort`` sets ``_interrupt_main_failed``
         when ``_thread.interrupt_main`` raises, writes an
@@ -11256,8 +11144,7 @@ class TestInterruptDeliveryFailedFlag:
         assert wd.tripped() is True
         assert wd.interrupt_delivery_failed() is True
         delivery_events = [
-            e for e in captured
-            if e.get("event") == "interrupt_delivery_failed"
+            e for e in captured if e.get("event") == "interrupt_delivery_failed"
         ]
         assert delivery_events
         assert delivery_events[0]["device_index"] == 1
@@ -11282,9 +11169,7 @@ class TestInterruptDeliveryFailedFlag:
         wd._device = "sda1"
 
         captured = []
-        monkeypatch.setattr(
-            iom, "append_audit_event", lambda **kw: captured.append(kw)
-        )
+        monkeypatch.setattr(iom, "append_audit_event", lambda **kw: captured.append(kw))
 
         # Patch the locally-imported _thread inside _on_trip.
         import _thread as _t_real
@@ -11299,8 +11184,7 @@ class TestInterruptDeliveryFailedFlag:
         assert wd.tripped() is True
         assert wd.interrupt_delivery_failed() is True
         delivery_events = [
-            e for e in captured
-            if e.get("event") == "interrupt_delivery_failed"
+            e for e in captured if e.get("event") == "interrupt_delivery_failed"
         ]
         assert delivery_events
         assert delivery_events[0]["watchdog"] == "io_stall"
@@ -11327,9 +11211,7 @@ class TestInterruptDeliveryFailedFlag:
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
-            io_stall = IOStallWatchdog(
-                _P(td), stall_s=10.0, poll_interval_s=1.0
-            )
+            io_stall = IOStallWatchdog(_P(td), stall_s=10.0, poll_interval_s=1.0)
             assert io_stall.interrupt_delivery_failed() is False
 
 
@@ -11366,9 +11248,7 @@ class TestWatchdogExitContextVarResetSwallow:
         """
         from spikelab.spike_sorting.guards import _gpu_watchdog as gpu_mod
 
-        wd = GpuMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0
-        )
+        wd = GpuMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0)
         ctx_var, used_token = self._make_used_token()
         wd._token = used_token  # type: ignore[assignment]
 
@@ -11385,9 +11265,7 @@ class TestWatchdogExitContextVarResetSwallow:
         assert wd._token is None
         assert shutdown_calls["count"] == 1
 
-    def test_io_stall_watchdog_exit_swallows_runtime_error(
-        self, tmp_path, monkeypatch
-    ):
+    def test_io_stall_watchdog_exit_swallows_runtime_error(self, tmp_path, monkeypatch):
         """
         ``IOStallWatchdog.__exit__`` swallows ``RuntimeError`` from a
         re-used token; the with-block teardown completes silently.
@@ -11408,9 +11286,7 @@ class TestWatchdogExitContextVarResetSwallow:
 
         assert wd._token is None
 
-    def test_host_memory_watchdog_exit_swallows_runtime_error(
-        self, monkeypatch
-    ):
+    def test_host_memory_watchdog_exit_swallows_runtime_error(self, monkeypatch):
         """
         ``HostMemoryWatchdog.__exit__`` (newly symmetric with the GPU
         and IO stall watchdogs) swallows ``RuntimeError`` from a
@@ -11446,9 +11322,7 @@ class TestWatchdogExitContextVarResetSwallow:
 class TestPynvmlSessionDoubleFailure:
     """``_PynvmlSession.start`` swallows both inner exceptions on double failure."""
 
-    def test_handle_failure_with_shutdown_failure_returns_false(
-        self, monkeypatch
-    ):
+    def test_handle_failure_with_shutdown_failure_returns_false(self, monkeypatch):
         """
         When ``nvmlDeviceGetHandleByIndex`` raises *and* the cleanup
         ``nvmlShutdown`` also raises, both exceptions are swallowed
@@ -11492,9 +11366,7 @@ class TestReadGpuMemoryNvidiaSmiSkipsMalformedLines:
         from spikelab.spike_sorting.guards import _gpu_watchdog as gpu_mod
 
         out = "garbage\nfoo, bar\n0, 1024, 4096\n"
-        monkeypatch.setattr(
-            gpu_mod.subprocess, "check_output", lambda *a, **k: out
-        )
+        monkeypatch.setattr(gpu_mod.subprocess, "check_output", lambda *a, **k: out)
         result = gpu_mod._read_gpu_memory_nvidia_smi(0)
         assert result is not None
         used_pct, total_gb = result
@@ -11521,13 +11393,9 @@ class TestGpuMemoryWatchdogEnterPynvmlSessionFailure:
         from spikelab.spike_sorting.guards import _gpu_watchdog as gpu_mod
 
         monkeypatch.setattr(gpu_mod, "read_gpu_memory", lambda i: (10.0, 16.0))
-        monkeypatch.setattr(
-            gpu_mod._PynvmlSession, "start", lambda self: False
-        )
+        monkeypatch.setattr(gpu_mod._PynvmlSession, "start", lambda self: False)
 
-        wd = GpuMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0
-        )
+        wd = GpuMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0)
         with wd:
             assert wd._enabled is True
             assert wd._session is None
@@ -11565,9 +11433,7 @@ class TestGpuMemoryWatchdogPollLoopThermalAbort:
 
         monkeypatch.setattr(gpu_mod, "read_gpu_memory", lambda i: (10.0, 16.0))
         # Force _PynvmlSession.start() to populate ourselves with the fake.
-        monkeypatch.setattr(
-            gpu_mod._PynvmlSession, "start", lambda self: False
-        )
+        monkeypatch.setattr(gpu_mod._PynvmlSession, "start", lambda self: False)
 
         wd = GpuMemoryWatchdog(
             warn_pct=70.0,
@@ -11621,9 +11487,7 @@ class TestGpuMemoryWatchdogPollLoopThrottleWarn:
         )
 
         monkeypatch.setattr(gpu_mod, "read_gpu_memory", lambda i: (10.0, 16.0))
-        monkeypatch.setattr(
-            gpu_mod._PynvmlSession, "start", lambda self: False
-        )
+        monkeypatch.setattr(gpu_mod._PynvmlSession, "start", lambda self: False)
 
         wd = GpuMemoryWatchdog(
             warn_pct=70.0,
@@ -11672,13 +11536,9 @@ class TestGpuMemoryWatchdogPollLoopInfoNoneSkip:
                 return None
 
         monkeypatch.setattr(gpu_mod, "read_gpu_memory", _read)
-        monkeypatch.setattr(
-            gpu_mod._PynvmlSession, "start", lambda self: False
-        )
+        monkeypatch.setattr(gpu_mod._PynvmlSession, "start", lambda self: False)
 
-        wd = GpuMemoryWatchdog(
-            warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05
-        )
+        wd = GpuMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05)
         with wd:
             time.sleep(0.4)
             assert not wd.tripped()
@@ -11932,9 +11792,7 @@ class TestFindTrippedGlobalWatchdogPriority:
                                 "_resolve_device_for_path",
                                 return_value="sda1",
                             ),
-                            mock.patch.object(
-                                iom, "_read_io_bytes", return_value=100
-                            ),
+                            mock.patch.object(iom, "_read_io_bytes", return_value=100),
                         ):
                             with IOStallWatchdog(
                                 tmp_path,
@@ -12240,9 +12098,7 @@ class TestHostMemoryWatchdogEnterEnabledFlag:
         fake_vm = SimpleNamespace(percent=10.0)
         fake_psutil = SimpleNamespace(virtual_memory=lambda: fake_vm)
         with mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
-            wd = HostMemoryWatchdog(
-                warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0
-            )
+            wd = HostMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=60.0)
             with wd:
                 assert wd._enabled is True
                 assert wd._thread is not None
@@ -12273,9 +12129,7 @@ class TestHostMemoryWatchdogPollLoopPsutilRetry:
 
         fake_psutil = SimpleNamespace(virtual_memory=_flaky)
         with mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
-            wd = HostMemoryWatchdog(
-                warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05
-            )
+            wd = HostMemoryWatchdog(warn_pct=70.0, abort_pct=90.0, poll_interval_s=0.05)
             with wd:
                 time.sleep(0.4)
                 assert not wd.tripped()
@@ -12371,9 +12225,7 @@ class TestPreflightWslconfigFindingExtra:
 
         # Pre-create a real .wslconfig so the file-existence check passes.
         home = tmp_path
-        monkeypatch.setattr(
-            pf.os.path, "expanduser", lambda _: str(home)
-        )
+        monkeypatch.setattr(pf.os.path, "expanduser", lambda _: str(home))
         wslconfig = home / ".wslconfig"
         wslconfig.write_text("[wsl2]\nmemory=8GB\n")
 
@@ -12419,9 +12271,7 @@ class TestPreflightWslconfigFindingExtra:
         )
         assert pf._wslconfig_finding(cfg) is None
 
-    def test_host_ram_undetectable_falls_through_to_none(
-        self, tmp_path, monkeypatch
-    ):
+    def test_host_ram_undetectable_falls_through_to_none(self, tmp_path, monkeypatch):
         """
         When ``get_system_ram_bytes`` returns None or raises, the
         host-vs-config comparison is skipped and the function returns
@@ -12901,9 +12751,7 @@ class TestReadGpuMemoryNvidiaSmiPositive:
         # Output: index, used_mib, total_mib. 8 GB = 8192 MiB.
         # Line 0 device-0 something; line 1 garbage; line 2 matches.
         out = "0, 1024, 16384\nbadline\n1, 4096, 8192\n"
-        monkeypatch.setattr(
-            gpu_mod.subprocess, "check_output", lambda *a, **k: out
-        )
+        monkeypatch.setattr(gpu_mod.subprocess, "check_output", lambda *a, **k: out)
         result = gpu_mod._read_gpu_memory_nvidia_smi(1)
         assert result is not None
         used_pct, total_gb = result
@@ -13000,18 +12848,14 @@ class TestReadGpuMemoryCascade:
             smi_calls["count"] += 1
             return (99.9, 99.9)
 
-        monkeypatch.setattr(
-            gpu_mod, "_read_gpu_memory_pynvml", lambda i: (10.0, 16.0)
-        )
+        monkeypatch.setattr(gpu_mod, "_read_gpu_memory_pynvml", lambda i: (10.0, 16.0))
         monkeypatch.setattr(gpu_mod, "_read_gpu_memory_nvidia_smi", _smi)
 
         result = gpu_mod.read_gpu_memory(0)
         assert result == (10.0, 16.0)
         assert smi_calls["count"] == 0
 
-    def test_falls_back_to_nvidia_smi_when_pynvml_returns_none(
-        self, monkeypatch
-    ):
+    def test_falls_back_to_nvidia_smi_when_pynvml_returns_none(self, monkeypatch):
         """
         ``_read_gpu_memory_pynvml`` returning None triggers the
         nvidia-smi fallback; its tuple is the final result.

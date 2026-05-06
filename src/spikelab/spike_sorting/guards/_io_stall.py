@@ -212,17 +212,13 @@ class IOStallWatchdog:
         kill_grace_s: float = 5.0,
     ) -> None:
         if stall_s <= 0.0:
-            raise ValueError(
-                f"stall_s must be positive, got {stall_s}."
-            )
+            raise ValueError(f"stall_s must be positive, got {stall_s}.")
         if poll_interval_s <= 0.0:
             raise ValueError(
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
         if kill_grace_s < 0.0:
-            raise ValueError(
-                f"kill_grace_s must be non-negative, got {kill_grace_s}."
-            )
+            raise ValueError(f"kill_grace_s must be non-negative, got {kill_grace_s}.")
         self.folder = Path(folder)
         self.stall_s = float(stall_s)
         self.poll_interval_s = float(poll_interval_s)
@@ -485,9 +481,7 @@ class IOStallWatchdog:
         # next sort, an exception handler, or the interactive
         # prompt. Skip it.
         if self._stop_event.is_set():
-            _logger.info(
-                "suppressing interrupt_main: watchdog is already exiting."
-            )
+            _logger.info("suppressing interrupt_main: watchdog is already exiting.")
             return
         try:
             import _thread as _t

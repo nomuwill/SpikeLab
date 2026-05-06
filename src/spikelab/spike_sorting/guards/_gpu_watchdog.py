@@ -505,9 +505,7 @@ class GpuMemoryWatchdog:
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
         if kill_grace_s < 0.0:
-            raise ValueError(
-                f"kill_grace_s must be non-negative, got {kill_grace_s}."
-            )
+            raise ValueError(f"kill_grace_s must be non-negative, got {kill_grace_s}.")
         if (
             warn_temp_c is not None
             and abort_temp_c is not None
@@ -849,9 +847,7 @@ class GpuMemoryWatchdog:
                         not thermal_blind_warned
                         and now - thermal_blind_started_t >= blind_threshold_s
                     ):
-                        self._warn_blind_thermal(
-                            now - thermal_blind_started_t
-                        )
+                        self._warn_blind_thermal(now - thermal_blind_started_t)
                         thermal_blind_warned = True
                 else:
                     thermal_blind_started_t = None
@@ -1085,9 +1081,7 @@ class GpuMemoryWatchdog:
         # next — the next sort, an exception handler, or the
         # interactive prompt. Skip it.
         if self._stop_event.is_set():
-            _logger.info(
-                "suppressing interrupt_main: watchdog is already exiting."
-            )
+            _logger.info("suppressing interrupt_main: watchdog is already exiting.")
             return
         try:
             _thread.interrupt_main()

@@ -236,9 +236,7 @@ class DiskUsageWatchdog:
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
         if kill_grace_s < 0.0:
-            raise ValueError(
-                f"kill_grace_s must be non-negative, got {kill_grace_s}."
-            )
+            raise ValueError(f"kill_grace_s must be non-negative, got {kill_grace_s}.")
 
         self.folder = Path(folder)
         self.warn_free_gb = float(warn_free_gb)
@@ -392,10 +390,7 @@ class DiskUsageWatchdog:
                 # the abort path otherwise.
                 if blind_started_t is None:
                     blind_started_t = now
-                elif (
-                    not blind_warned
-                    and now - blind_started_t >= blind_threshold_s
-                ):
+                elif not blind_warned and now - blind_started_t >= blind_threshold_s:
                     self._warn_blind(now - blind_started_t)
                     blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)

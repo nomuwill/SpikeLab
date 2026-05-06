@@ -129,9 +129,7 @@ class HostMemoryWatchdog:
                 f"poll_interval_s must be positive, got {poll_interval_s}."
             )
         if kill_grace_s < 0.0:
-            raise ValueError(
-                f"kill_grace_s must be non-negative, got {kill_grace_s}."
-            )
+            raise ValueError(f"kill_grace_s must be non-negative, got {kill_grace_s}.")
 
         self.warn_pct = float(warn_pct)
         self.abort_pct = float(abort_pct)
@@ -386,10 +384,7 @@ class HostMemoryWatchdog:
                 # warning instead of silently disabling the abort path.
                 if blind_started_t is None:
                     blind_started_t = now
-                elif (
-                    not blind_warned
-                    and now - blind_started_t >= blind_threshold_s
-                ):
+                elif not blind_warned and now - blind_started_t >= blind_threshold_s:
                     self._warn_blind(now - blind_started_t)
                     blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
@@ -401,10 +396,7 @@ class HostMemoryWatchdog:
             if math.isnan(pct):
                 if blind_started_t is None:
                     blind_started_t = now
-                elif (
-                    not blind_warned
-                    and now - blind_started_t >= blind_threshold_s
-                ):
+                elif not blind_warned and now - blind_started_t >= blind_threshold_s:
                     self._warn_blind(now - blind_started_t)
                     blind_warned = True
                 self._stop_event.wait(self.poll_interval_s)
@@ -498,9 +490,7 @@ class HostMemoryWatchdog:
         # next — the next sort, an exception handler, or the
         # interactive prompt. Skip it.
         if self._stop_event.is_set():
-            _logger.info(
-                "suppressing interrupt_main: watchdog is already exiting."
-            )
+            _logger.info("suppressing interrupt_main: watchdog is already exiting.")
             return
         try:
             _thread.interrupt_main()

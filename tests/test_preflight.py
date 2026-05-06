@@ -1229,9 +1229,7 @@ class TestSpikeInterfaceVersionCheck:
 class TestDetectGpuDeviceCountExtra:
     """``_detect_gpu_device_count`` torch-no-cuda + nvidia-smi parse edges."""
 
-    def test_torch_available_but_cuda_unavailable_falls_through(
-        self, monkeypatch
-    ):
+    def test_torch_available_but_cuda_unavailable_falls_through(self, monkeypatch):
         """
         With pynvml absent and torch importable but
         ``cuda.is_available()`` False, the helper falls through to the
@@ -1303,9 +1301,7 @@ class TestCheckRtSortHappyCuda:
                 torch`` resolves; rt_device='cuda:1' yields ``[]``.
         """
         _set_present_modules(monkeypatch, "torch", "diptest", "sklearn", "h5py", "tqdm")
-        fake_torch = SimpleNamespace(
-            cuda=SimpleNamespace(is_available=lambda: True)
-        )
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
         monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
         cfg = _make_cfg(sorter_name="rt_sort", rt_device="cuda:1")

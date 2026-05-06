@@ -148,8 +148,7 @@ def linux_cgroup_v2_memory_cap(frac: float = 0.8) -> Iterator[bool]:
         return
 
     _logger.info(
-        "active: memory.max = %.1f GB (= %.0f%% of %.1f GB host RAM, "
-        "cgroup v2).",
+        "active: memory.max = %.1f GB (= %.0f%% of %.1f GB host RAM, " "cgroup v2).",
         cap_bytes / 1e9,
         frac * 100,
         ram_bytes / 1e9,

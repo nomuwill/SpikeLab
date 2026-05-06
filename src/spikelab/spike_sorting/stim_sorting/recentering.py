@@ -47,11 +47,12 @@ def _build_reference_trace(traces, n_reference_channels):
     return np.sum(traces[top_k_idx], axis=0)
 
 
-def _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz):
+def _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz, neg_peak=None):
     """Find the up→down transition in a biphasic pulse.
 
     Algorithm:
-      1. Find the negative peak in ``reference[lo:hi]``.
+      1. Find the negative peak in ``reference[lo:hi]`` (or use the
+         caller-supplied ``neg_peak`` for multi-peak recentering).
       2. Find the positive peak in the window
          ``[max(lo, neg_peak - prewindow_samples), neg_peak)``.
       3. Transition = first positive-to-negative zero-crossing in
@@ -62,7 +63,8 @@ def _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz):
       5. If the pre-window is empty (negative peak at ``lo``), return
          the negative peak.
     """
-    neg_peak = lo + int(np.argmin(reference[lo:hi]))
+    if neg_peak is None:
+        neg_peak = lo + int(np.argmin(reference[lo:hi]))
 
     prewindow_samples = max(1, int(round(prewindow_ms * fs_Hz / 1000.0)))
     pre_lo = max(lo, neg_peak - prewindow_samples)
@@ -87,14 +89,15 @@ def _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz):
     return pos_peak + int(np.argmin(diffs))
 
 
-def _find_up_edge(reference, lo, hi, prewindow_ms, fs_Hz):
+def _find_up_edge(reference, lo, hi, prewindow_ms, fs_Hz, pos_peak=None):
     """Symmetric to ``_find_down_edge`` for biphasic cathodic-first.
 
-    Finds the positive peak, then the negative peak in a pre-window
-    before it, then the first negative-to-positive zero-crossing
-    between them.
+    Finds the positive peak (or uses caller-supplied ``pos_peak``), then
+    the negative peak in a pre-window before it, then the first
+    negative-to-positive zero-crossing between them.
     """
-    pos_peak = lo + int(np.argmax(reference[lo:hi]))
+    if pos_peak is None:
+        pos_peak = lo + int(np.argmax(reference[lo:hi]))
 
     prewindow_samples = max(1, int(round(prewindow_ms * fs_Hz / 1000.0)))
     pre_lo = max(lo, pos_peak - prewindow_samples)
@@ -117,6 +120,83 @@ def _find_up_edge(reference, lo, hi, prewindow_ms, fs_Hz):
 
 
 _VALID_PEAK_MODES = ("abs_max", "pos_peak", "neg_peak", "down_edge", "up_edge")
+_VALID_MULTI_PEAK_SELECT = ("first", "last")
+
+
+def _multi_peak_anchor(
+    reference,
+    lo,
+    hi,
+    peak_mode,
+    multi_peak_select,
+    multi_peak_threshold,
+    multi_peak_min_separation_ms,
+    fs_Hz,
+):
+    """Pick a single anchor sample from possibly multiple peaks in ``reference[lo:hi]``.
+
+    Used for stimulation trains: the search window is wide enough to span
+    several pulses, and a simple ``argmax``/``argmin`` would arbitrarily
+    pick whichever pulse happened to have the largest amplitude.  This
+    helper finds **all** local peaks in the window whose amplitude is at
+    least ``multi_peak_threshold * max_peak_amplitude``, then returns the
+    first (or last) one — guaranteeing alignment to a chosen end of the
+    train regardless of pulse-to-pulse amplitude variation.
+
+    The "search signal" used for peak detection depends on the
+    ``peak_mode``:
+      * ``abs_max``: ``|reference|`` — peaks of unsigned amplitude.
+      * ``pos_peak``, ``up_edge``: positive lobe — peaks of ``reference``.
+      * ``neg_peak``, ``down_edge``: negative lobe — peaks of
+        ``-reference``.
+
+    For ``down_edge`` / ``up_edge``, the returned anchor is the sample of
+    the main artifact peak (negative or positive resp.) of the chosen
+    pulse — not the zero-crossing.  The caller threads this anchor into
+    :func:`_find_down_edge` / :func:`_find_up_edge` to compute the
+    zero-crossing relative to that anchor.
+
+    Returns:
+        anchor_sample (int): Sample index in the global ``reference``
+            array (i.e. already offset by ``lo``).  Falls back to single-
+            peak ``argmax``/``argmin`` if no peaks are found above
+            threshold (e.g. very short window or pure noise).
+    """
+    from scipy.signal import find_peaks  # lazy import
+
+    segment = reference[lo:hi]
+    if segment.size == 0:
+        return lo
+
+    if peak_mode == "abs_max":
+        search = np.abs(segment)
+    elif peak_mode in ("pos_peak", "up_edge"):
+        search = np.maximum(segment, 0.0)
+    else:  # neg_peak, down_edge
+        search = -np.minimum(segment, 0.0)
+
+    distance_samples = max(1, int(round(multi_peak_min_separation_ms * fs_Hz / 1000.0)))
+    if search.max() <= 0:
+        # All-zero or all-wrong-sign window → degrade to argmax/argmin
+        if peak_mode in ("neg_peak", "down_edge"):
+            return lo + int(np.argmin(segment))
+        return lo + int(np.argmax(segment))
+
+    threshold_abs = multi_peak_threshold * float(search.max())
+    peak_idxs, _ = find_peaks(search, height=threshold_abs, distance=distance_samples)
+
+    if peak_idxs.size == 0:
+        # No interior local maxima above threshold (e.g. monotonic ramp).
+        # Fall back to the single best sample in the window.
+        if peak_mode in ("neg_peak", "down_edge"):
+            return lo + int(np.argmin(segment))
+        return lo + int(np.argmax(segment))
+
+    if multi_peak_select == "first":
+        chosen_local = int(peak_idxs[0])
+    else:  # last
+        chosen_local = int(peak_idxs[-1])
+    return lo + chosen_local
 
 
 def recenter_stim_times(
@@ -129,6 +209,10 @@ def recenter_stim_times(
     n_reference_channels=8,
     prewindow_ms=5.0,
     warn_offset_ms=3.0,
+    multi_peak=False,
+    multi_peak_select="first",
+    multi_peak_threshold=0.8,
+    multi_peak_min_separation_ms=2.0,
 ):
     """Find actual stimulation artifact times near logged stim times.
 
@@ -172,6 +256,30 @@ def recenter_stim_times(
             stim log, or a unit mismatch (ms vs s vs samples) rather
             than genuine jitter.  Set to ``None`` to silence.  Default
             ``3.0`` ms — well above one-sample jitter at 20–30 kHz.
+        multi_peak (bool): Opt-in support for multi-pulse stim trains.
+            When ``True``, the search window is treated as potentially
+            containing multiple stimulation pulses (e.g. a 100 Hz
+            train), and the alignment target is the **first** or
+            **last** qualifying pulse rather than the strongest one.
+            Default ``False`` — preserves backward-compatible single-
+            peak behavior.
+        multi_peak_select (str): When ``multi_peak=True``, which
+            qualifying peak to lock onto.  ``"first"`` (default) =
+            first pulse onset (matches "first-pulse alignment" used
+            for train PSTHs).  ``"last"`` = last pulse onset (useful
+            for studying after-train rebound).  Ignored when
+            ``multi_peak=False``.
+        multi_peak_threshold (float): When ``multi_peak=True``, only
+            peaks whose amplitude is at least this fraction of the
+            largest peak in the search window are considered "real
+            pulses".  Default ``0.8`` — accepts pulses up to 20% weaker
+            than the strongest, rejects noise.
+        multi_peak_min_separation_ms (float): When ``multi_peak=True``,
+            the minimum spacing between candidate peaks.  Prevents
+            multi-sample peaks of a single pulse from being counted as
+            separate pulses.  Default ``2.0`` ms — well below any
+            sensible inter-pulse interval (5 ms = 200 Hz; 10 ms =
+            100 Hz).
 
     Returns:
         corrected_ms (np.ndarray): Corrected stim times in
@@ -187,10 +295,23 @@ def recenter_stim_times(
           polarity's noise peak and the zero-crossing fallback lands
           near the onset of the single artifact — but ``pos_peak`` /
           ``neg_peak`` will give cleaner results in that case.
+        * For single-pulse stim, ``multi_peak=True`` degrades to the
+          original single-peak behavior (only one peak in the window
+          is above threshold; first==last).  Set it always-on if you
+          mix single-pulse and train conditions in one recording.
     """
     if peak_mode not in _VALID_PEAK_MODES:
         raise ValueError(
             f"Unknown peak_mode {peak_mode!r}; " f"expected one of {_VALID_PEAK_MODES}"
+        )
+    if multi_peak and multi_peak_select not in _VALID_MULTI_PEAK_SELECT:
+        raise ValueError(
+            f"Unknown multi_peak_select {multi_peak_select!r}; "
+            f"expected one of {_VALID_MULTI_PEAK_SELECT}"
+        )
+    if multi_peak and not (0.0 < multi_peak_threshold <= 1.0):
+        raise ValueError(
+            f"multi_peak_threshold must be in (0, 1]; got {multi_peak_threshold}"
         )
 
     stim_times_ms = np.asarray(stim_times_ms, dtype=np.float64)
@@ -210,16 +331,44 @@ def recenter_stim_times(
         lo = max(0, center - offset_samples)
         hi = min(n_samples, center + offset_samples + 1)
 
-        if peak_mode == "abs_max":
-            peak_sample = lo + int(np.argmax(reference[lo:hi]))
-        elif peak_mode == "pos_peak":
-            peak_sample = lo + int(np.argmax(reference[lo:hi]))
-        elif peak_mode == "neg_peak":
-            peak_sample = lo + int(np.argmin(reference[lo:hi]))
-        elif peak_mode == "down_edge":
-            peak_sample = _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz)
-        else:  # up_edge
-            peak_sample = _find_up_edge(reference, lo, hi, prewindow_ms, fs_Hz)
+        if multi_peak:
+            anchor = _multi_peak_anchor(
+                reference,
+                lo,
+                hi,
+                peak_mode,
+                multi_peak_select,
+                multi_peak_threshold,
+                multi_peak_min_separation_ms,
+                fs_Hz,
+            )
+            if peak_mode == "abs_max":
+                peak_sample = anchor
+            elif peak_mode == "pos_peak":
+                peak_sample = anchor
+            elif peak_mode == "neg_peak":
+                peak_sample = anchor
+            elif peak_mode == "down_edge":
+                # anchor IS the negative-peak sample of the chosen pulse;
+                # pre-window search runs ahead of it for the pos peak.
+                peak_sample = _find_down_edge(
+                    reference, lo, hi, prewindow_ms, fs_Hz, neg_peak=anchor
+                )
+            else:  # up_edge
+                peak_sample = _find_up_edge(
+                    reference, lo, hi, prewindow_ms, fs_Hz, pos_peak=anchor
+                )
+        else:
+            if peak_mode == "abs_max":
+                peak_sample = lo + int(np.argmax(reference[lo:hi]))
+            elif peak_mode == "pos_peak":
+                peak_sample = lo + int(np.argmax(reference[lo:hi]))
+            elif peak_mode == "neg_peak":
+                peak_sample = lo + int(np.argmin(reference[lo:hi]))
+            elif peak_mode == "down_edge":
+                peak_sample = _find_down_edge(reference, lo, hi, prewindow_ms, fs_Hz)
+            else:  # up_edge
+                peak_sample = _find_up_edge(reference, lo, hi, prewindow_ms, fs_Hz)
 
         corrected[i] = peak_sample / fs_Hz * 1000.0
 

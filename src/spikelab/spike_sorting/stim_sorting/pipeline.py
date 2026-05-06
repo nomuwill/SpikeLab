@@ -63,6 +63,10 @@ def sort_stim_recording(
     peak_mode="abs_max",
     n_reference_channels=8,
     prewindow_ms=5.0,
+    multi_peak=False,
+    multi_peak_select="first",
+    multi_peak_threshold=0.8,
+    multi_peak_min_separation_ms=2.0,
     model=None,
     model_path=None,
     recording_window_ms=None,
@@ -114,6 +118,21 @@ def sort_stim_recording(
         poly_order (int): Polynomial order for detrend.  Default 3.
         artifact_window_only (bool): Only process around stim events.
             Default True.
+        multi_peak (bool): When ``True``, enables multi-pulse-aware
+            recentering — the search window is interpreted as
+            potentially containing multiple pulses (a stim train), and
+            the alignment target is the first or last qualifying pulse
+            rather than the strongest. Default ``False``.  When
+            ``False``, behaviour is identical to the pre-multi-peak
+            implementation.  See :func:`recenter_stim_times` for details.
+        multi_peak_select (str): When ``multi_peak=True``, which
+            qualifying peak to lock onto.  ``"first"`` (default) /
+            ``"last"``.
+        multi_peak_threshold (float): When ``multi_peak=True``, peaks
+            below this fraction of the largest peak in the search
+            window are ignored.  Default ``0.8``.
+        multi_peak_min_separation_ms (float): When ``multi_peak=True``,
+            minimum spacing between candidate peaks.  Default ``2.0``.
         max_stim_offset_ms (float): Search window radius for stim
             time recentering.  Default 50.0.
         peak_mode (str): Alignment target for ``recenter_stim_times``.
@@ -168,6 +187,10 @@ def sort_stim_recording(
             peak_mode=peak_mode,
             n_reference_channels=n_reference_channels,
             prewindow_ms=prewindow_ms,
+            multi_peak=multi_peak,
+            multi_peak_select=multi_peak_select,
+            multi_peak_threshold=multi_peak_threshold,
+            multi_peak_min_separation_ms=multi_peak_min_separation_ms,
             recording_window_ms=recording_window_ms,
             verbose=verbose,
         )
@@ -198,6 +221,10 @@ def sort_stim_recording(
         peak_mode=peak_mode,
         n_reference_channels=n_reference_channels,
         prewindow_ms=prewindow_ms,
+        multi_peak=multi_peak,
+        multi_peak_select=multi_peak_select,
+        multi_peak_threshold=multi_peak_threshold,
+        multi_peak_min_separation_ms=multi_peak_min_separation_ms,
         recording_window_ms=recording_window_ms,
         verbose=verbose,
     )
@@ -225,6 +252,10 @@ def _sort_stim_chunked(
     peak_mode,
     n_reference_channels,
     prewindow_ms,
+    multi_peak,
+    multi_peak_select,
+    multi_peak_threshold,
+    multi_peak_min_separation_ms,
     recording_window_ms,
     verbose,
 ):
@@ -330,6 +361,10 @@ def _sort_stim_chunked(
             peak_mode=peak_mode,
             n_reference_channels=n_reference_channels,
             prewindow_ms=prewindow_ms,
+            multi_peak=multi_peak,
+            multi_peak_select=multi_peak_select,
+            multi_peak_threshold=multi_peak_threshold,
+            multi_peak_min_separation_ms=multi_peak_min_separation_ms,
         )
 
         # Remove artifacts on the chunk (in-place — we don't need the
@@ -474,6 +509,10 @@ def _sort_stim_full_recording(
     peak_mode,
     n_reference_channels,
     prewindow_ms,
+    multi_peak,
+    multi_peak_select,
+    multi_peak_threshold,
+    multi_peak_min_separation_ms,
     recording_window_ms,
     verbose,
 ):
@@ -504,6 +543,10 @@ def _sort_stim_full_recording(
         peak_mode=peak_mode,
         n_reference_channels=n_reference_channels,
         prewindow_ms=prewindow_ms,
+        multi_peak=multi_peak,
+        multi_peak_select=multi_peak_select,
+        multi_peak_threshold=multi_peak_threshold,
+        multi_peak_min_separation_ms=multi_peak_min_separation_ms,
     )
     if verbose:
         offsets = corrected_stim_ms - stim_times_ms

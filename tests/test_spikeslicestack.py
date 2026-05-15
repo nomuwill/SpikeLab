@@ -4244,3 +4244,68 @@ class TestResponsivenessChange:
                 bin_size=10.0,
                 baseline_window_ms=(0.0, 20.0),
             )
+
+
+class TestSpikeSliceStackBoundarySpike:
+    """``SpikeSliceStack.__init__`` validates that per-slice spike
+    times fall within the slice window using strict inequality
+    (``train[-1] > expected_end``). A spike at exactly
+    ``expected_end`` is therefore accepted, matching the
+    ``SpikeData.__init__`` contract that uses the same strict
+    comparator. Pinned here as a regression guard against any
+    future tightening to ``>=`` that would silently reject valid
+    boundary spikes.
+    """
+
+    def test_spike_exactly_at_expected_end_accepted(self):
+        """
+        Construct a ``SpikeData`` with ``start_time=0``,
+        ``length=10``, and a single spike at exactly ``t=10.0``,
+        then wrap it in a ``SpikeSliceStack`` whose
+        ``times_start_to_end=[(0.0, 10.0)]`` matches the slice
+        duration. The strict ``>`` check at the validator allows
+        ``train[-1] == expected_end``; a ``>=`` regression would
+        raise ``ValueError``.
+
+        Tests:
+            (Test Case 1) Construction succeeds (no ValueError).
+            (Test Case 2) The boundary spike survives in the stored
+                spike train.
+            (Test Case 3) The slice times are stored unchanged.
+        """
+        import numpy as np
+
+        from spikelab.spikedata import SpikeData
+        from spikelab.spikedata.spikeslicestack import SpikeSliceStack
+
+        sd = SpikeData([np.array([10.0])], length=10.0)
+        sss = SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 10.0)])
+
+        assert len(sss) == 1
+        assert sss.spike_stack[0].train[0][0] == 10.0
+        assert sss.times == [(0.0, 10.0)]
+
+    def test_spike_just_past_expected_end_raises(self):
+        """
+        Companion test: a spike at ``expected_end + epsilon``
+        triggers the ``train[-1] > expected_end`` branch and raises
+        ``ValueError``. Pinned alongside the boundary case so the
+        accept/reject contract is visible together.
+
+        Tests:
+            (Test Case 1) Spike at ``10.0001`` against a slice ending
+                at ``10.0`` raises ValueError mentioning the spike
+                time and expected range.
+        """
+        import numpy as np
+
+        from spikelab.spikedata import SpikeData
+        from spikelab.spikedata.spikeslicestack import SpikeSliceStack
+
+        # SpikeData itself rejects spike past start_time + length, so
+        # use a longer length to construct the SpikeData, then pass a
+        # tighter slice window to SpikeSliceStack to trigger its
+        # per-slice validator.
+        sd = SpikeData([np.array([10.0001])], length=20.0)
+        with pytest.raises(ValueError, match="fall outside"):
+            SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 10.0)])

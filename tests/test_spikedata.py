@@ -8333,3 +8333,132 @@ class TestSpikeDataCvIsi:
         sd = SpikeData([times])
         expected = 2.0 * 8.0 / 12.0
         assert abs(sd.cv2_isi()[0] - expected) < 1e-6
+
+
+class TestSpikeDataFramesNonAlignedBoundary:
+    """``SpikeData.frames`` builds frame boundaries via
+    ``np.arange(start, end - length + 1e-9, step)``; non-aligned
+    ``frame_length`` values near the recording end can produce one
+    more or one fewer frame depending on floating-point accumulation.
+    Pin the count for a representative non-aligned configuration as
+    a regression guard.
+    """
+
+    def test_three_frames_for_length_99_99999_and_frame_33_33333(self):
+        """
+        Configuration: ``length=99.99999``, ``frame_length=33.33333``,
+        ``overlap=0``. The ``+1e-9`` epsilon in the arange upper bound
+        admits the third frame at start ≈ 66.66666. A regression that
+        dropped the epsilon would yield two frames instead of three.
+
+        Tests:
+            (Test Case 1) Exactly 3 frames are produced.
+            (Test Case 2) Frame starts are ``0, 33.33333, 66.66666``
+                (within float tolerance).
+            (Test Case 3) Each frame's reported duration equals
+                ``frame_length`` (within float tolerance).
+        """
+        sd = SpikeData([[5.0, 50.0, 95.0]], length=99.99999)
+        stack = sd.frames(33.33333)
+        assert len(stack.times) == 3
+        expected_starts = [0.0, 33.33333, 66.66666]
+        for (start, end), exp_start in zip(stack.times, expected_starts):
+            assert start == pytest.approx(exp_start, abs=1e-5)
+            assert (end - start) == pytest.approx(33.33333, abs=1e-9)
+
+    def test_exactly_aligned_length_produces_integer_frame_count(self):
+        """
+        With ``length`` an exact integer multiple of ``frame_length``
+        (no floating-point ambiguity), the frame count is the simple
+        quotient.
+
+        Tests:
+            (Test Case 1) ``length=100, frame_length=25`` → 4 frames.
+        """
+        sd = SpikeData([[5.0, 50.0, 95.0]], length=100.0)
+        stack = sd.frames(25.0)
+        assert len(stack.times) == 4
+
+
+class TestSpikeDataSpikeTimeTilingsNumbaParity:
+    """``SpikeData.spike_time_tilings`` uses a numba kernel only when
+    ``self.N > 2`` (source guard at the dispatch site). The N≤2 path
+    runs in pure numpy. Verify the two paths agree on shared pairs so
+    a regression in either path is caught.
+    """
+
+    def test_n_equals_2_numpy_path_matches_n_equals_3_numba_pair(self):
+        """
+        The (0,1) entry of the (2,2) matrix (numpy path, N==2) equals
+        the (0,1) entry of the (3,3) matrix computed on the same two
+        trains plus an additional unit (numba path, N==3).
+
+        Tests:
+            (Test Case 1) ``spike_time_tilings`` returns shape (2,2)
+                for N=2 and (3,3) for N=3.
+            (Test Case 2) Diagonal is 1.0 in both matrices.
+            (Test Case 3) Off-diagonal pair (0,1) value is identical
+                across the two paths (within numerical tolerance).
+        """
+        rng = np.random.default_rng(0)
+        train_a = np.sort(rng.uniform(0, 1000, 50))
+        train_b = np.sort(rng.uniform(0, 1000, 50))
+        train_c = np.sort(rng.uniform(0, 1000, 50))
+
+        # N == 3: numba path (gate `self.N > 2`) when numba is installed.
+        sd3 = SpikeData([train_a, train_b, train_c], length=1000.0)
+        pcm3 = sd3.spike_time_tilings(delt=10.0)
+
+        # N == 2: pure-numpy path always.
+        sd2 = SpikeData([train_a, train_b], length=1000.0)
+        pcm2 = sd2.spike_time_tilings(delt=10.0)
+
+        assert pcm2.matrix.shape == (2, 2)
+        assert pcm3.matrix.shape == (3, 3)
+        # Diagonal is identity in both.
+        assert pcm2.matrix[0, 0] == pytest.approx(1.0)
+        assert pcm3.matrix[1, 1] == pytest.approx(1.0)
+        # Shared (0,1) entry must match across paths.
+        assert pcm2.matrix[0, 1] == pytest.approx(pcm3.matrix[0, 1], abs=1e-9)
+
+    def test_n_equals_1_returns_singleton_identity_matrix(self):
+        """
+        Single-unit ``SpikeData`` produces a (1,1) matrix with the
+        diagonal entry equal to 1.0.
+
+        Tests:
+            (Test Case 1) Shape is (1,1).
+            (Test Case 2) Single entry is 1.0.
+        """
+        sd1 = SpikeData([[1.0, 5.0, 9.0]], length=20.0)
+        pcm1 = sd1.spike_time_tilings(delt=10.0)
+        assert pcm1.matrix.shape == (1, 1)
+        assert pcm1.matrix[0, 0] == pytest.approx(1.0)
+
+
+class TestSpikeDataGetPairwiseCCGNegativeMaxLag:
+    """``SpikeData.get_pairwise_ccg`` forwards ``max_lag`` to
+    ``compute_cross_correlation_with_lag``, which internally takes
+    the absolute value. A negative ``max_lag`` therefore produces the
+    same matrices as the equivalent positive value — documented but
+    not previously pinned.
+    """
+
+    def test_negative_max_lag_matches_positive(self):
+        """
+        ``max_lag=-5`` produces the same correlation matrix as
+        ``max_lag=5`` because the underlying compare function does
+        ``max_lag = abs(max_lag)``.
+
+        Tests:
+            (Test Case 1) Both correlation matrices agree elementwise.
+            (Test Case 2) Lag matrix shapes match (the sign-flip
+                applied by ``get_pairwise_ccg`` for the lower triangle
+                is independent of the input ``max_lag`` sign).
+        """
+        sd = SpikeData([[1.0, 5.0, 9.0], [2.0, 6.0, 10.0]], length=20.0)
+        corr_pos, lag_pos = sd.get_pairwise_ccg(bin_size=1.0, max_lag=5.0)
+        corr_neg, lag_neg = sd.get_pairwise_ccg(bin_size=1.0, max_lag=-5.0)
+
+        np.testing.assert_allclose(corr_pos.matrix, corr_neg.matrix, equal_nan=True)
+        assert lag_pos.matrix.shape == lag_neg.matrix.shape

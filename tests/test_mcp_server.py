@@ -7674,3 +7674,78 @@ class TestComputeWaveformMetricsNoRawData:
                     "namespace": "rec0",
                 },
             )
+
+
+class TestMcpJsonNanSanitiser:
+    """Regression test for BUG-3: ``_call_tool`` must emit RFC-8259-valid
+    JSON. Pre-fix, ``json.dumps(result, indent=2)`` used the default
+    ``allow_nan=True`` and emitted the JavaScript literals ``NaN`` /
+    ``Infinity`` / ``-Infinity``, which a conformant JSON parser rejects.
+    The fix routes the result through ``_sanitize_for_json`` (NaN → None,
+    ±Inf → None) and then ``json.dumps(..., allow_nan=False)``.
+    """
+
+    def test_sanitize_for_json_replaces_nan_and_inf_with_none(self):
+        """
+        Recursive scalar / list / dict replacement: any NaN or
+        ±Infinity float becomes ``None``; finite floats pass through;
+        non-float values pass through untouched.
+
+        Tests:
+            (Test Case 1) NaN → None.
+            (Test Case 2) +Inf, -Inf → None.
+            (Test Case 3) Finite floats and other types preserved.
+            (Test Case 4) Nested dict/list traversed.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        clean = _sanitize_for_json(
+            {
+                "a": float("nan"),
+                "b": float("inf"),
+                "c": float("-inf"),
+                "d": 1.5,
+                "e": 7,
+                "f": "ok",
+                "g": [float("nan"), 2.0, {"h": float("inf")}],
+            }
+        )
+        assert clean["a"] is None
+        assert clean["b"] is None
+        assert clean["c"] is None
+        assert clean["d"] == 1.5
+        assert clean["e"] == 7
+        assert clean["f"] == "ok"
+        assert clean["g"][0] is None
+        assert clean["g"][1] == 2.0
+        assert clean["g"][2]["h"] is None
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_dispatcher_emits_rfc8259_valid_json_for_nan_result(
+        self, monkeypatch
+    ):
+        """
+        Patching a tool to return a result containing NaN must produce
+        TextContent whose body parses with a strict JSON parser (one
+        that rejects NaN / Infinity literals).
+
+        Tests:
+            (Test Case 1) ``json.loads(text)`` succeeds (rejects with
+                strict-mode would surface BUG-3 regression).
+            (Test Case 2) The NaN field in the original result is now
+                ``None`` in the parsed payload.
+        """
+        from spikelab.mcp_server import server as srv
+
+        async def _fake_handler(**_kwargs):
+            return {"metric": float("nan"), "ok": 1.0}
+
+        monkeypatch.setitem(srv._TOOL_DISPATCH, "list_workspaces", _fake_handler)
+
+        out = await srv._call_tool("list_workspaces", {})
+        # ``json.loads`` is strict by default (does not accept NaN/Infinity
+        # tokens — Python's strict parser equivalent of RFC 8259).
+        payload = json.loads(out[0].text)
+        assert payload["metric"] is None
+        assert payload["ok"] == 1.0

@@ -1342,12 +1342,20 @@ class TestValidationModule:
             assert isinstance(summary, str)
 
     def test_summarize_validation_error_multiple_errors(self):
-        """summarize_validation_error joins multiple errors with semicolons."""
+        """summarize_validation_error puts each error on its own line.
+
+        Pinning the new multiline format: header + one bullet per
+        issue. Nested-location validation messages stay scannable when
+        a pydantic error has several issues at once.
+        """
         try:
             validate_job_spec({"container": {}})  # missing image + other issues
         except PydanticValidationError as exc:
             summary = summarize_validation_error(exc)
-            assert ";" in summary  # multiple errors joined
+            assert summary.startswith("Invalid job config:")
+            assert "\n  - " in summary
+            # At least two distinct bullet lines for the multi-error case.
+            assert summary.count("\n  - ") >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -3818,16 +3826,20 @@ class TestValidation:
     """Edge cases for the validation module."""
 
     def test_summarize_validation_error_empty_loc(self):
-        """summarize_validation_error handles error with empty loc tuple."""
+        """summarize_validation_error handles error with empty loc tuple.
+
+        With the new multiline format, the message appears as a bullet
+        under the ``Invalid job config:`` header. The location prefix is
+        absent because the loc tuple is empty.
+        """
         from spikelab.batch_jobs.validation import summarize_validation_error
 
-        # Create a mock ValidationError with an empty loc
         mock_exc = MagicMock()
         mock_exc.errors.return_value = [
             {"loc": (), "msg": "custom error message"},
         ]
         result = summarize_validation_error(mock_exc)
-        assert result == "custom error message"
+        assert result == "Invalid job config:\n  - custom error message"
 
 
 class TestInitLazyImport:
@@ -4170,3 +4182,114 @@ class TestProfilesEdgeCases:
 
         prof = load_profile_from_name("  NRP  ")
         assert prof.name == "nrp"
+
+
+class TestBuildPodVolumesRejectsAmbiguousSources:
+    """Regression test for BUG-5 item 3: a K8s ``Volume`` may have at
+    most one of ``secret`` / ``persistentVolumeClaim`` — they're
+    mutually exclusive volume sources. Pre-fix, ``_build_pod_volumes``
+    accepted both, the Jinja template at ``job.yaml.j2:83-88`` rendered
+    only the secret via ``{% if secret_name %}{% elif pvc_name %}``,
+    and the pvc was silently dropped. ``_build_pod_volumes`` now raises
+    ``ValueError`` at build time.
+    """
+
+    def test_volume_with_both_secret_and_pvc_raises(self):
+        """
+        Tests:
+            (Test Case 1) Building a mount dict with both
+                ``secret_name`` and ``pvc_name`` raises ``ValueError``.
+            (Test Case 2) The error message names "mutually exclusive"
+                and the offending volume name.
+        """
+        from spikelab.batch_jobs.templating import _build_pod_volumes
+
+        mounts = [
+            {
+                "name": "creds",
+                "secret_name": "my-secret",
+                "pvc_name": "my-pvc",
+            }
+        ]
+        with pytest.raises(ValueError, match=r"mutually exclusive") as excinfo:
+            _build_pod_volumes(mounts)
+        assert "'creds'" in str(excinfo.value)
+
+    def test_volume_with_neither_source_raises(self):
+        """
+        Tests:
+            (Test Case 1) A mount with ``name`` but neither source set
+                raises ``ValueError`` mentioning "exactly one source".
+        """
+        from spikelab.batch_jobs.templating import _build_pod_volumes
+
+        mounts = [{"name": "empty-vol", "secret_name": None, "pvc_name": None}]
+        with pytest.raises(ValueError, match=r"exactly one source"):
+            _build_pod_volumes(mounts)
+
+    def test_secret_then_pvc_merge_raises(self):
+        """
+        Two mounts with the same ``name``, one carrying a secret and
+        the other carrying a pvc, merge into a single volume with
+        BOTH sources — which is exactly the conflict the validator
+        must catch.
+
+        Tests:
+            (Test Case 1) Merge of secret-only + pvc-only mounts with
+                the same name raises ``ValueError``.
+        """
+        from spikelab.batch_jobs.templating import _build_pod_volumes
+
+        mounts = [
+            {"name": "shared", "secret_name": "s", "pvc_name": None},
+            {"name": "shared", "secret_name": None, "pvc_name": "p"},
+        ]
+        with pytest.raises(ValueError, match=r"mutually exclusive"):
+            _build_pod_volumes(mounts)
+
+
+class TestKubectlEmptyStdoutGuard:
+    """Regression test for BUG-7 item 2: ``yaml.safe_load("")`` returns
+    ``None``; pre-fix, ``payload.get("status", {})`` then raised
+    ``AttributeError: 'NoneType' object has no attribute 'get'``,
+    silently breaking job-status monitoring on transient empty
+    kubectl stdout. Fix: ``yaml.safe_load(out) or {}``.
+    """
+
+    def test_job_status_handles_empty_kubectl_stdout(self):
+        """
+        Tests:
+            (Test Case 1) ``job_status`` returns ``"Pending"`` (the
+                fallthrough status) instead of raising AttributeError
+                when ``_run_kubectl`` returns empty stdout.
+        """
+        from spikelab.batch_jobs.backend_k8s import KubernetesBatchJobBackend
+
+        backend = KubernetesBatchJobBackend.__new__(KubernetesBatchJobBackend)
+        backend.namespace = "default"
+        backend._batch_api = None  # forces the kubectl path
+        backend._core_api = None
+
+        def _stub_run_kubectl(_args):
+            return ""
+
+        backend._run_kubectl = _stub_run_kubectl  # type: ignore[assignment]
+
+        assert backend.job_status("any-job") == "Pending"
+
+    def test_pods_for_job_handles_empty_kubectl_stdout(self):
+        """
+        Tests:
+            (Test Case 1) ``pods_for_job`` returns ``[]`` instead of
+                raising AttributeError when ``_run_kubectl`` returns
+                empty stdout.
+        """
+        from spikelab.batch_jobs.backend_k8s import KubernetesBatchJobBackend
+
+        backend = KubernetesBatchJobBackend.__new__(KubernetesBatchJobBackend)
+        backend.namespace = "default"
+        backend._batch_api = None
+        backend._core_api = None
+        backend._run_kubectl = lambda _args: ""  # type: ignore[assignment]
+
+        assert backend.pods_for_job("any-job") == []

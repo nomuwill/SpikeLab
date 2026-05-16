@@ -1759,10 +1759,21 @@ def run_preflight(
         "preflight_min_free_vram_gb",
     )
     for field_name in threshold_fields:
-        if getattr(exe, field_name) is None:
+        value = getattr(exe, field_name)
+        if value is None:
             raise ValueError(
                 f"config.execution.{field_name} must be a float, got None. "
                 "Set a numeric threshold or rely on the dataclass default."
+            )
+        # NaN passes through `is None` but silently disables every downstream
+        # threshold comparison (`x >= NaN` is False), making the preflight
+        # finding unreachable. Reject explicitly so misconfigured thresholds
+        # surface at construction time instead of silently failing open.
+        if isinstance(value, float) and math.isnan(value):
+            raise ValueError(
+                f"config.execution.{field_name} must be a finite float, got NaN. "
+                "NaN thresholds silently disable the preflight check; set a "
+                "numeric value or rely on the dataclass default."
             )
     min_free_inter = float(exe.preflight_min_free_inter_gb)
     min_free_results = float(exe.preflight_min_free_results_gb)

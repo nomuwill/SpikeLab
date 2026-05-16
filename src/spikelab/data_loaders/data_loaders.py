@@ -555,12 +555,14 @@ def load_spikedata_from_nwb(
             )
         except ImportError:  # pragma: no cover
             pass  # pynwb not installed — fall back to h5py
-        except (
-            TypeError,
-            ValueError,
-            KeyError,
-            AttributeError,
-        ) as e:  # pragma: no cover
+        except Exception as e:
+            # Broad catch is intentional: pynwb raises a wide variety of
+            # exception types depending on schema/runtime issue (TypeError,
+            # ValueError, KeyError, AttributeError, RuntimeError on schema
+            # mismatch, OSError on HDF5-plugin issues, etc.). Any pynwb
+            # failure should fall back to the h5py loader rather than
+            # propagating to the caller. The warning preserves the original
+            # exception type+message for diagnosis.
             warnings.warn(
                 f"pynwb failed to load NWB file ({type(e).__name__}: {e}); "
                 f"falling back to h5py. If this is unexpected, check the file "

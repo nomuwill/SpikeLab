@@ -5152,3 +5152,91 @@ class TestLoadSpikelabSortedNpzMissingKeys:
 # in TestS3UrlEdgeCases (see test_is_s3_url_with_whitespace_returns_true
 # and test_is_s3_url_uppercase_scheme_returns_true), which assert the
 # corrected case-insensitive + whitespace-stripping contract.
+
+
+# ===========================================================================
+# Regression tests for bugs fixed during test_scanner triage
+# (see iat/BUG_REPORT.md). Each test pins the fix's contract.
+# ===========================================================================
+
+
+class TestNWBLoaderPynwbFallbackBroadException:
+    """Regression test for BUG-1: ``load_spikedata_from_nwb`` pynwb fallback
+    must catch any pynwb-side exception (not just the original four types)
+    and fall through to the h5py loader. The pre-fix except clause was
+    ``(TypeError, ValueError, KeyError, AttributeError)``; ``RuntimeError``
+    (schema mismatch) and ``OSError`` (HDF5 plugin issues) leaked through,
+    making the documented fallback unreachable.
+    """
+
+    def _write_valid_nwb_h5py_layout(self, path):
+        """Write a minimal h5py-loadable NWB file the fallback can consume."""
+        with h5py.File(path, "w") as f:  # type: ignore
+            g = f.create_group("units")
+            g.create_dataset("spike_times", data=np.array([0.1, 0.2, 0.5]))
+            g.create_dataset("spike_times_index", data=np.array([2, 3]))
+
+    def _assert_h5py_fallback_warning(self, recwarn, exc_type: type) -> None:
+        msgs = [str(w.message) for w in recwarn]
+        joined = " | ".join(msgs)
+        assert "falling back to h5py" in joined, f"no fallback warning in {msgs!r}"
+        assert exc_type.__name__ in joined, (
+            f"warning does not name the original exception type "
+            f"{exc_type.__name__}: {msgs!r}"
+        )
+
+    def test_pynwb_runtime_error_falls_back_to_h5py(self, tmp_path, monkeypatch):
+        """
+        ``pynwb`` raising ``RuntimeError`` (schema mismatch case) must trigger
+        the h5py fallback rather than propagating.
+
+        Tests:
+            (Test Case 1) Loader returns a SpikeData with the h5py-derived
+                spike trains.
+            (Test Case 2) A ``UserWarning`` mentioning the original
+                ``RuntimeError`` and "falling back to h5py" is emitted.
+        """
+        pynwb = pytest.importorskip("pynwb")
+
+        class _RaisingNWBHDF5IO:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("simulated schema mismatch")
+
+        monkeypatch.setattr(pynwb, "NWBHDF5IO", _RaisingNWBHDF5IO)
+
+        path = str(tmp_path / "test.nwb")
+        self._write_valid_nwb_h5py_layout(path)
+
+        with pytest.warns(UserWarning) as recwarn:
+            sd = loaders.load_spikedata_from_nwb(path)
+        self._assert_h5py_fallback_warning(recwarn, RuntimeError)
+
+        # h5py path read the data correctly.
+        assert sd.N == 2
+        np.testing.assert_array_equal(sd.train[0], np.array([100.0, 200.0]))
+        np.testing.assert_array_equal(sd.train[1], np.array([500.0]))
+
+    def test_pynwb_os_error_falls_back_to_h5py(self, tmp_path, monkeypatch):
+        """
+        ``pynwb`` raising ``OSError`` (HDF5 plugin case) must trigger the
+        h5py fallback.
+
+        Tests:
+            (Test Case 1) Loader returns a SpikeData.
+            (Test Case 2) Warning names ``OSError``.
+        """
+        pynwb = pytest.importorskip("pynwb")
+
+        class _RaisingNWBHDF5IO:
+            def __init__(self, *args, **kwargs):
+                raise OSError("simulated HDF5 plugin missing")
+
+        monkeypatch.setattr(pynwb, "NWBHDF5IO", _RaisingNWBHDF5IO)
+
+        path = str(tmp_path / "test.nwb")
+        self._write_valid_nwb_h5py_layout(path)
+
+        with pytest.warns(UserWarning) as recwarn:
+            sd = loaders.load_spikedata_from_nwb(path)
+        self._assert_h5py_fallback_warning(recwarn, OSError)
+        assert sd.N == 2

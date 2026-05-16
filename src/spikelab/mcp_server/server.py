@@ -4104,9 +4104,6 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "export_to_pickle": exporters.export_to_pickle,
 }
 
-# Tools that take no arguments (called without **arguments)
-_NO_ARGS_TOOLS = {"list_workspaces"}
-
 
 @server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
@@ -4117,17 +4114,53 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
     ``isError=True`` — the canonical protocol-level error signal that
     clients can distinguish from a successful result containing an
     ``"error"`` key.
+
+    Normalises ``arguments`` to ``{}`` so handlers that accept no
+    parameters can be called uniformly with ``**arguments`` without
+    maintaining a hand-curated allow-list.
     """
     handler = _TOOL_DISPATCH.get(name)
     if handler is None:
         raise ValueError(f"Unknown tool: {name}")
 
-    if name in _NO_ARGS_TOOLS:
-        result = await handler()
-    else:
-        result = await handler(**arguments)
+    arguments = arguments or {}
+    result = await handler(**arguments)
 
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    # ``allow_nan=False`` rejects NaN / Infinity / -Infinity floats per RFC 8259.
+    # Without this guard, ``json.dumps`` defaults emit the JavaScript literals
+    # ``NaN``/``Infinity``/``-Infinity`` which most MCP clients reject. Tools
+    # that compute summary statistics (waveform metrics, slice stability,
+    # shuffle z-scores, etc.) can legitimately produce non-finite floats on
+    # degenerate input; the recursive sanitiser replaces them with ``None`` at
+    # the serialisation boundary so clients can parse the result.
+    return [
+        types.TextContent(
+            type="text",
+            text=json.dumps(_sanitize_for_json(result), indent=2, allow_nan=False),
+        )
+    ]
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively replace NaN / Inf floats with None for RFC-8259 JSON.
+
+    ``json.dumps(..., allow_nan=False)`` rejects non-finite floats — but those
+    floats arise legitimately from many statistical tools on degenerate input
+    (empty arrays, zero-variance signals, all-NaN slices). Replacing them with
+    ``None`` at the serialisation boundary lets clients distinguish "no value"
+    from a parse error.
+    """
+    import math as _math
+
+    if isinstance(obj, float):
+        if _math.isnan(obj) or _math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 def _parse_args() -> argparse.Namespace:

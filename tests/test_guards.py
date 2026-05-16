@@ -13610,3 +13610,38 @@ class TestDiskUsageWatchdogNanGuard:
                 poll_interval_s=0.05,
                 popen=mock.Mock(spec=subprocess.Popen),
             )
+
+
+class TestRunPreflightNanThresholdGuard:
+    """Regression test for BUG-2: ``run_preflight`` must reject NaN
+    threshold values explicitly. Pre-fix, the validator only checked
+    ``is None``; NaN floats passed the check and silently disabled
+    every downstream ``x >= threshold`` comparison (``>= NaN`` is
+    always False), making the preflight finding unreachable.
+    """
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "preflight_min_free_inter_gb",
+            "preflight_min_free_results_gb",
+            "preflight_min_available_ram_gb",
+            "preflight_min_free_vram_gb",
+        ],
+    )
+    def test_nan_threshold_raises_value_error(self, field):
+        """
+        Setting any of the four preflight threshold fields to NaN
+        triggers a ``ValueError`` at the start of ``run_preflight``
+        — before any check runs against the NaN value.
+
+        Tests:
+            (Test Case 1) ValueError raised, message names the field
+                and "finite float".
+        """
+        cfg = _make_config(**{field: float("nan")})
+        with pytest.raises(ValueError, match="finite float"):
+            run_preflight(cfg, [mock.Mock()], ["/inter"], ["/results"])
+        # The message also references the field name for actionability.
+        with pytest.raises(ValueError, match=field):
+            run_preflight(cfg, [mock.Mock()], ["/inter"], ["/results"])

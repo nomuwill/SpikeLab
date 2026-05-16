@@ -545,10 +545,18 @@ class PairwiseCompMatrixStack:
             >>> stack[::2]    # Get every other matrix
         """
         if isinstance(index, (slice, np.ndarray, list)):
+            # When ``self.times`` is a Python list (the documented type),
+            # NumPy fancy/boolean indexing (``list[bool_array]``) raises
+            # TypeError. Convert to ndarray for indexing then back to a
+            # list to preserve the public type contract.
+            if self.times:
+                times_sub = list(np.asarray(self.times, dtype=object)[index])
+            else:
+                times_sub = None
             return PairwiseCompMatrixStack(
                 stack=self.stack[:, :, index],
                 labels=self.labels,
-                times=self.times[index] if self.times else None,
+                times=times_sub,
                 metadata=self.metadata.copy(),
             )
 

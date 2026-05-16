@@ -866,9 +866,16 @@ def PCA_reduction(matrix_2d, n_components=2):
 
 
 def _clamp_umap_n_neighbors(n_samples: int, n_neighbors: int) -> int:
-    """Clamp n_neighbors so small datasets do not raise at UMAP fit time."""
+    """Clamp n_neighbors so small datasets do not raise at UMAP fit time.
+
+    Raises:
+        ValueError: When ``n_samples < 2``. UMAP needs at least two
+            samples to define a neighborhood; surfacing this at the
+            wrapper boundary is far clearer than letting the underlying
+            ``umap-learn`` call fail with a less informative error.
+    """
     if n_samples < 2:
-        return 1
+        raise ValueError(f"UMAP requires at least 2 samples, got n_samples={n_samples}")
     max_nn = max(1, int(math.ceil(n_samples / 2)) - 1)
     return min(max(int(n_neighbors), 2), max_nn)
 
@@ -1979,6 +1986,11 @@ def _compute_agreement_score(train1, train2, delta):
         return 0.0, 0.0, 0.0
     n_matches = _count_matching_spikes(train1, train2, delta)
     denom = n1 + n2 - n_matches
+    # ``n_matches <= min(n1, n2)`` so ``denom = n1 + n2 - n_matches >=
+    # max(n1, n2) >= n_matches``. The ``denom > 0`` guard is therefore
+    # only false when both trains are empty, which is already handled
+    # by the early return above. The branch is kept for safety against
+    # future refactors that might invalidate the invariant.
     agreement = n_matches / denom if denom > 0 else 0.0
     frac_1 = n_matches / n1 if n1 > 0 else 0.0
     frac_2 = n_matches / n2 if n2 > 0 else 0.0

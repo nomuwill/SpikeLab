@@ -844,6 +844,8 @@ class SpikeData:
                 list/array matching neuron_indices length for each neuron.
             neuron_indices (list): Neurons to update. If None, updates all.
         """
+        if not isinstance(key, str):
+            raise TypeError(f"key must be a string, got {type(key).__name__}: {key!r}")
         if self.neuron_attributes is None:
             self.neuron_attributes = [{} for _ in range(self.N)]
         indices = range(self.N) if neuron_indices is None else neuron_indices
@@ -3686,6 +3688,14 @@ class SpikeData:
                                 f"{label}.neuron_attributes[{idx}] is missing "
                                 f"required key '{key}'."
                             )
+                    # Surface shape mismatches at the API boundary rather
+                    # than letting them fail deep inside _compute_footprint.
+                    template_arr = np.asarray(attrs["template"])
+                    if template_arr.ndim != 1:
+                        raise ValueError(
+                            f"{label}.neuron_attributes[{idx}]['template'] "
+                            f"must be 1-D, got shape {template_arr.shape}"
+                        )
 
             all_channels: List[int] = []
             self_attrs: List[Dict[str, Any]] = self.neuron_attributes  # type: ignore[assignment]

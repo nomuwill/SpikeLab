@@ -436,6 +436,9 @@ class SpikeSliceStack:
                 True, T covers the full recording span and all slices share
                 the same time axis.
         """
+        if bin_size <= 0:
+            raise ValueError(f"bin_size must be > 0, got {bin_size}")
+
         if not absolute_times:
             dense_list = []
             for sd in self.spike_stack:

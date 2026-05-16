@@ -8462,3 +8462,122 @@ class TestSpikeDataGetPairwiseCCGNegativeMaxLag:
 
         np.testing.assert_allclose(corr_pos.matrix, corr_neg.matrix, equal_nan=True)
         assert lag_pos.matrix.shape == lag_neg.matrix.shape
+
+
+class TestSpikeDataGetBurstsMismatchedPopRateLengths:
+    """``SpikeData.get_bursts`` refines burst peak times using
+    ``pop_rate_acc`` only when ``len(pop_rate_acc) == len(pop_rate)``.
+    Mismatched lengths fall through to a deliberate fallback that
+    keeps the coarse ``peaks[burst]`` index for ``tburst``. Pin the
+    fallback so a future refactor that silently changed precedence
+    would surface.
+    """
+
+    def test_mismatched_lengths_fall_back_to_coarse_peaks(self):
+        """
+        When ``pop_rate_acc`` has a different length than ``pop_rate``,
+        the inner per-burst block keeps ``tburst[burst] = peaks[burst]``
+        (no refinement) without raising.
+
+        Tests:
+            (Test Case 1) Bursts are still detected when lengths differ.
+            (Test Case 2) ``tburst`` indices match the coarse peaks
+                returned by the same ``pop_rate`` (i.e. no acc-driven
+                refinement was applied).
+            (Test Case 3) No exception is raised — the fallback path
+                is reachable from the public API.
+        """
+        # Build a SpikeData whose population firing has clear, separated
+        # bursts so find_peaks returns multiple peaks.
+        rng = np.random.default_rng(0)
+        n_units = 5
+        bursts_at = [200.0, 600.0, 1000.0]
+        train = []
+        for _ in range(n_units):
+            spikes = []
+            for t0 in bursts_at:
+                spikes.extend(t0 + rng.uniform(-3.0, 3.0, size=20))
+            spikes.extend(rng.uniform(0.0, 1200.0, size=10))
+            train.append(np.sort(np.asarray(spikes)))
+        sd = SpikeData(train, length=1300.0)
+
+        # Real pop_rate; deliberately wrong-length pop_rate_acc.
+        pop_rate = sd.get_pop_rate(square_width=20, gauss_sigma=50)
+        pop_rate_acc_wrong = np.zeros(len(pop_rate) // 2)
+
+        tburst, edges, peak_amp = sd.get_bursts(
+            thr_burst=2.0,
+            min_burst_diff=50,
+            burst_edge_mult_thresh=0.3,
+            pop_rate=pop_rate,
+            pop_rate_acc=pop_rate_acc_wrong,
+        )
+
+        # At least one burst was detected (the fallback executed for it).
+        assert len(tburst) > 0
+        # Without acc-refinement, tburst values must match indices that
+        # come directly from pop_rate's peaks — verify by recomputing.
+        from scipy.signal import find_peaks
+
+        pop_rms = np.sqrt(np.mean(np.square(pop_rate)))
+        peaks_expected, _ = find_peaks(pop_rate, height=pop_rms * 2.0, distance=50)
+        # Every retained tburst value should equal one of the find_peaks
+        # outputs (the fallback preserved peaks[burst] verbatim, modulo
+        # bursts dropped because no edges were found).
+        for t in tburst:
+            assert int(t) in set(int(x) for x in peaks_expected)
+
+
+class TestCompareSorterNeighborChannelsValidation:
+    """``compare_sorter("waveforms")`` builds per-unit footprints via
+    ``_compute_footprint``, which requires ``neighbor_channels[0]`` to
+    equal the unit's primary channel (the helper uses index 0 as the
+    canonical primary slot). The error message references both the
+    primary channel and the offending zeroth neighbor — pin that the
+    error reaches the public API rather than crashing internally with
+    a less actionable message.
+    """
+
+    def test_waveforms_neighbor_channels_zeroth_must_match_primary(self):
+        """
+        A unit whose ``neighbor_channels[0]`` differs from ``channel``
+        triggers the validation in ``_compute_footprint`` from the
+        public ``compare_sorter("waveforms")`` API.
+
+        Tests:
+            (Test Case 1) ``ValueError`` is raised with a message
+                naming "neighbor_channels" and the primary channel.
+            (Test Case 2) The error fires when the bad attrs live on
+                the *first* unit visited (failing fast).
+        """
+        template = np.array([0.0, -1.0, -2.0, -1.0, 0.0], dtype=float)
+        good_attrs = {
+            "template": template,
+            "neighbor_templates": np.vstack([np.zeros_like(template), 0.5 * template]),
+            "channel": 0,
+            "neighbor_channels": np.array([0, 1], dtype=int),
+        }
+        bad_attrs = {
+            "template": template,
+            "neighbor_templates": np.vstack([np.zeros_like(template), 0.5 * template]),
+            # Primary channel is 0 but neighbor_channels[0] is 7 — the
+            # validator must reject this before any similarity is
+            # computed.
+            "channel": 0,
+            "neighbor_channels": np.array([7, 1], dtype=int),
+        }
+
+        sd1 = SpikeData(
+            [[], []], length=30.0, neuron_attributes=[bad_attrs, good_attrs]
+        )
+        sd2 = SpikeData(
+            [[], []], length=30.0, neuron_attributes=[good_attrs, good_attrs]
+        )
+
+        with pytest.raises(ValueError, match="neighbor_channels"):
+            sd1.compare_sorter(
+                sd2,
+                comparison_type="waveforms",
+                f_rel_to_trough=(2, 2),
+                max_lag=0,
+            )

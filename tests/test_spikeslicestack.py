@@ -4246,6 +4246,84 @@ class TestResponsivenessChange:
             )
 
 
+class TestSliceToSliceUnitComparisonCcgMaxLagZero:
+    """``SpikeSliceStack.get_slice_to_slice_unit_comparison(metric="ccg",
+    max_lag=0)`` reduces to the zero-lag fast path of
+    ``compute_cross_correlation_with_lag``. Pin that the resulting
+    ``all_lag`` matrix is all zeros (only zero-lag is searched) and
+    ``all_corr`` is finite for valid slice pairs.
+    """
+
+    def test_max_lag_zero_yields_zero_lag_matrix(self):
+        """
+        Setting ``max_lag=0`` forces ``max_lag_bins=0``; every
+        slice-pair lag in the returned ``all_lag`` stack is therefore
+        ``0``, while ``all_corr`` reflects the zero-lag normalised
+        dot-product.
+
+        Tests:
+            (Test Case 1) ``all_lag`` is all zeros (no NaN, no non-zero
+                lag values).
+            (Test Case 2) ``all_corr`` diagonal is 1.0 (self-pair).
+            (Test Case 3) Returned shapes are ``(S, S, U)``.
+        """
+        # Dense slices: every unit has many spikes inside each slice so
+        # min_spikes filtering does not produce NaN entries.
+        rng = np.random.default_rng(11)
+        n_units = 2
+        train = [np.sort(rng.uniform(0.0, 200.0, size=200)) for _ in range(n_units)]
+        sd = SpikeData(train, length=200.0)
+        sss = SpikeSliceStack(
+            sd, time_peaks=[40.0, 100.0, 160.0], time_bounds=(20.0, 20.0)
+        )
+
+        all_corr, all_lag, _av_corr, _av_lag = sss.get_slice_to_slice_unit_comparison(
+            metric="ccg", bin_size=1.0, max_lag=0, min_spikes=1, min_frac=0.5
+        )
+
+        S, U = len(sss.spike_stack), sss.N
+        assert all_corr.stack.shape == (S, S, U)
+        assert all_lag.stack.shape == (S, S, U)
+        # Every non-NaN lag entry is zero (max_lag=0 collapses the search
+        # window). Some entries may be NaN if a slice falls below
+        # min_spikes; those still must NOT be non-zero values.
+        finite = ~np.isnan(all_lag.stack)
+        assert np.all(all_lag.stack[finite] == 0.0)
+        # Diagonal entries are self-correlation (= 1.0) for any unit
+        # whose slice has enough spikes.
+        for u in range(U):
+            for s in range(S):
+                d = all_corr.stack[s, s, u]
+                if not np.isnan(d):
+                    assert d == pytest.approx(1.0, abs=1e-9)
+
+
+class TestSpikeSliceStackRankOrderNShufflesExactly5:
+    """Mirrors ``test_n_shuffles_exactly_5`` in test_rateslicestack.py
+    for the ``SpikeSliceStack`` path — pins that ``n_shuffles=5``
+    (the documented minimum) is accepted and produces a valid output
+    on the spike-based code path.
+    """
+
+    def test_n_shuffles_exactly_5_accepted(self):
+        """
+        ``n_shuffles=5`` (boundary of the valid range) does not raise
+        on ``SpikeSliceStack.rank_order_correlation`` and produces
+        the expected ``(S, S)`` output matrix.
+
+        Tests:
+            (Test Case 1) No ValueError raised at the boundary.
+            (Test Case 2) Returned correlation matrix has shape
+                ``(S, S)``.
+        """
+        sd = make_spikedata(n_units=4, length_ms=400.0, seed=13)
+        sss = SpikeSliceStack(
+            sd, time_peaks=[80.0, 200.0, 320.0], time_bounds=(40.0, 40.0)
+        )
+        corr, _, _ = sss.rank_order_correlation(n_shuffles=5, seed=42)
+        assert corr.matrix.shape == (3, 3)
+
+
 class TestSpikeSliceStackBoundarySpike:
     """``SpikeSliceStack.__init__`` validates that per-slice spike
     times fall within the slice window using strict inequality

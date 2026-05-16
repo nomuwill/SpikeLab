@@ -10155,3 +10155,332 @@ class TestBackendConfigThreading:
         )
 
         assert captured["config"] is backend.config
+
+
+# ===========================================================================
+# Batch G — additional Phase 5 refactor coverage: format_params validation,
+# sorter_params merge equivalences, backend isolation, OOM snapshot
+# semantics, and rt_sort defaults round-trip.
+# ===========================================================================
+
+
+class TestRunKilosortFormatParamsValidation:
+    """``RunKilosort.format_params`` is the canonical leak-fix entry
+    point; pin the error contract for hand-crafted partial input
+    dicts (the static-method form is more callable in isolation than
+    the pre-refactor in-place mutation was).
+    """
+
+    def test_nt_none_without_ntbuff_raises_key_error(self):
+        """
+        ``format_params({"NT": None, "car": True})`` (no ``ntbuff``)
+        raises ``KeyError`` because the resolution
+        ``NT = 64*1024 + out["ntbuff"]`` indexes without a default.
+
+        Tests:
+            (Test Case 1) KeyError raised, message names "ntbuff".
+        """
+        from spikelab.spike_sorting.ks2_runner import RunKilosort
+
+        with pytest.raises(KeyError, match="ntbuff"):
+            RunKilosort.format_params({"NT": None, "car": True})
+
+    def test_nt_non_numeric_string_raises_value_error(self):
+        """
+        Non-numeric string for ``NT`` (e.g. ``"64k"``) fails the
+        ``int()`` cast.
+
+        Tests:
+            (Test Case 1) ValueError raised by ``int()``.
+        """
+        from spikelab.spike_sorting.ks2_runner import RunKilosort
+
+        with pytest.raises(ValueError):
+            RunKilosort.format_params({"NT": "64k", "ntbuff": 64, "car": False})
+
+    def test_nt_digit_string_accepted(self):
+        """
+        Digit-only string for ``NT`` is accepted (``int("65600")``
+        works); rounded down to a multiple of 32.
+
+        Tests:
+            (Test Case 1) ``NT="65600"`` → ``out["NT"] == 65600``.
+        """
+        from spikelab.spike_sorting.ks2_runner import RunKilosort
+
+        out = RunKilosort.format_params({"NT": "65600", "ntbuff": 64, "car": False})
+        assert out["NT"] == 65600
+
+
+@skip_no_spikeinterface
+class TestSpikeSortKs2SorterParamsEmptyDictEquivalentToNone:
+    """``config.sorter.sorter_params={}`` and ``None`` must produce
+    the same merged ``kilosort_params`` dict reaching ``RunKilosort``.
+    """
+
+    def test_empty_dict_equals_none(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Both forms forward the same merged dict
+                (== ``DEFAULT_KILOSORT2_PARAMS``) to ``RunKilosort``.
+        """
+        from spikelab.spike_sorting import ks2_runner
+        from spikelab.spike_sorting.backends.kilosort2 import (
+            DEFAULT_KILOSORT2_PARAMS,
+        )
+        from spikelab.spike_sorting.config import SorterConfig, SortingPipelineConfig
+
+        captured = {"none": None, "empty": None}
+
+        def _stub_factory(slot):
+            class _Stub:
+                def __init__(self, **kwargs):
+                    captured[slot] = kwargs.get("kilosort_params")
+
+                def run(self, **_kw):
+                    return MagicMock(unit_ids=[])
+
+            return _Stub
+
+        monkeypatch.setattr(ks2_runner, "write_recording", lambda *a, **kw: None)
+        monkeypatch.setattr(ks2_runner, "create_folder", lambda *a, **kw: None)
+
+        monkeypatch.setattr(ks2_runner, "RunKilosort", _stub_factory("none"))
+        ks2_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=Path("/tmp/out"),
+            config=SortingPipelineConfig(
+                sorter=SorterConfig(sorter_path="/fake/ks", sorter_params=None)
+            ),
+        )
+
+        monkeypatch.setattr(ks2_runner, "RunKilosort", _stub_factory("empty"))
+        ks2_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=Path("/tmp/out"),
+            config=SortingPipelineConfig(
+                sorter=SorterConfig(sorter_path="/fake/ks", sorter_params={})
+            ),
+        )
+
+        assert captured["none"] == captured["empty"]
+        assert captured["none"] == dict(DEFAULT_KILOSORT2_PARAMS)
+
+
+@skip_no_spikeinterface
+class TestSpikeSortKs4ConfigNoneUsesDefaults:
+    """``ks4_runner.spike_sort(config=None)`` constructs a default
+    config and forwards bare ``DEFAULT_KILOSORT4_PARAMS`` to
+    ``run_sorter``.
+    """
+
+    def test_config_none_forwards_default_kilosort4_params(self, monkeypatch, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``run_sorter`` kwargs contain every key
+                from ``DEFAULT_KILOSORT4_PARAMS``.
+        """
+        import spikeinterface.sorters as ss
+
+        from spikelab.spike_sorting import ks4_runner
+        from spikelab.spike_sorting.backends.kilosort4 import (
+            DEFAULT_KILOSORT4_PARAMS,
+        )
+
+        captured = {}
+
+        def _stub(name, recording, **kwargs):
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(ss, "run_sorter", _stub)
+        monkeypatch.setattr(
+            ks4_runner, "KilosortSortingExtractor", lambda **_kw: MagicMock(unit_ids=[])
+        )
+
+        ks4_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=tmp_path / "ks4_out",
+            config=None,
+        )
+
+        for k, v in DEFAULT_KILOSORT4_PARAMS.items():
+            assert captured["kwargs"][k] == v
+
+
+@skip_no_spikeinterface
+class TestBackendStateIsolationAcrossRecordings:
+    """Two backends constructed with distinct ``sorter_params`` must
+    not contaminate each other. Pins the canonical multi-recording
+    isolation that the refactor closed.
+    """
+
+    def test_two_kilosort2_backends_keep_independent_params(self):
+        """
+        Tests:
+            (Test Case 1) Construction-time isolation: backend A's NT
+                is 65600 even after backend B with NT=32000 is built.
+            (Test Case 2) Method-call isolation: scaling backend A's
+                config does not leak to backend B.
+        """
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SorterConfig, SortingPipelineConfig
+
+        cfg_a = SortingPipelineConfig(sorter=SorterConfig(sorter_params={"NT": 65600}))
+        cfg_b = SortingPipelineConfig(sorter=SorterConfig(sorter_params={"NT": 32000}))
+        backend_a = Kilosort2Backend(cfg_a)
+        backend_b = Kilosort2Backend(cfg_b)
+
+        assert backend_a.config.sorter.sorter_params["NT"] == 65600
+        assert backend_b.config.sorter.sorter_params["NT"] == 32000
+
+        backend_a.scale_oom_params(0.5)
+        assert backend_b.config.sorter.sorter_params["NT"] == 32000
+
+
+@skip_no_spikeinterface
+class TestBackendOomSnapshotIsDeepCopy:
+    """``snapshot_oom_params()`` returns a value independent of
+    subsequent ``scale_oom_params`` mutations.
+    """
+
+    def test_kilosort2_snapshot_independent_of_subsequent_scale(self):
+        """
+        Tests:
+            (Test Case 1) NT in the snapshot is unchanged after
+                ``scale_oom_params`` mutates the live config.
+        """
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SorterConfig, SortingPipelineConfig
+
+        backend = Kilosort2Backend(
+            SortingPipelineConfig(
+                sorter=SorterConfig(sorter_params={"NT": 65600, "ntbuff": 64})
+            )
+        )
+        snap = backend.snapshot_oom_params()
+        original_nt = snap["sorter_params"]["NT"]
+
+        backend.scale_oom_params(0.5)
+        scaled_nt = backend.config.sorter.sorter_params["NT"]
+
+        assert scaled_nt < original_nt
+        assert snap["sorter_params"]["NT"] == original_nt
+
+    def test_kilosort4_snapshot_independent_of_subsequent_scale(self):
+        """KS4 equivalent — pins the same contract on batch_size."""
+        from spikelab.spike_sorting.backends.kilosort4 import Kilosort4Backend
+        from spikelab.spike_sorting.config import SorterConfig, SortingPipelineConfig
+
+        backend = Kilosort4Backend(
+            SortingPipelineConfig(
+                sorter=SorterConfig(sorter_params={"batch_size": 60000})
+            )
+        )
+        snap = backend.snapshot_oom_params()
+        original_bs = snap["sorter_params"]["batch_size"]
+
+        backend.scale_oom_params(0.5)
+        scaled_bs = backend.config.sorter.sorter_params["batch_size"]
+
+        assert scaled_bs < original_bs
+        assert snap["sorter_params"]["batch_size"] == original_bs
+
+
+@skip_no_spikeinterface
+class TestNumpySortingToKsExtractorDefaults:
+    """``_numpy_sorting_to_ks_extractor`` falls back to documented
+    defaults when ``keep_good_only`` or ``pos_peak_thresh`` is
+    ``None``.
+    """
+
+    @pytest.fixture()
+    def captured_kse_init(self, monkeypatch):
+        """Patch ``KilosortSortingExtractor.__init__`` to capture the
+        kwargs it receives without running the real init (which
+        requires Kilosort-format files on disk)."""
+        from spikelab.spike_sorting import sorting_extractor
+
+        captured = {}
+
+        class _StubKSE:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(sorting_extractor, "KilosortSortingExtractor", _StubKSE)
+        return captured
+
+    def test_keep_good_only_none_defaults_to_false(self, captured_kse_init, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``keep_good_only=None`` resolves to ``False``
+                in the kwargs passed to ``KilosortSortingExtractor``.
+            (Test Case 2) ``pos_peak_thresh=None`` resolves to
+                ``WaveformConfig().pos_peak_thresh``.
+        """
+        from spikeinterface.core import NumpyRecording
+        from spikeinterface.extractors import NumpySorting
+
+        from spikelab.spike_sorting.backends.rt_sort import (
+            _numpy_sorting_to_ks_extractor,
+        )
+        from spikelab.spike_sorting.config import WaveformConfig
+
+        fs = 20000.0
+        rec = NumpyRecording(
+            traces_list=[np.zeros((1000, 4), dtype=np.float32)],
+            sampling_frequency=fs,
+        )
+        sorting = NumpySorting.from_unit_dict(
+            [{0: np.array([100, 200], dtype=np.int64)}], sampling_frequency=fs
+        )
+
+        _numpy_sorting_to_ks_extractor(
+            sorting,
+            rec,
+            tmp_path / "out",
+            root_elecs=[0],
+            keep_good_only=None,
+            pos_peak_thresh=None,
+        )
+        assert captured_kse_init["keep_good_only"] is False
+        assert captured_kse_init["pos_peak_thresh"] == WaveformConfig().pos_peak_thresh
+
+    def test_keep_good_only_true_round_trip(self, captured_kse_init, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``keep_good_only=True`` propagates verbatim
+                to the KSE constructor.
+            (Test Case 2) ``pos_peak_thresh=1.5`` propagates verbatim.
+        """
+        from spikeinterface.core import NumpyRecording
+        from spikeinterface.extractors import NumpySorting
+
+        from spikelab.spike_sorting.backends.rt_sort import (
+            _numpy_sorting_to_ks_extractor,
+        )
+
+        fs = 20000.0
+        rec = NumpyRecording(
+            traces_list=[np.zeros((1000, 4), dtype=np.float32)],
+            sampling_frequency=fs,
+        )
+        sorting = NumpySorting.from_unit_dict(
+            [{0: np.array([100, 200], dtype=np.int64)}], sampling_frequency=fs
+        )
+
+        _numpy_sorting_to_ks_extractor(
+            sorting,
+            rec,
+            tmp_path / "out",
+            root_elecs=[0],
+            keep_good_only=True,
+            pos_peak_thresh=1.5,
+        )
+        assert captured_kse_init["keep_good_only"] is True
+        assert captured_kse_init["pos_peak_thresh"] == 1.5

@@ -7676,6 +7676,7 @@ class TestComputeWaveformMetricsNoRawData:
             )
 
 
+@pytestmark_server
 class TestMcpJsonNanSanitiser:
     """``_call_tool`` must emit RFC-8259-valid JSON. ``json.dumps`` with
     the default ``allow_nan=True`` emits the JavaScript literals ``NaN``

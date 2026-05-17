@@ -236,7 +236,20 @@ def _build_spikedata(
     """Internal helper to construct a SpikeData with sensible defaults. Infers `length_ms` from the last spike if not provided."""
     if length_ms is None:
         last = [t[-1] for t in trains_ms if len(t) > 0]
-        length_ms = float(max(last)) - start_time if last else 0.0
+        if last:
+            # Add one ULP at the magnitude of the latest spike so the
+            # constructor's strict ``t[-1] > start_time + length`` check
+            # passes even when unit-conversion round-trips (samples → s
+            # → ms in the loaders) drift the loaded spike value by a
+            # ULP above the inferred end. ``np.spacing(x)`` returns the
+            # gap between ``x`` and the next float; at typical recording
+            # scales (~1e5 ms) that's ~1.5e-11 ms — far below any
+            # measurable precision but enough to keep the inequality
+            # strict.
+            max_last = float(max(last))
+            length_ms = max_last - start_time + np.spacing(max_last)
+        else:
+            length_ms = 0.0
     return SpikeData(
         trains_ms,
         length=length_ms,

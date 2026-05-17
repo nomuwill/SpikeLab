@@ -19,27 +19,6 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 import pytest
 
-
-class _GlobalsStub:
-    """No-op stand-in for the deleted ``_globals`` module.
-
-    Some test fixtures predate Phase 5 of the ``_globals.py`` refactor
-    (see ``iat/TO_IMPLEMENT.md``) and still expect to import
-    ``spikelab.spike_sorting._globals`` to set sentinel attributes
-    before the test runs. With the module gone — and the code under
-    test reading from ``SortingPipelineConfig`` instead — those writes
-    have no effect; this stub absorbs them silently so the fixtures
-    stay syntactically valid until a follow-up cleanup pass removes
-    them.
-    """
-
-    def __getattr__(self, name):
-        return None
-
-    def __setattr__(self, name, value):
-        pass
-
-
 # ---------------------------------------------------------------------------
 # Optional-dependency gating
 # ---------------------------------------------------------------------------
@@ -290,18 +269,9 @@ class TestKilosortSortingExtractor:
         spike_clusters = np.array([0, 0, 0, 1, 1], dtype=np.int64)
         _write_ks_folder(tmp_path, spike_times, spike_clusters, sample_rate=30000.0)
 
-        # Need to set KILOSORT_PARAMS global for init
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(tmp_path)
-            assert set(kse.unit_ids) == {0, 1}
-            assert kse.sampling_frequency == 30000.0
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(tmp_path)
+        assert set(kse.unit_ids) == {0, 1}
+        assert kse.sampling_frequency == 30000.0
 
     def test_exclude_cluster_groups_string(self, tmp_path, ks_module):
         """
@@ -315,18 +285,10 @@ class TestKilosortSortingExtractor:
         tsv = {"cluster_id": [0, 1], "group": ["good", "noise"]}
         _write_ks_folder(tmp_path, spike_times, spike_clusters, tsv_data=tsv)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(
-                tmp_path, exclude_cluster_groups="noise"
-            )
-            assert kse.unit_ids == [0]
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(
+            tmp_path, exclude_cluster_groups="noise"
+        )
+        assert kse.unit_ids == [0]
 
     def test_exclude_cluster_groups_list(self, tmp_path, ks_module):
         """
@@ -340,18 +302,10 @@ class TestKilosortSortingExtractor:
         tsv = {"cluster_id": [0, 1, 2], "group": ["good", "noise", "mua"]}
         _write_ks_folder(tmp_path, spike_times, spike_clusters, tsv_data=tsv)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(
-                tmp_path, exclude_cluster_groups=["noise", "mua"]
-            )
-            assert kse.unit_ids == [0]
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(
+            tmp_path, exclude_cluster_groups=["noise", "mua"]
+        )
+        assert kse.unit_ids == [0]
 
     def test_keep_good_only(self, tmp_path, ks_module):
         """
@@ -402,31 +356,23 @@ class TestKilosortSortingExtractor:
         spike_clusters = np.array([0, 0, 0, 0, 0], dtype=np.int64)
         _write_ks_folder(tmp_path, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
+        kse = ks_module.KilosortSortingExtractor(tmp_path)
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(tmp_path)
+        # All spikes
+        st = kse.get_unit_spike_train(0)
+        assert len(st) == 5
 
-            # All spikes
-            st = kse.get_unit_spike_train(0)
-            assert len(st) == 5
+        # start_frame only
+        st = kse.get_unit_spike_train(0, start_frame=100)
+        np.testing.assert_array_equal(st, [100, 200, 500])
 
-            # start_frame only
-            st = kse.get_unit_spike_train(0, start_frame=100)
-            np.testing.assert_array_equal(st, [100, 200, 500])
+        # end_frame only
+        st = kse.get_unit_spike_train(0, end_frame=200)
+        np.testing.assert_array_equal(st, [10, 50, 100])
 
-            # end_frame only
-            st = kse.get_unit_spike_train(0, end_frame=200)
-            np.testing.assert_array_equal(st, [10, 50, 100])
-
-            # Both
-            st = kse.get_unit_spike_train(0, start_frame=50, end_frame=200)
-            np.testing.assert_array_equal(st, [50, 100])
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        # Both
+        st = kse.get_unit_spike_train(0, start_frame=50, end_frame=200)
+        np.testing.assert_array_equal(st, [50, 100])
 
     def test_get_num_segments(self, ks_module):
         """
@@ -449,17 +395,9 @@ class TestKilosortSortingExtractor:
         spike_clusters = np.array([0], dtype=np.int64)
         _write_ks_folder(tmp_path, spike_times, spike_clusters, sample_rate=20000.0)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(tmp_path)
-            assert kse.ms_to_samples(1.0) == 20
-            assert kse.ms_to_samples(0.5) == 10
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(tmp_path)
+        assert kse.ms_to_samples(1.0) == 20
+        assert kse.ms_to_samples(0.5) == 10
 
     def test_no_tsv_files_fallback(self, tmp_path, ks_module):
         """
@@ -473,16 +411,8 @@ class TestKilosortSortingExtractor:
         folder = tmp_path / "no_tsv"
         _write_ks_folder(folder, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            assert set(kse.unit_ids) == {0, 3}
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        assert set(kse.unit_ids) == {0, 3}
 
     def test_single_spike_single_unit(self, tmp_path, ks_module):
         """
@@ -498,18 +428,10 @@ class TestKilosortSortingExtractor:
         spike_clusters = np.array([0], dtype=np.int64)
         _write_ks_folder(tmp_path, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(tmp_path)
-            assert kse.unit_ids == [0]
-            st = kse.get_unit_spike_train(0)
-            np.testing.assert_array_equal(st, [42])
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(tmp_path)
+        assert kse.unit_ids == [0]
+        st = kse.get_unit_spike_train(0)
+        np.testing.assert_array_equal(st, [42])
 
     def test_csv_file_loading(self, tmp_path, ks_module):
         """
@@ -525,18 +447,8 @@ class TestKilosortSortingExtractor:
         csv_text = "cluster_id,group\n0,good\n1,noise"
         (folder / "cluster_info.csv").write_text(csv_text)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(
-                folder, exclude_cluster_groups="noise"
-            )
-            assert kse.unit_ids == [0]
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder, exclude_cluster_groups="noise")
+        assert kse.unit_ids == [0]
 
     def test_id_column_fallback(self, tmp_path, ks_module):
         """
@@ -551,16 +463,8 @@ class TestKilosortSortingExtractor:
         _write_ks_folder(folder, spike_times, spike_clusters)
         (folder / "cluster_info.tsv").write_text("id\tgroup\n0\tgood\n1\tgood")
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            assert set(kse.unit_ids) == {0, 1}
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        assert set(kse.unit_ids) == {0, 1}
 
     def test_empty_exclude_cluster_groups_list(self, tmp_path, ks_module):
         """
@@ -574,18 +478,8 @@ class TestKilosortSortingExtractor:
         tsv = {"cluster_id": [0, 1], "group": ["good", "noise"]}
         _write_ks_folder(tmp_path, spike_times, spike_clusters, tsv_data=tsv)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(
-                tmp_path, exclude_cluster_groups=[]
-            )
-            assert set(kse.unit_ids) == {0, 1}
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(tmp_path, exclude_cluster_groups=[])
+        assert set(kse.unit_ids) == {0, 1}
 
     def test_multiple_tsv_files_merged(self, tmp_path, ks_module):
         """
@@ -618,17 +512,9 @@ class TestKilosortSortingExtractor:
         folder = tmp_path / "start_eq_end"
         _write_ks_folder(folder, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            st = kse.get_unit_spike_train(0, start_frame=50, end_frame=50)
-            assert len(st) == 0
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        st = kse.get_unit_spike_train(0, start_frame=50, end_frame=50)
+        assert len(st) == 0
 
     def test_spike_train_bounds_beyond_all_spikes(self, tmp_path, ks_module):
         """
@@ -643,17 +529,9 @@ class TestKilosortSortingExtractor:
         folder = tmp_path / "beyond_bounds"
         _write_ks_folder(folder, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            assert len(kse.get_unit_spike_train(0, start_frame=200)) == 0
-            assert len(kse.get_unit_spike_train(0, end_frame=5)) == 0
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        assert len(kse.get_unit_spike_train(0, start_frame=200)) == 0
+        assert len(kse.get_unit_spike_train(0, end_frame=5)) == 0
 
     def test_spike_exactly_at_end_frame_excluded(self, tmp_path, ks_module):
         """
@@ -667,17 +545,9 @@ class TestKilosortSortingExtractor:
         folder = tmp_path / "at_end"
         _write_ks_folder(folder, spike_times, spike_clusters)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            st = kse.get_unit_spike_train(0, end_frame=100)
-            np.testing.assert_array_equal(st, [50])
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        st = kse.get_unit_spike_train(0, end_frame=100)
+        np.testing.assert_array_equal(st, [50])
 
     def test_ms_to_samples_zero(self, tmp_path, ks_module):
         """
@@ -691,16 +561,8 @@ class TestKilosortSortingExtractor:
         folder = tmp_path / "ms_zero"
         _write_ks_folder(folder, spike_times, spike_clusters, sample_rate=44100.0)
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        try:
-            kse = ks_module.KilosortSortingExtractor(folder)
-            assert kse.ms_to_samples(0) == 0
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
+        kse = ks_module.KilosortSortingExtractor(folder)
+        assert kse.ms_to_samples(0) == 0
 
     def test_missing_params_py(self, tmp_path):
         """Missing params.py raises FileNotFoundError."""
@@ -775,8 +637,6 @@ class TestKilosortSortingExtractorGetChansMax:
         """Create a KSE with known templates."""
         from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
         spike_times = np.array([10, 20, 100, 200], dtype=np.int64)
         spike_clusters = np.array([0, 0, 1, 1], dtype=np.int64)
 
@@ -797,18 +657,8 @@ class TestKilosortSortingExtractorGetChansMax:
             channel_map=channel_map,
         )
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        old_pos_peak = getattr(ks_mod, "POS_PEAK_THRESH", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        ks_mod.POS_PEAK_THRESH = 2.0
-
         kse = KilosortSortingExtractor(tmp_path)
         yield kse
-
-        if old_params is not None:
-            ks_mod.KILOSORT_PARAMS = old_params
-        if old_pos_peak is not None:
-            ks_mod.POS_PEAK_THRESH = old_pos_peak
 
     def test_get_chans_max_negative_peaks(self, kse_with_templates):
         """
@@ -835,8 +685,6 @@ class TestKilosortSortingExtractorGetChansMax:
         """
         from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
         spike_times = np.array([10, 20], dtype=np.int64)
         spike_clusters = np.array([0, 0], dtype=np.int64)
 
@@ -856,21 +704,10 @@ class TestKilosortSortingExtractorGetChansMax:
             channel_map=channel_map,
         )
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        old_pos_peak = getattr(ks_mod, "POS_PEAK_THRESH", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        ks_mod.POS_PEAK_THRESH = 2.0
-
-        try:
-            kse = KilosortSortingExtractor(folder)
-            use_pos, _, chans_all = kse.get_chans_max()
-            assert use_pos[0]
-            assert chans_all[0] == 3
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
-            if old_pos_peak is not None:
-                ks_mod.POS_PEAK_THRESH = old_pos_peak
+        kse = KilosortSortingExtractor(folder)
+        use_pos, _, chans_all = kse.get_chans_max()
+        assert use_pos[0]
+        assert chans_all[0] == 3
 
     def test_get_templates_half_windows_sizes(self, kse_with_templates):
         """
@@ -1431,37 +1268,10 @@ class TestSpikeSortDocker:
 
     @pytest.fixture(autouse=True)
     def _set_globals(self):
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
         import spikelab.spike_sorting.ks2_runner as ks_runner_mod
 
-        self._ks_mod = ks_mod
         self._ks_runner_mod = ks_runner_mod
-        self._old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        self._old_docker = getattr(ks_mod, "USE_DOCKER", None)
-        self._old_recompute = getattr(ks_mod, "RECOMPUTE_SORTING", None)
-        ks_mod.KILOSORT_PARAMS = {
-            "detect_threshold": 6,
-            "projection_threshold": [10, 4],
-            "preclust_threshold": 8,
-            "car": True,
-            "minFR": 0.1,
-            "minfr_goodchannels": 0.1,
-            "freq_min": 150,
-            "sigmaMask": 30,
-            "nPCs": 3,
-            "ntbuff": 64,
-            "nfilt_factor": 4,
-            "NT": None,
-            "keep_good_only": False,
-        }
-        ks_mod.RECOMPUTE_SORTING = True
         yield
-        if self._old_params is not None:
-            ks_mod.KILOSORT_PARAMS = self._old_params
-        if self._old_docker is not None:
-            ks_mod.USE_DOCKER = self._old_docker
-        if self._old_recompute is not None:
-            ks_mod.RECOMPUTE_SORTING = self._old_recompute
 
     def _write_fake_phy_output(self, folder):
         """Write minimal Phy output files so KilosortSortingExtractor can load."""
@@ -1617,7 +1427,6 @@ class TestSpikeSortDocker:
         """
         from spikelab.spike_sorting.ks2_runner import spike_sort
 
-        self._ks_mod.USE_DOCKER = False
         output_folder = tmp_path / "ks_output"
         recording = _make_mock_recording()
 
@@ -1898,19 +1707,9 @@ class TestConcatenateRecordingsValidation:
     """
 
     @pytest.fixture()
-    def concat_fn(self, monkeypatch):
-        _globals = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
+    def concat_fn(self):
         from spikelab.spike_sorting import recording_io
 
-        monkeypatch.setattr(_globals, "REC_CHUNKS", [], raising=False)
-        monkeypatch.setattr(_globals, "_REC_CHUNK_NAMES", [], raising=False)
-        monkeypatch.setattr(_globals, "STREAM_ID", None, raising=False)
-        monkeypatch.setattr(_globals, "GAIN_TO_UV", None, raising=False)
-        monkeypatch.setattr(_globals, "OFFSET_TO_UV", None, raising=False)
-        monkeypatch.setattr(_globals, "FREQ_MIN", 300, raising=False)
-        monkeypatch.setattr(_globals, "FREQ_MAX", 6000, raising=False)
-        monkeypatch.setattr(_globals, "FIRST_N_MINS", None, raising=False)
-        monkeypatch.setattr(_globals, "MEA_Y_MAX", None, raising=False)
         return recording_io.concatenate_recordings
 
     def test_channel_count_mismatch_raises(self, concat_fn, tmp_path, monkeypatch):
@@ -3635,24 +3434,6 @@ class TestKilosort4BackendDockerBranch:
         (Test Case 3) No docker kwargs when USE_DOCKER is falsy.
     """
 
-    @pytest.fixture(autouse=True)
-    def _set_globals(self):
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        self._ks_mod = ks_mod
-        self._old_docker = getattr(ks_mod, "USE_DOCKER", None)
-        self._old_recompute = getattr(ks_mod, "RECOMPUTE_SORTING", None)
-        self._old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {}
-        ks_mod.RECOMPUTE_SORTING = True
-        yield
-        if self._old_docker is not None:
-            ks_mod.USE_DOCKER = self._old_docker
-        if self._old_recompute is not None:
-            ks_mod.RECOMPUTE_SORTING = self._old_recompute
-        if self._old_params is not None:
-            ks_mod.KILOSORT_PARAMS = self._old_params
-
     def _write_fake_phy_output(self, folder):
         """Write minimal Phy output files so KilosortSortingExtractor can load."""
         folder.mkdir(parents=True, exist_ok=True)
@@ -3789,8 +3570,6 @@ class TestTemplateHalfWindowDenseTemplates:
         """
         from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
         spike_times = np.array([10, 20], dtype=np.int64)
         spike_clusters = np.array([0, 0], dtype=np.int64)
 
@@ -3811,25 +3590,14 @@ class TestTemplateHalfWindowDenseTemplates:
             channel_map=channel_map,
         )
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        old_pos_peak = getattr(ks_mod, "POS_PEAK_THRESH", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        ks_mod.POS_PEAK_THRESH = 2.0
-
-        try:
-            kse = KilosortSortingExtractor(folder)
-            _, chans_ks, _ = kse.get_chans_max()
-            hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
-            assert len(hw_sizes) == 1
-            # All pre-mid values (abs=2.0) are above threshold (1.0),
-            # so no small_indices → size = template_mid = 30
-            # Result: int(30 * 0.75) = 22
-            assert hw_sizes[0] == 22
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
-            if old_pos_peak is not None:
-                ks_mod.POS_PEAK_THRESH = old_pos_peak
+        kse = KilosortSortingExtractor(folder)
+        _, chans_ks, _ = kse.get_chans_max()
+        hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
+        assert len(hw_sizes) == 1
+        # All pre-mid values (abs=2.0) are above threshold (1.0),
+        # so no small_indices → size = template_mid = 30
+        # Result: int(30 * 0.75) = 22
+        assert hw_sizes[0] == 22
 
     def test_template_with_small_nonzero_edges(self, tmp_path):
         """
@@ -3840,8 +3608,6 @@ class TestTemplateHalfWindowDenseTemplates:
             (Test Case 2) Window is smaller than template_mid.
         """
         from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
-
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
 
         spike_times = np.array([10, 20], dtype=np.int64)
         spike_clusters = np.array([0, 0], dtype=np.int64)
@@ -3864,26 +3630,15 @@ class TestTemplateHalfWindowDenseTemplates:
             channel_map=channel_map,
         )
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        old_pos_peak = getattr(ks_mod, "POS_PEAK_THRESH", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        ks_mod.POS_PEAK_THRESH = 2.0
-
-        try:
-            kse = KilosortSortingExtractor(folder)
-            _, chans_ks, _ = kse.get_chans_max()
-            hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
-            assert len(hw_sizes) == 1
-            assert hw_sizes[0] > 0
-            # Edge values (0.001) are below 1% of 10.0 = 0.1, so they're "small".
-            # The ramp starts at index 25 with -0.5 which is above threshold.
-            # So the last small index should be 24, giving size = 30 - 24 = 6.
-            assert hw_sizes[0] < 30  # tighter than full half
-        finally:
-            if old_params is not None:
-                ks_mod.KILOSORT_PARAMS = old_params
-            if old_pos_peak is not None:
-                ks_mod.POS_PEAK_THRESH = old_pos_peak
+        kse = KilosortSortingExtractor(folder)
+        _, chans_ks, _ = kse.get_chans_max()
+        hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
+        assert len(hw_sizes) == 1
+        assert hw_sizes[0] > 0
+        # Edge values (0.001) are below 1% of 10.0 = 0.1, so they're "small".
+        # The ramp starts at index 25 with -0.5 which is above threshold.
+        # So the last small index should be 24, giving size = 30 - 24 = 6.
+        assert hw_sizes[0] < 30  # tighter than full half
 
 
 # ===========================================================================
@@ -3983,9 +3738,6 @@ class TestTemplateHalfWindow:
         """Helper to create a KSE from given templates array."""
         from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
 
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        n_templates = templates.shape[0]
         n_channels = templates.shape[2]
         spike_times = np.array([10, 20], dtype=np.int64)
         spike_clusters = np.array([0, 0], dtype=np.int64)
@@ -4001,20 +3753,7 @@ class TestTemplateHalfWindow:
             channel_map=channel_map,
         )
 
-        old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        old_pos_peak = getattr(ks_mod, "POS_PEAK_THRESH", None)
-        ks_mod.KILOSORT_PARAMS = {"keep_good_only": False}
-        ks_mod.POS_PEAK_THRESH = 2.0
-
-        kse = KilosortSortingExtractor(folder)
-
-        return kse, ks_mod, old_params, old_pos_peak
-
-    def _restore(self, ks_mod, old_params, old_pos_peak):
-        if old_params is not None:
-            ks_mod.KILOSORT_PARAMS = old_params
-        if old_pos_peak is not None:
-            ks_mod.POS_PEAK_THRESH = old_pos_peak
+        return KilosortSortingExtractor(folder)
 
     def test_zero_amplitude_template_returns_zero(self, tmp_path):
         """
@@ -4028,16 +3767,11 @@ class TestTemplateHalfWindow:
               (no waveform to bound).
         """
         templates = np.zeros((1, 61, 2), dtype=np.float32)
-        kse, ks_mod, old_p, old_pp = self._make_kse_with_templates(
-            tmp_path, templates, "zero_amp"
-        )
-        try:
-            _, chans_ks, _ = kse.get_chans_max()
-            hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
-            assert len(hw_sizes) == 1
-            assert hw_sizes[0] == 0
-        finally:
-            self._restore(ks_mod, old_p, old_pp)
+        kse = self._make_kse_with_templates(tmp_path, templates, "zero_amp")
+        _, chans_ks, _ = kse.get_chans_max()
+        hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
+        assert len(hw_sizes) == 1
+        assert hw_sizes[0] == 0
 
     def test_single_sample_template(self, tmp_path):
         """
@@ -4049,16 +3783,11 @@ class TestTemplateHalfWindow:
         """
         # 1 template, 1 sample, 2 channels
         templates = np.array([[[5.0, 0.0]]], dtype=np.float32)
-        kse, ks_mod, old_p, old_pp = self._make_kse_with_templates(
-            tmp_path, templates, "single_sample"
-        )
-        try:
-            _, chans_ks, _ = kse.get_chans_max()
-            hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
-            assert len(hw_sizes) == 1
-            assert hw_sizes[0] == 0
-        finally:
-            self._restore(ks_mod, old_p, old_pp)
+        kse = self._make_kse_with_templates(tmp_path, templates, "single_sample")
+        _, chans_ks, _ = kse.get_chans_max()
+        hw_sizes = kse.get_templates_half_windows_sizes(chans_ks)
+        assert len(hw_sizes) == 1
+        assert hw_sizes[0] == 0
 
     def test_window_size_scale_zero(self, tmp_path):
         """
@@ -4069,18 +3798,11 @@ class TestTemplateHalfWindow:
         """
         templates = np.zeros((1, 61, 2), dtype=np.float32)
         templates[0, 30, 0] = -10.0
-        kse, ks_mod, old_p, old_pp = self._make_kse_with_templates(
-            tmp_path, templates, "scale_zero"
-        )
-        try:
-            _, chans_ks, _ = kse.get_chans_max()
-            hw_sizes = kse.get_templates_half_windows_sizes(
-                chans_ks, window_size_scale=0.0
-            )
-            assert len(hw_sizes) == 1
-            assert hw_sizes[0] == 0
-        finally:
-            self._restore(ks_mod, old_p, old_pp)
+        kse = self._make_kse_with_templates(tmp_path, templates, "scale_zero")
+        _, chans_ks, _ = kse.get_chans_max()
+        hw_sizes = kse.get_templates_half_windows_sizes(chans_ks, window_size_scale=0.0)
+        assert len(hw_sizes) == 1
+        assert hw_sizes[0] == 0
 
 
 # ===========================================================================
@@ -4097,24 +3819,6 @@ class TestKilosort4BackendDocker:
         (Test Case 1) get_docker_image raises RuntimeError → returned as object.
         (Test Case 2) run_sorter raises → exception returned as object.
     """
-
-    @pytest.fixture(autouse=True)
-    def _set_globals(self):
-        ks_mod = _GlobalsStub()  # _globals.py deleted in Phase 5; stub absorbs writes
-
-        self._ks_mod = ks_mod
-        self._old_docker = getattr(ks_mod, "USE_DOCKER", None)
-        self._old_recompute = getattr(ks_mod, "RECOMPUTE_SORTING", None)
-        self._old_params = getattr(ks_mod, "KILOSORT_PARAMS", None)
-        ks_mod.KILOSORT_PARAMS = {}
-        ks_mod.RECOMPUTE_SORTING = True
-        yield
-        if self._old_docker is not None:
-            ks_mod.USE_DOCKER = self._old_docker
-        if self._old_recompute is not None:
-            ks_mod.RECOMPUTE_SORTING = self._old_recompute
-        if self._old_params is not None:
-            ks_mod.KILOSORT_PARAMS = self._old_params
 
     @pytest.fixture()
     def ks4_backend(self):
@@ -4159,7 +3863,6 @@ class TestKilosort4BackendDocker:
         Tests:
             (Test Case 1) run_sorter raises ValueError → returned, not raised.
         """
-        self._ks_mod.USE_DOCKER = False
         output_folder = tmp_path / "ks4_sorter_fail"
         output_folder.mkdir()
 
@@ -10484,3 +10187,510 @@ class TestNumpySortingToKsExtractorDefaults:
         )
         assert captured_kse_init["keep_good_only"] is True
         assert captured_kse_init["pos_peak_thresh"] == 1.5
+
+
+# ===========================================================================
+# Branch refactor/remove-globals — remaining HIGH-priority gaps from
+# `iat/REVIEW.md` § "Edge Case Scan — Spike Sorting … Branch refactor/
+# remove-globals". Each class below pins one contract that the refactor
+# either added or shifted, where prior coverage either did not exist or
+# relied on the now-defunct `_GlobalsStub` fixture.
+# ===========================================================================
+
+
+@skip_no_spikeinterface
+class TestSpikeSortKs2ConfigNoneUsesDefaults:
+    """``ks2_runner.spike_sort(config=None)`` constructs a default
+    :class:`SortingPipelineConfig` and forwards bare
+    ``DEFAULT_KILOSORT2_PARAMS`` to ``RunKilosort``. Pre-refactor the
+    same merge happened via ``_globals.KILOSORT_PARAMS`` mutation in
+    ``_sync_globals``; post-refactor it's a fresh dict per call.
+    """
+
+    def test_config_none_forwards_default_kilosort2_params_to_runkilosort(
+        self, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``RunKilosort`` is constructed with
+                ``kilosort_params`` containing every key in
+                ``DEFAULT_KILOSORT2_PARAMS`` (defaults flow through
+                without a caller-supplied config).
+            (Test Case 2) ``DEFAULT_KILOSORT2_PARAMS`` is not mutated
+                across the call (canonical leak guard).
+        """
+        from spikelab.spike_sorting import ks2_runner
+        from spikelab.spike_sorting.backends.kilosort2 import (
+            DEFAULT_KILOSORT2_PARAMS,
+        )
+
+        captured = {}
+
+        class _StubRunKilosort:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run(self, **_kw):
+                return MagicMock(unit_ids=[])
+
+        monkeypatch.setattr(ks2_runner, "RunKilosort", _StubRunKilosort)
+        monkeypatch.setattr(ks2_runner, "write_recording", lambda *a, **kw: None)
+        monkeypatch.setattr(ks2_runner, "create_folder", lambda *a, **kw: None)
+
+        defaults_before = dict(DEFAULT_KILOSORT2_PARAMS)
+        ks2_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=Path("/tmp/out"),
+            config=None,
+        )
+
+        merged = captured["kilosort_params"]
+        for key, value in DEFAULT_KILOSORT2_PARAMS.items():
+            assert key in merged, f"missing default key {key!r} in merged dict"
+            assert merged[key] == value
+        # Source dict untouched.
+        assert DEFAULT_KILOSORT2_PARAMS == defaults_before
+
+
+@skip_no_spikeinterface
+class TestSpikeSortDockerNoKwargsUsesDefaults:
+    """``_spike_sort_docker(recording, output_folder)`` (no kwargs)
+    falls back to ``dict(DEFAULT_KILOSORT2_PARAMS)``. This pins the
+    contract directly, without the ``_GlobalsStub`` fixture used by
+    the existing ``TestSpikeSortDocker.test_spike_sort_docker_calls_run_sorter``
+    test (whose stub absorbs writes silently and so cannot prove the
+    fallback comes from the post-refactor defaults rather than from
+    leaked globals).
+    """
+
+    def test_no_kwargs_forwards_default_kilosort2_params_to_run_sorter(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``run_sorter`` receives every key from
+                ``DEFAULT_KILOSORT2_PARAMS`` as a kwarg (with
+                ``car`` left as the raw default value — the docker
+                path forwards ``kilosort_params`` directly without
+                ``format_params`` normalisation).
+            (Test Case 2) ``detect_threshold=6`` (the canonical
+                default) reaches the sorter.
+            (Test Case 3) ``DEFAULT_KILOSORT2_PARAMS`` is not mutated.
+        """
+        from spikelab.spike_sorting import ks2_runner
+        from spikelab.spike_sorting.backends.kilosort2 import (
+            DEFAULT_KILOSORT2_PARAMS,
+        )
+
+        output_folder = tmp_path / "ks_output"
+        output_folder.mkdir()
+        sorter_output = output_folder / "sorter_output"
+        # Write minimal phy output so the docker path can load results
+        # after the stubbed run_sorter call.
+        _write_ks_folder(
+            sorter_output,
+            spike_times=np.array([10, 20], dtype=np.int64),
+            spike_clusters=np.array([0, 0], dtype=np.int64),
+        )
+
+        captured = MagicMock(return_value=None)
+        defaults_before = dict(DEFAULT_KILOSORT2_PARAMS)
+
+        with (
+            patch.object(ks2_runner, "write_binary_recording"),
+            patch.object(ks2_runner, "BinaryRecordingExtractor"),
+            patch.object(ks2_runner, "run_sorter", captured),
+        ):
+            ks2_runner._spike_sort_docker(_make_mock_recording(), output_folder)
+
+        captured.assert_called_once()
+        _, call_kwargs = captured.call_args
+        # Every default key reached run_sorter as a kwarg.
+        for key, value in DEFAULT_KILOSORT2_PARAMS.items():
+            assert key in call_kwargs, f"missing {key!r} in run_sorter kwargs"
+            assert call_kwargs[key] == value
+        # detect_threshold default specifically.
+        assert call_kwargs["detect_threshold"] == 6
+        # Source dict untouched.
+        assert DEFAULT_KILOSORT2_PARAMS == defaults_before
+
+
+@skip_no_torch
+class TestRTSortSpikeSortParamsResolution:
+    """``rt_sort_runner.spike_sort`` resolves ``config.rt_sort.params``
+    into ``detect_sequences`` kwargs in three regimes: ``params=None``
+    (default), ``params={}`` (caller cleared overrides), and
+    ``params={"probe": ...}`` (caller's probe wins over ``rts.probe``).
+
+    These tests pin the exact ``ds_kwargs`` shape and the probe
+    precedence rule. Pre-refactor these flowed through
+    ``_globals.RT_SORT_*`` mutations; post-refactor they are sourced
+    from :class:`RTSortConfig` exclusively.
+    """
+
+    @pytest.fixture()
+    def captured(self, monkeypatch):
+        """Stub ``_load_detection_model``, ``detect_sequences``, and
+        ``_save_sorting_cache`` so ``spike_sort`` runs without real
+        RT-Sort/torch internals. Capture the probe passed to model
+        load and the full kwargs passed to ``detect_sequences``.
+        """
+        data = {"model_probe": None, "ds_kwargs": None}
+
+        class _FakeRTSort:
+            _seq_root_elecs = []
+
+            def sort_offline(self, **kw):
+                return object()
+
+        def _fake_load_model(*_a, **kw):
+            data["model_probe"] = kw.get("probe")
+            return object()
+
+        def _fake_detect_sequences(recording, inter_path, detection_model, **kw):
+            data["ds_kwargs"] = kw
+            return _FakeRTSort()
+
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._load_detection_model",
+            _fake_load_model,
+        )
+        import spikelab.spike_sorting.rt_sort as rt_sort_pkg
+
+        monkeypatch.setattr(
+            rt_sort_pkg, "detect_sequences", _fake_detect_sequences, raising=False
+        )
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._save_sorting_cache",
+            lambda *a, **k: None,
+        )
+        return data
+
+    def _run(self, params, tmp_path, probe="mea"):
+        from spikelab.spike_sorting import rt_sort_runner as runner
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            RTSortConfig,
+            SortingPipelineConfig,
+        )
+
+        config = SortingPipelineConfig(
+            execution=ExecutionConfig(recompute_sorting=True),
+            rt_sort=RTSortConfig(
+                probe=probe,
+                params=params,
+                recording_window_ms=(0.0, 120_000.0),
+                detection_window_s=None,
+                device="cpu",
+                num_processes=1,
+                delete_inter=False,
+                verbose=False,
+                save_rt_sort_pickle=False,
+            ),
+        )
+        runner.spike_sort(
+            rec_cache=object(),
+            rec_path=tmp_path / "fake.h5",
+            recording_dat_path=None,
+            output_folder=tmp_path / "out",
+            config=config,
+        )
+        return config
+
+    def test_params_none_yields_no_overrides(self, captured, tmp_path):
+        """
+        ``config.rt_sort.params is None`` produces a ``detect_sequences``
+        call with only the resolved-from-config kwargs — no user
+        overrides — and the probe falls back to ``rts.probe``.
+
+        Tests:
+            (Test Case 1) ``_load_detection_model`` receives the
+                ``rts.probe`` value (``"mea"``).
+            (Test Case 2) ``detect_sequences`` kwargs contain
+                ``recording_window_ms``, ``device``, ``num_processes``,
+                ``delete_inter``, ``verbose`` — and no ``probe`` key
+                (probe is consumed at model load).
+        """
+        self._run(params=None, tmp_path=tmp_path)
+        assert captured["model_probe"] == "mea"
+        kw = captured["ds_kwargs"]
+        assert "probe" not in kw
+        assert kw["device"] == "cpu"
+        assert kw["num_processes"] == 1
+        assert kw["delete_inter"] is False
+        assert kw["verbose"] is False
+        assert kw["recording_window_ms"] == (0.0, 120_000.0)
+
+    def test_params_empty_dict_equivalent_to_none(self, captured, tmp_path):
+        """
+        ``config.rt_sort.params == {}`` (empty dict) takes the same
+        code path as ``None`` — ``if rts.params:`` is False for both.
+
+        Tests:
+            (Test Case 1) Empty-dict run produces the same ``ds_kwargs``
+                as the ``None`` run, including no ``probe`` key.
+            (Test Case 2) ``_load_detection_model`` receives
+                ``rts.probe`` in both cases.
+        """
+        self._run(params={}, tmp_path=tmp_path)
+        kw_empty = dict(captured["ds_kwargs"])
+        probe_empty = captured["model_probe"]
+
+        # Reset captured state and run with None for direct comparison.
+        captured["ds_kwargs"] = None
+        captured["model_probe"] = None
+        self._run(params=None, tmp_path=tmp_path)
+        kw_none = dict(captured["ds_kwargs"])
+
+        assert kw_empty == kw_none
+        assert probe_empty == "mea"
+
+    def test_params_probe_overrides_rts_probe(self, captured, tmp_path):
+        """
+        ``config.rt_sort.params={"probe": "neuropixels"}`` overrides
+        ``rts.probe`` for the model-load lookup. The override does
+        NOT mutate ``rts.probe`` on the config — that field stays
+        at its original value (``"mea"``). The probe is popped from
+        ``detect_sequences`` kwargs (consumed at model load).
+
+        Tests:
+            (Test Case 1) ``_load_detection_model`` receives the
+                params-override probe (``"neuropixels"``).
+            (Test Case 2) ``config.rt_sort.probe`` is unchanged
+                after the call (the override path does not mutate
+                the caller's config).
+            (Test Case 3) ``detect_sequences`` kwargs do not include
+                a ``probe`` key.
+        """
+        config = self._run(
+            params={"probe": "neuropixels"}, tmp_path=tmp_path, probe="mea"
+        )
+        assert captured["model_probe"] == "neuropixels"
+        # Config field unchanged.
+        assert config.rt_sort.probe == "mea"
+        # Probe consumed at model load, not forwarded to detect_sequences.
+        assert "probe" not in captured["ds_kwargs"]
+
+
+@skip_no_spikeinterface
+class TestBackendInitDoesNotRaiseOnFreshConfig:
+    """Backend constructors no longer raise on a bare
+    :class:`SortingPipelineConfig` even when ``sorter_path`` is unset.
+
+    Pre-refactor the constructor called ``_sync_globals`` which set
+    ``KILOSORT_PATH=None`` etc. — harmless. Post-refactor the
+    constructor just stores the config and validation is deferred
+    to ``RunKilosort.set_kilosort_path`` at sort time. These tests
+    pin the post-refactor error-point shift.
+    """
+
+    def test_kilosort2_backend_init_does_not_raise(self):
+        """
+        Tests:
+            (Test Case 1) ``Kilosort2Backend(SortingPipelineConfig())``
+                returns a backend without raising.
+            (Test Case 2) ``backend.config`` is the supplied config
+                instance.
+        """
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        cfg = SortingPipelineConfig()
+        backend = Kilosort2Backend(cfg)
+        assert backend.config is cfg
+
+    def test_kilosort4_backend_init_does_not_raise(self):
+        """
+        Tests:
+            (Test Case 1) ``Kilosort4Backend(SortingPipelineConfig())``
+                returns a backend without raising.
+        """
+        from spikelab.spike_sorting.backends.kilosort4 import Kilosort4Backend
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        cfg = SortingPipelineConfig()
+        backend = Kilosort4Backend(cfg)
+        assert backend.config is cfg
+
+    def test_kilosort_path_error_fires_at_runkilosort_init_not_backend_init(
+        self,
+    ):
+        """
+        The Kilosort-path validation has shifted from backend
+        ``__init__`` (pre-refactor, via ``_sync_globals``) to
+        ``RunKilosort.__init__`` at sort time. This pins the new
+        error site (``set_kilosort_path``) and exception type
+        (``ValueError`` when the env var is unset).
+
+        Tests:
+            (Test Case 1) Backend init with no ``sorter_path`` is
+                silent.
+            (Test Case 2) Calling ``RunKilosort(kilosort_path=None)``
+                with no ``KILOSORT_PATH`` env var raises ``ValueError``
+                from ``set_kilosort_path``.
+        """
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+        from spikelab.spike_sorting.ks2_runner import RunKilosort
+
+        # Backend init: silent.
+        Kilosort2Backend(SortingPipelineConfig())
+
+        # Runner init at sort time: validates the path eagerly and
+        # raises when neither ``kilosort_path`` nor the
+        # ``KILOSORT_PATH`` env var resolves to a real install.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KILOSORT_PATH", None)
+            with pytest.raises(ValueError, match="KILOSORT_PATH"):
+                RunKilosort(kilosort_path=None)
+
+
+@skip_no_spikeinterface
+class TestKilosort2ScaleOomParamsNoneSorterParams:
+    """``Kilosort2Backend.scale_oom_params`` with ``sorter_params=None``
+    falls back to ``ntbuff=64`` (default) when computing the scaled
+    ``NT``. This pins the canonical default and detects drift if a
+    future change moves the fallback to a different value.
+    """
+
+    def test_scale_with_none_sorter_params_falls_back_to_ntbuff_64(self):
+        """
+        Tests:
+            (Test Case 1) Backend with ``sorter_params=None`` and
+                ``scale_oom_params(0.5)`` resolves ``NT`` from the
+                ``ntbuff=64`` default, then halves it via the
+                standard rounding (``NT = (64*1024 + 64) // 2 // 32 * 32``).
+            (Test Case 2) The resolved ``NT`` is a positive multiple
+                of 32 (the Kilosort2 batch alignment).
+        """
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        backend = Kilosort2Backend(SortingPipelineConfig())
+        assert backend.config.sorter.sorter_params is None
+
+        ok = backend.scale_oom_params(0.5)
+        # Scale must succeed (the fallback path is the success path).
+        assert ok is True
+
+        nt = backend.config.sorter.sorter_params["NT"]
+        # Expected: starting from NT = 64*1024 + ntbuff=64 = 65600,
+        # halved to 32800, rounded down to a multiple of 32 = 32800.
+        full_nt = 64 * 1024 + 64
+        expected_nt = (full_nt // 2) // 32 * 32
+        assert nt == expected_nt
+        assert nt > 0 and nt % 32 == 0
+
+
+@skip_no_spikeinterface
+class TestRunCanaryFolderCleanupGaps:
+    """``run_canary`` has a small window between ``canary_root.mkdir``
+    and the inner ``try:`` where an exception can leak the canary
+    folder. These tests pin the actual behaviour at the two
+    candidate failure points so a future regression is caught.
+
+    Note: the pre-refactor outer ``try/finally`` wrapper that
+    snapshot/restored ``_globals`` did not cover this case either —
+    the snapshot was for globals, not the canary folder.
+    """
+
+    def test_build_canary_config_raise_does_not_create_canary_folder(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        ``_build_canary_config`` runs *before* ``canary_root.mkdir``,
+        so a raise there leaves no folder to clean up. This documents
+        the actual behaviour: no leak when the build step fails.
+
+        Tests:
+            (Test Case 1) Patching ``_build_canary_config`` to raise
+                propagates the exception to the caller.
+            (Test Case 2) No ``_canary_<pid>`` folder is created
+                under ``inter_path``.
+        """
+        from spikelab.spike_sorting import canary as canary_mod
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            SortingPipelineConfig,
+        )
+
+        cfg = SortingPipelineConfig(
+            execution=ExecutionConfig(canary_first_n_s=5.0),
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("config clone failed")
+
+        monkeypatch.setattr(canary_mod, "_build_canary_config", _boom)
+
+        with pytest.raises(RuntimeError, match="config clone failed"):
+            canary_mod.run_canary(
+                cfg,
+                recording=None,
+                rec_path="rec.h5",
+                inter_path=tmp_path,
+                sorter_name="kilosort2",
+            )
+
+        # No canary folder was created — nothing to clean up.
+        canary_dirs = list(tmp_path.glob("_canary_*"))
+        assert canary_dirs == []
+
+    def test_unknown_sorter_inside_inner_try_cleans_up_folder(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Failure inside the inner ``try:`` block (e.g. an unknown
+        sorter name → ``EnvironmentSortFailure``) is caught by the
+        canary's classified-failure branch which calls
+        ``_wipe_canary_folder(canary_root)`` before returning.
+
+        This pins the cleanup-on-inner-failure path. Combined with
+        the previous test (failure before mkdir → no folder), the
+        remaining narrow gap is only between ``canary_root.mkdir``
+        and the inner ``try:`` (lines 230–242 in ``canary.py``) —
+        which only does Path arithmetic, attribute access via
+        ``getattr(..., default)``, and a logger call, none of which
+        realistically raise.
+
+        Tests:
+            (Test Case 1) Unknown sorter raises
+                ``EnvironmentSortFailure`` via the inner try.
+            (Test Case 2) The canary folder is wiped before
+                propagation (per the ``except _CLASSIFIED_FAILURES``
+                branch).
+        """
+        from spikelab.spike_sorting import canary as canary_mod
+        from spikelab.spike_sorting import backends as backends_mod
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            SortingPipelineConfig,
+        )
+
+        cfg = SortingPipelineConfig(
+            execution=ExecutionConfig(canary_first_n_s=5.0),
+        )
+
+        # Make the sorter-name lookup fail inside the inner try.
+        monkeypatch.setattr(backends_mod, "list_sorters", lambda: ["kilosort2"])
+
+        # An unknown sorter name triggers EnvironmentSortFailure inside
+        # the inner try — which is a classified failure, so run_canary
+        # returns it (not raises) and cleans up.
+        result = canary_mod.run_canary(
+            cfg,
+            recording=None,
+            rec_path="rec.h5",
+            inter_path=tmp_path,
+            sorter_name="unknown_sorter",
+        )
+
+        from spikelab.spike_sorting._exceptions import EnvironmentSortFailure
+
+        assert isinstance(result, EnvironmentSortFailure)
+        assert "unknown_sorter" in str(result)
+        # Cleanup runs.
+        canary_dirs = list(tmp_path.glob("_canary_*"))
+        assert canary_dirs == []

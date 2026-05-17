@@ -15,6 +15,7 @@ import os
 import pickle
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import shutil
@@ -988,6 +989,14 @@ def _process_recording_body(
                 )
                 return err
             print(f"Recording failed in post-sort pipeline: {e!r}")
+            # Print the full traceback so the originating call site is
+            # diagnosable from the batch log. The previous handler only
+            # printed ``repr(e)`` — for a deeply-nested failure (typical
+            # for waveform extraction / curation errors) that leaves the
+            # operator with no way to find which call raised. The
+            # behaviour (return the error rather than re-raising so the
+            # batch loop continues) is preserved.
+            print(traceback.format_exc())
             print("Moving on to next recording")
             return e
 
@@ -2507,22 +2516,35 @@ def _atomic_write_pickle(
     tmp = final.with_suffix(final.suffix + ".tmp")
     final.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(tmp, "wb") as f:
-        if protocol is None:
-            _pkl.dump(obj, f)
-        else:
-            _pkl.dump(obj, f, protocol=protocol)
-        f.flush()
+    try:
+        with open(tmp, "wb") as f:
+            if protocol is None:
+                _pkl.dump(obj, f)
+            else:
+                _pkl.dump(obj, f, protocol=protocol)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                # fsync can fail on certain Windows file systems and
+                # raises AttributeError on some non-OS file objects
+                # (e.g. test-time wrappers). The replace below is still
+                # atomic; we just skip the durability hint.
+                pass
+        os.replace(tmp, final)
+    except BaseException:
+        # Remove the partial .tmp file on any failure (pickling errors
+        # from non-picklable objects, OSError on disk-full, KeyboardInterrupt
+        # from the inactivity watchdog mid-write, etc.) so it doesn't
+        # accumulate in the results folder. Use BaseException because we
+        # explicitly want to catch SystemExit and KeyboardInterrupt for
+        # cleanup, then re-raise. ``missing_ok=True`` covers the case
+        # where the open itself failed before the tmp file was created.
         try:
-            os.fsync(f.fileno())
-        except (OSError, AttributeError):
-            # fsync can fail on certain Windows file systems and
-            # raises AttributeError on some non-OS file objects
-            # (e.g. test-time wrappers). The replace below is still
-            # atomic; we just skip the durability hint.
+            tmp.unlink(missing_ok=True)
+        except OSError:
             pass
-
-    os.replace(tmp, final)
+        raise
 
 
 def sort_multistream(recording, stream_ids, config=None, sorter="kilosort2", **kwargs):

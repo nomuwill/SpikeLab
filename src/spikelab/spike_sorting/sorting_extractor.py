@@ -120,7 +120,14 @@ class KilosortSortingExtractor:
         if end_frame is not None:
             spike_times = spike_times[spike_times < end_frame]
 
-        return np.atleast_1d(spike_times.copy().squeeze())
+        # ``ravel`` always returns a 1-D view regardless of input shape.
+        # The previous ``np.atleast_1d(spike_times.copy().squeeze())``
+        # idiom worked for the current 1-D ``spike_times`` storage but
+        # was fragile: if ``self.spike_times`` ever became 2-D with
+        # one column, ``squeeze`` would collapse it to 1-D but a
+        # multi-column 2-D shape would be returned as-is and break
+        # callers expecting 1-D. ``ravel`` is robust to either case.
+        return np.asarray(spike_times.copy()).ravel()
 
     def get_templates_all(self):
         # Returns Kilosort2's outputted templates as mmap np.array

@@ -82,6 +82,21 @@ class KilosortSortingExtractor:
             cluster_info["cluster_id"] = cluster_info["id"]
             del cluster_info["id"]
 
+        # Coerce cluster_id to int explicitly. ``pd.read_csv`` infers
+        # dtypes per column, so a TSV that writes IDs as ``1.0`` (float
+        # literal) or ``"001"`` (string-padded) ends up as float or
+        # object dtype — the ``int(unit_id)`` casts later break with
+        # confusing errors. Coerce up-front and surface the actual
+        # offending value cleanly when coercion fails.
+        try:
+            cluster_info["cluster_id"] = cluster_info["cluster_id"].astype(int)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"cluster_id column has non-integer values "
+                f"(dtype={cluster_info['cluster_id'].dtype}): {exc}. "
+                "Expected integer cluster IDs from Phy/kilosort output."
+            ) from exc
+
         if exclude_cluster_groups is not None:
             if isinstance(exclude_cluster_groups, str):
                 cluster_info = cluster_info.query(

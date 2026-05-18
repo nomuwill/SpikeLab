@@ -2762,9 +2762,23 @@ async def pcm_stack_threshold(
     namespace: str,
     key: str,
     threshold: float,
-    out_key: str = "",
+    out_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Apply a binary threshold to a PairwiseCompMatrixStack and store to workspace."""
+    """Apply a binary threshold to a PairwiseCompMatrixStack and store to workspace.
+
+    By default (``out_key=None`` or omitted) the binary {0, 1}
+    thresholded stack **overwrites** the original float-valued stack
+    at ``(namespace, key)``. The original float values are
+    unrecoverable from the workspace after this call — any subsequent
+    analysis that expects the source stack to be float-valued will
+    silently fail or produce wrong results. Pass an explicit
+    ``out_key`` to write the result to a separate slot and keep the
+    source intact.
+
+    The empty string ``""`` is also accepted in place of ``None`` for
+    backwards compatibility with callers using the previous default,
+    and is treated identically (use input ``key``).
+    """
     ws = _get_workspace(workspace_id)
     stack = _get_pcm_stack(ws, namespace, key)
     new_stack = stack.threshold(threshold)

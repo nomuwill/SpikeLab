@@ -3567,7 +3567,11 @@ async def _list_tools() -> list[types.Tool]:
                 name="pcm_stack_threshold",
                 description=(
                     "Apply a binary threshold to a PairwiseCompMatrixStack. "
-                    "Values become 1 where |v| > threshold, else 0."
+                    "Values become 1 where |v| > threshold, else 0. By "
+                    "default (no out_key) the binary result OVERWRITES the "
+                    "original float-valued stack at (namespace, key); the "
+                    "original float values are unrecoverable. Pass an "
+                    "explicit out_key to preserve the source."
                 ),
                 inputSchema={
                     "type": "object",
@@ -3583,7 +3587,13 @@ async def _list_tools() -> list[types.Tool]:
                         },
                         "out_key": {
                             "type": "string",
-                            "description": "Output key. Defaults to input key.",
+                            "description": (
+                                "Output key. Default (omitted or null) "
+                                "OVERWRITES the source stack with the "
+                                "binary thresholded result, destroying "
+                                "the float values. Pass an explicit value "
+                                "to preserve the source."
+                            ),
                         },
                     },
                     "required": ["workspace_id", "namespace", "key", "threshold"],

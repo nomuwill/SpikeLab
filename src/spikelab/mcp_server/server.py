@@ -1234,8 +1234,10 @@ async def _list_tools() -> list[types.Tool]:
                 name="concatenate_units",
                 description=(
                     "Add all units from a second SpikeData into the first (both must "
-                    "have the same length). Modifies and re-stores (namespace_a, 'spikedata') "
-                    "in place."
+                    "have the same length). By default re-stores the combined result "
+                    "at (namespace_a, 'spikedata'), overwriting that slot. Pass "
+                    "``out_namespace`` to write the result to a separate namespace "
+                    "and preserve both inputs."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1243,11 +1245,24 @@ async def _list_tools() -> list[types.Tool]:
                         "workspace_id": {"type": "string"},
                         "namespace_a": {
                             "type": "string",
-                            "description": "Namespace to add units into (modified in place)",
+                            "description": (
+                                "Namespace of the first SpikeData. The combined "
+                                "result inherits its time range, raw_data, and "
+                                "(on metadata-key conflicts) metadata."
+                            ),
                         },
                         "namespace_b": {
                             "type": "string",
                             "description": "Namespace whose units are added",
+                        },
+                        "out_namespace": {
+                            "type": "string",
+                            "description": (
+                                "Namespace to write the combined SpikeData into. "
+                                "Default (omitted or null) overwrites namespace_a, "
+                                "matching legacy behaviour. Pass an explicit value "
+                                "to preserve both inputs."
+                            ),
                         },
                     },
                     "required": ["workspace_id", "namespace_a", "namespace_b"],

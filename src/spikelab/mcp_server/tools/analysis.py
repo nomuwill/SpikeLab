@@ -746,18 +746,36 @@ async def concatenate_units(
     workspace_id: str,
     namespace_a: str,
     namespace_b: str,
+    out_namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Concatenate units from two SpikeData objects and store to workspace."""
+    """Concatenate units from two SpikeData objects and store to workspace.
+
+    By default (``out_namespace=None``) the combined SpikeData overwrites
+    the SpikeData slot at ``namespace_a`` — historical behaviour, kept
+    for backwards compatibility. Pass an explicit ``out_namespace`` to
+    write the result to a separate slot, preserving both inputs. This
+    matches the explicit-destination pattern used by other MCP tools
+    in this file (``compute_pairwise_fr_corr``, ``curate_spikedata``,
+    etc.).
+
+    The combined SpikeData inherits ``namespace_a``'s time range,
+    ``raw_data`` / ``raw_time``, and (on metadata key conflicts)
+    metadata — so the choice of ``namespace_a`` vs ``namespace_b``
+    is structurally significant, not just a destination selector.
+    Swapping the two arguments produces a different combined
+    SpikeData (units in reversed order, different inherited fields).
+    """
     ws = _get_workspace(workspace_id)
     sd_a = _get_spikedata(ws, namespace_a)
     sd_b = _get_spikedata(ws, namespace_b)
     sd_combined = sd_a.concatenate_spike_data(sd_b)
-    ws.store(namespace_a, _SPIKEDATA_KEY, sd_combined)
+    target = out_namespace if out_namespace is not None else namespace_a
+    ws.store(target, _SPIKEDATA_KEY, sd_combined)
     return {
         "workspace_id": workspace_id,
-        "namespace": namespace_a,
+        "namespace": target,
         "workspace_key": _SPIKEDATA_KEY,
-        "info": ws.get_info(namespace_a, _SPIKEDATA_KEY),
+        "info": ws.get_info(target, _SPIKEDATA_KEY),
     }
 
 

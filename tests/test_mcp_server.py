@@ -7753,3 +7753,70 @@ class TestMcpJsonNanSanitiser:
         payload = json.loads(out[0].text)
         assert payload["metric"] is None
         assert payload["ok"] == 1.0
+
+
+class TestListNeuronsNumpyArrayAttr:
+    """``list_neurons`` returns ``neuron_attributes`` verbatim — including
+    numpy arrays (e.g. ``template``, ``amplitudes``) populated by the
+    SpikeLab npz loader. The MCP dispatcher's ``_sanitize_for_json`` only
+    handles non-finite floats; numpy arrays are *not* converted to lists,
+    so the boundary ``json.dumps`` call raises ``TypeError``. Pin both
+    halves of the contract so a future numpy-aware encoder surfaces here.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_numpy_array_attribute_returned_raw(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``list_neurons`` returns the numpy array
+                value unchanged (not converted to a list).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_with_np = SpikeData(
+            [np.array([1.0, 5.0])],
+            length=10.0,
+            neuron_attributes=[
+                {"unit_id": 0, "template": np.array([1.0, 2.0, 3.0])},
+            ],
+        )
+        ws.store("np_ns", "spikedata", sd_with_np)
+
+        result = await analysis.list_neurons(ws_id, "np_ns")
+
+        assert len(result["neurons"]) == 1
+        tpl = result["neurons"][0]["template"]
+        assert isinstance(tpl, np.ndarray)
+        assert tpl.tolist() == [1.0, 2.0, 3.0]
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_json_dumps_via_dispatcher_raises_type_error(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) Routing the result through the MCP dispatcher
+                (which sanitises NaN/Inf but not numpy arrays) raises
+                ``TypeError`` at the ``json.dumps`` boundary, mentioning
+                ``ndarray``.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_with_np = SpikeData(
+            [np.array([1.0, 5.0])],
+            length=10.0,
+            neuron_attributes=[
+                {"unit_id": 0, "template": np.array([1.0, 2.0, 3.0])},
+            ],
+        )
+        ws.store("np_ns2", "spikedata", sd_with_np)
+
+        from spikelab.mcp_server import server as srv
+
+        with pytest.raises(TypeError, match=r"ndarray"):
+            await srv._call_tool(
+                "list_neurons",
+                {"workspace_id": ws_id, "namespace": "np_ns2"},
+            )

@@ -5423,3 +5423,67 @@ class TestLoadSpikedataFromKilosortClusterIdExceedsChannelMapWarning:
         # length.
         assert "100" in joined
         assert "channel_map" in joined.lower()
+
+
+class TestLoadKilosortInvalidTimeUnit:
+    """``load_spikedata_from_kilosort`` with an unrecognised ``time_unit``
+    propagates the ``ValueError`` raised by the shared ``to_ms`` helper.
+    The error message names the offending unit so the user can attribute
+    the failure to the loader argument rather than guessing where it came
+    from in the call chain.
+    """
+
+    def test_unknown_time_unit_raises_value_error_naming_unit(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``time_unit='hz'`` raises ``ValueError``.
+            (Test Case 2) The message mentions the offending unit name
+                ``'hz'`` so the failure is attributable.
+        """
+        d = str(tmp_path / "ks")
+        os.makedirs(d)
+        np.save(os.path.join(d, "spike_times.npy"), np.array([10, 20, 30]))
+        np.save(os.path.join(d, "spike_clusters.npy"), np.array([0, 0, 0]))
+
+        with pytest.raises(ValueError, match=r"hz"):
+            loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0, time_unit="hz")
+
+
+@skip_no_h5py
+class TestRawArraysShapeMismatch:
+    """``_read_raw_arrays`` does NOT validate that ``raw_data.shape[-1]``
+    matches ``raw_time.shape[0]``. A mismatched HDF5 file returns both
+    arrays at their stored sizes with no warning and no error, leaving
+    the caller to detect the inconsistency. Pinning this so any future
+    addition of a shape-mismatch guard surfaces as a test failure.
+    """
+
+    def test_mismatched_shapes_returned_silently(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``_read_raw_arrays`` returns the raw_data and
+                raw_time arrays at their stored shapes, even though
+                ``raw_data.shape[-1] != raw_time.shape[0]``.
+            (Test Case 2) No warning is emitted.
+            (Test Case 3) No exception is raised.
+        """
+        path = str(tmp_path / "mismatch.h5")
+        raw_data = np.random.randn(3, 100)
+        raw_time = np.arange(50, dtype=float)  # length 50 != 100
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.create_dataset("raw", data=raw_data)
+            f.create_dataset("raw_time", data=raw_time)
+
+        with h5py.File(path, "r") as f:  # type: ignore
+            with warnings.catch_warnings(record=True) as recwarn:
+                warnings.simplefilter("always")
+                rd, rt = loaders._read_raw_arrays(
+                    f, "raw", "raw_time", "ms", None
+                )
+
+        # Both arrays come back at their stored sizes — no validation.
+        assert rd is not None and rt is not None
+        assert rd.shape == (3, 100)
+        assert rt.shape == (50,)
+        # Loader does not warn about the shape mismatch.
+        assert len(recwarn) == 0

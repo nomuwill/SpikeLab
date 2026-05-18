@@ -516,6 +516,7 @@ def load_spikedata_from_nwb(
     *,
     prefer_pynwb: bool = True,
     length_ms: Optional[float] = None,
+    start_time_ms: Optional[float] = None,
 ) -> SpikeData:
     """Load spike trains from an NWB file's Units table.
 
@@ -523,6 +524,15 @@ def load_spikedata_from_nwb(
         filepath (str): Path to the NWB file.
         prefer_pynwb (bool): If True, try pynwb first; if False, try h5py.
         length_ms (float | None): Recording duration in milliseconds.
+            When ``None``, reads from the file-level ``length_ms``
+            attribute (written by ``export_spikedata_to_nwb``); falls
+            back to inferring from the latest spike time if the
+            attribute is absent.
+        start_time_ms (float | None): Recording start time in
+            milliseconds. When ``None``, reads from the file-level
+            ``start_time`` attribute (written by
+            ``export_spikedata_to_nwb``); falls back to 0.0 if the
+            attribute is absent. Mirrors the ``length_ms`` ladder.
 
     Returns:
         sd (SpikeData): The loaded spike train data.
@@ -530,6 +540,30 @@ def load_spikedata_from_nwb(
     trains: List[np.ndarray] = []
     neuron_attributes: List[dict] = []
     meta = {"source_file": os.path.abspath(filepath), "format": "NWB"}
+
+    # Read file-level attributes via h5py up-front so both the pynwb
+    # and h5py paths benefit. Caller overrides take precedence; missing
+    # attrs fall back to None/0 (the SpikeData defaults).
+    file_length_ms: Optional[float] = None
+    file_start_time_ms: float = 0.0
+    if length_ms is None or start_time_ms is None:
+        try:
+            import h5py as _h5  # type: ignore
+
+            with _h5.File(filepath, "r") as _attrs_f:
+                if "length_ms" in _attrs_f.attrs:
+                    file_length_ms = float(_attrs_f.attrs["length_ms"])
+                if "start_time" in _attrs_f.attrs:
+                    file_start_time_ms = float(_attrs_f.attrs["start_time"])
+        except Exception:
+            # Attribute read is best-effort; if h5py can't open the file
+            # (corrupt, unsupported plugin, etc.) the loader proper will
+            # raise the real error below.
+            pass
+    if length_ms is None:
+        length_ms = file_length_ms
+    if start_time_ms is None:
+        start_time_ms = file_start_time_ms
 
     if prefer_pynwb:
         try:
@@ -585,6 +619,7 @@ def load_spikedata_from_nwb(
             return _build_spikedata(
                 trains,
                 length_ms=length_ms,
+                start_time=start_time_ms or 0.0,
                 metadata=meta,
                 neuron_attributes=neuron_attributes,
             )
@@ -732,7 +767,11 @@ def load_spikedata_from_nwb(
             neuron_attributes.append(attr)
 
     return _build_spikedata(
-        trains, length_ms=length_ms, metadata=meta, neuron_attributes=neuron_attributes
+        trains,
+        length_ms=length_ms,
+        start_time=start_time_ms or 0.0,
+        metadata=meta,
+        neuron_attributes=neuron_attributes,
     )
 
 

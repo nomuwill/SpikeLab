@@ -7896,3 +7896,255 @@ class TestListNeuronsNumpyArrayAttr:
                 "list_neurons",
                 {"workspace_id": ws_id, "namespace": "np_ns2"},
             )
+
+
+class TestComputeResampledIsiSigmaMsZero:
+    """Pin the ``sigma_ms=0.0`` boundary contract for ``compute_resampled_isi``.
+
+    Adjacent tests in ``TestComputeResampledISI`` cover the negative-sigma
+    boundary (which may raise depending on scipy version) and empty/single
+    times paths. This pins the ``sigma_ms=0.0`` boundary — exactly zero
+    smoothing — which delegates through ``SpikeData.resampled_isi`` to
+    ``_resampled_isi`` and ultimately to ``scipy.ndimage.gaussian_filter1d``
+    with ``sigma=0`` (which is a documented no-op).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_sigma_ms_zero_succeeds(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``compute_resampled_isi(sigma_ms=0.0)`` returns a
+                successful result dict (no exception).
+            (Test Case 2) ``result["sigma_ms"] == 0.0`` is echoed back.
+            (Test Case 3) Stored ``RateData`` has the expected ``(U, T)``
+                shape with U=3 (units) and T=5 (resample times).
+            (Test Case 4) ``result["n_timepoints"] == 5``.
+        """
+        ws_id, ns = loaded_ws
+        # Use a uniformly-spaced grid; non-uniform times are now
+        # rejected by ``_resampled_isi`` (see test_utils.py's
+        # ``test_non_uniform_time_grid``).
+        result = await analysis.compute_resampled_isi(
+            ws_id,
+            ns,
+            "rates_sigma0",
+            times=[10.0, 20.0, 30.0, 40.0, 50.0],
+            sigma_ms=0.0,
+        )
+        assert result["sigma_ms"] == 0.0
+        assert result["n_timepoints"] == 5
+        assert result["key"] == "rates_sigma0"
+        ws = get_workspace_manager().get_workspace(ws_id)
+        rd = ws.get(ns, "rates_sigma0")
+        assert rd.inst_Frate_data.shape == (3, 5)
+
+
+class TestAlignToEventsKeyNotInMetadata:
+    """Pin the error contract when ``events`` is a string key that is not
+    present in ``SpikeData.metadata``. Source:
+    ``SpikeData.align_to_events`` raises ``KeyError`` with a message that
+    starts with ``"Metadata key {key!r} not found"`` and includes the list
+    of available keys. The MCP wrapper does not catch this, so the
+    KeyError propagates to the caller.
+
+    The ``loaded_ws`` fixture's SpikeData has ``metadata={"test": "data"}``
+    — so ``events="missing_key"`` exercises the "key not in dict" branch
+    (rather than the "metadata is None" branch).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_missing_metadata_key_raises_key_error(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``align_to_events(events="missing_key")`` raises
+                ``KeyError``.
+            (Test Case 2) The error message mentions ``"missing_key"``.
+            (Test Case 3) The error message mentions ``"Metadata key"``.
+            (Test Case 4) The error message lists the available keys
+                (here: ``test``).
+        """
+        ws_id, ns = loaded_ws
+        with pytest.raises(KeyError) as exc_info:
+            await analysis.align_to_events(
+                ws_id,
+                ns,
+                key="aligned",
+                events="missing_key",
+                pre_ms=5.0,
+                post_ms=5.0,
+            )
+        msg = str(exc_info.value)
+        assert "missing_key" in msg
+        assert "Metadata key" in msg
+        assert "test" in msg  # available keys list contains the existing key
+
+
+class TestExtractLowerTriangleFeaturesAdditionalShapes:
+    """Pin the shape-rejection branches of ``extract_lower_triangle_features``.
+
+    Source: the MCP wrapper accepts either a ``PairwiseCompMatrixStack`` or
+    a 3-D ``(N, N, S)`` ndarray with ``shape[0] == shape[1]``. Anything
+    else falls through to a ``ValueError("Expected PairwiseCompMatrixStack
+    or (N, N, S) ndarray ...")`` with the offending ``type(obj).__name__``
+    embedded in the message.
+
+    This test pins two of the rejection cases that the existing
+    ``TestExtractLowerTriangleFeatures.test_2x2_stack`` happy-path does
+    not exercise:
+
+    * A bare 2-D ``(N, N)`` ndarray (``ndim != 3``).
+    * A 3-D ndarray whose first two dims aren't equal — e.g.
+      ``(S, N, N)`` shaped data where the stack dim isn't last
+      (``shape[0] != shape[1]``).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_2d_ndarray_rejected(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) A bare 2-D ``(3, 3)`` ndarray at the workspace
+                slot raises ``ValueError``.
+            (Test Case 2) The error message mentions the expected type
+                ``"PairwiseCompMatrixStack or (N, N, S)"``.
+            (Test Case 3) The error message names ``ndarray`` (the
+                ``type(obj).__name__``).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store(ns, "mat_2d", np.eye(3))  # (3, 3) — ndim==2
+        with pytest.raises(ValueError) as exc_info:
+            await analysis.extract_lower_triangle_features(
+                ws_id, ns, key="mat_2d", out_key="feat_2d"
+            )
+        msg = str(exc_info.value)
+        assert "PairwiseCompMatrixStack or (N, N, S)" in msg
+        assert "ndarray" in msg
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_3d_non_square_first_two_dims_rejected(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) A 3-D ndarray with shape ``(4, 3, 3)`` — i.e.
+                the stack dim is first, not last, so
+                ``shape[0] != shape[1]`` — raises ``ValueError``.
+            (Test Case 2) The error message identifies the type
+                mismatch (``"Expected PairwiseCompMatrixStack or (N, N, S)"``).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        # (S, N, N) layout with S=4, N=3 — shape[0]=4, shape[1]=3 != 4.
+        ws.store(ns, "stack_snn", np.zeros((4, 3, 3)))
+        with pytest.raises(ValueError) as exc_info:
+            await analysis.extract_lower_triangle_features(
+                ws_id, ns, key="stack_snn", out_key="feat_snn"
+            )
+        msg = str(exc_info.value)
+        assert "Expected PairwiseCompMatrixStack or (N, N, S)" in msg
+
+
+class TestPcmStackThresholdNaN:
+    """Pin the ``threshold=NaN`` boundary contract for ``pcm_stack_threshold``.
+
+    Source: ``PairwiseCompMatrixStack.threshold`` returns
+    ``(np.abs(self.stack) > threshold).astype(float)``. Because
+    ``abs(value) > NaN`` is False for every finite value (and for NaN
+    itself), the resulting binary stack is identically zero everywhere —
+    regardless of the underlying values. The stored metadata records
+    ``threshold=NaN, binary=True``.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_threshold_nan_produces_all_zero_stack(self):
+        """
+        Tests:
+            (Test Case 1) ``pcm_stack_threshold(threshold=np.nan)`` returns
+                a successful result dict.
+            (Test Case 2) The result stack is a ``PairwiseCompMatrixStack``
+                of the same shape as the input.
+            (Test Case 3) Every element of the resulting ``stack`` is
+                exactly 0.0 (no NaN, no 1.0).
+            (Test Case 4) ``metadata["binary"] is True`` and
+                ``metadata["threshold"]`` is NaN (round-trips the input).
+        """
+        if not MCP_SERVER_AVAILABLE:
+            pytest.skip("MCP server not available")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pcm_nan_ws")
+        ws = wm.get_workspace(ws_id)
+        # Non-trivial, fully finite stack so the all-zero result is
+        # attributable to the NaN comparator, not to input NaN.
+        stack_data = np.array(
+            [
+                [[1.0, 0.5], [-2.0, 3.0]],
+                [[0.0, 0.1], [4.0, -1.0]],
+            ]
+        )  # shape (2, 2, 2)
+        ws.store("ns", "pcms", PairwiseCompMatrixStack(stack=stack_data))
+
+        result = await analysis.pcm_stack_threshold(
+            ws_id, "ns", key="pcms", threshold=float("nan"), out_key="pcms_nan"
+        )
+        assert result["info"]["type"] == "PairwiseCompMatrixStack"
+        out = ws.get("ns", "pcms_nan")
+        assert out.stack.shape == stack_data.shape
+        # Every comparator `abs(x) > NaN` is False → all zeros, no NaN, no 1.
+        assert np.all(out.stack == 0.0)
+        assert not np.any(np.isnan(out.stack))
+        assert out.metadata.get("binary") is True
+        assert np.isnan(out.metadata.get("threshold"))
+
+
+class TestSetNeuronAttributeEmptyIndices:
+    """Pin the no-op contract for ``set_neuron_attribute(neuron_indices=[])``.
+
+    Source: ``SpikeData.set_neuron_attribute`` builds ``indices = []``,
+    then the scalar-values branch runs ``for i in indices: ...`` — which
+    is a no-op when ``indices`` is empty. The MCP wrapper still re-stores
+    the SpikeData to refresh the workspace index summary, but no neuron
+    attributes are added or changed.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_empty_indices_is_noop(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``set_neuron_attribute(neuron_indices=[],
+                values=1)`` returns successfully (no exception).
+            (Test Case 2) The result dict echoes back the attribute key.
+            (Test Case 3) ``SpikeData.neuron_attributes`` was either
+                left as None (initial state) OR initialized to a list of
+                empty dicts — but in neither case does the new attribute
+                ``"foo"`` appear in any neuron's attribute dict.
+            (Test Case 4) The number of neurons is unchanged.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_before = ws.get(ns, "spikedata")
+        n_before = sd_before.N
+
+        result = await analysis.set_neuron_attribute(
+            ws_id, ns, key="foo", values=1, neuron_indices=[]
+        )
+        assert result["key"] == "foo"
+
+        sd_after = ws.get(ns, "spikedata")
+        assert sd_after.N == n_before
+        # Underlying source initialises neuron_attributes to [{} for _ in range(N)]
+        # when it was None — so it may now be a list of empty dicts even
+        # though no values were set. The contract: "foo" is not present
+        # in any neuron's attribute dict.
+        attrs = sd_after.neuron_attributes
+        if attrs is not None:
+            for neuron_dict in attrs:
+                assert "foo" not in neuron_dict

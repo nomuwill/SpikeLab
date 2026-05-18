@@ -1345,25 +1345,18 @@ class TestResampledIsi:
 
     def test_non_uniform_time_grid(self):
         """
-        _resampled_isi uses times[1] - times[0] as a uniform step size.
-        Non-uniform time grids produce wrong results because the bin assignment
-        assumes constant dt_ms.
+        _resampled_isi assumes uniform ``dt_ms = times[1] - times[0]``.
+        Non-uniform grids are now rejected at the boundary with a
+        clear ``ValueError`` (previously: silently wrong output).
 
         Tests:
-            (Test Case 1) Non-uniform time grid [0, 1, 5, 10, 20]. The function
-                uses dt_ms = 1.0 (from times[1] - times[0]) regardless of the
-                actual spacing. It does not raise an error. Output shape matches
-                the times array.
-
-        Notes:
-            - This is a known limitation: the function assumes a uniform grid
-              but does not validate this assumption. Results for non-uniform
-              grids are unreliable.
+            (Test Case 1) Non-uniform time grid [0, 1, 5, 10, 20]
+                raises ``ValueError`` naming the gap range.
         """
         spikes = np.array([2.0, 8.0, 15.0])
         times = np.array([0.0, 1.0, 5.0, 10.0, 20.0])
-        result = _resampled_isi(spikes, times, sigma_ms=2.0)
-        assert result.shape == times.shape
+        with pytest.raises(ValueError, match="uniformly spaced"):
+            _resampled_isi(spikes, times, sigma_ms=2.0)
 
     def test_spikes_outside_times_range(self):
         """

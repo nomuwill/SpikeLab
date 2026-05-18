@@ -11299,3 +11299,744 @@ class TestRTSortBackendExtractWaveformsConfigThreading:
         assert captured["config"] is backend.config
         assert captured["n_jobs"] == cfg.execution.n_jobs
         assert captured["total_memory"] == cfg.execution.total_memory
+
+
+# ===========================================================================
+# Branch test coverage: refactor/remove-globals — MED-priority batch.
+# Pins remaining 🟡 gaps in REVIEW.md § "Branch test coverage":
+#
+#   - `load_single_recording` config propagations: gain_to_uv,
+#     offset_to_uv, freq_min/freq_max.
+#   - `extract_waveforms` cache-hit branch + streaming dispatch +
+#     config=None default.
+#   - `WaveformExtractor.create_initial(config=None)`.
+#   - `_spike_sort_docker` custom keep_good_only / pos_peak_thresh
+#     propagation to the returned KilosortSortingExtractor.
+#   - `ks4_runner.spike_sort` recompute_sorting=False early-return +
+#     pos_peak_thresh propagation.
+#   - rt_sort: save_rt_sort_pickle writes pickle file +
+#     detect_window_s with recording_window_ms=None branch.
+# ===========================================================================
+
+
+@skip_no_spikeinterface
+class TestLoadSingleRecordingConfigPropagation:
+    """``load_single_recording`` reads four scaling/filtering values
+    from ``config.recording`` and passes them through to
+    ``ScaleRecording`` (gain/offset) and ``bandpass_filter``
+    (freq_min/freq_max). Pre-refactor these came from
+    ``_globals.GAIN_TO_UV`` etc.; post-refactor they live on the
+    typed config.
+    """
+
+    @pytest.fixture()
+    def base_recording(self):
+        from spikeinterface.core import NumpyRecording
+
+        traces = np.zeros((1000, 4), dtype=np.float32)
+        return NumpyRecording(traces_list=[traces], sampling_frequency=20000.0)
+
+    def test_gain_to_uv_override_reaches_scale_recording(
+        self, base_recording, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``config.recording.gain_to_uv=2.5`` reaches
+                ``ScaleRecording`` as ``gain=2.5``.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            RecordingConfig,
+            SortingPipelineConfig,
+        )
+
+        captured = {}
+
+        class _StubScale:
+            def __init__(self, rec, *, gain, offset, dtype):
+                captured["gain"] = gain
+                captured["offset"] = offset
+                self._rec = rec
+
+            def __getattr__(self, name):
+                return getattr(self._rec, name)
+
+        monkeypatch.setattr(recording_io, "ScaleRecording", _StubScale)
+        monkeypatch.setattr(
+            recording_io, "bandpass_filter", lambda rec, **_kw: rec
+        )
+
+        cfg = SortingPipelineConfig(recording=RecordingConfig(gain_to_uv=2.5))
+        recording_io.load_single_recording(base_recording, config=cfg)
+        assert captured["gain"] == 2.5
+
+    def test_offset_to_uv_override_reaches_scale_recording(
+        self, base_recording, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``config.recording.offset_to_uv=7.0`` reaches
+                ``ScaleRecording`` as ``offset=7.0``.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            RecordingConfig,
+            SortingPipelineConfig,
+        )
+
+        captured = {}
+
+        class _StubScale:
+            def __init__(self, rec, *, gain, offset, dtype):
+                captured["offset"] = offset
+                self._rec = rec
+
+            def __getattr__(self, name):
+                return getattr(self._rec, name)
+
+        monkeypatch.setattr(recording_io, "ScaleRecording", _StubScale)
+        monkeypatch.setattr(
+            recording_io, "bandpass_filter", lambda rec, **_kw: rec
+        )
+
+        cfg = SortingPipelineConfig(recording=RecordingConfig(offset_to_uv=7.0))
+        recording_io.load_single_recording(base_recording, config=cfg)
+        assert captured["offset"] == 7.0
+
+    def test_freq_min_freq_max_overrides_reach_bandpass_filter(
+        self, base_recording, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``config.recording.freq_min=200`` and
+                ``freq_max=5000`` reach ``bandpass_filter`` as kwargs.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            RecordingConfig,
+            SortingPipelineConfig,
+        )
+
+        captured = {}
+
+        monkeypatch.setattr(
+            recording_io, "ScaleRecording", lambda rec, **_kw: rec
+        )
+
+        def _stub_bp(rec, **kw):
+            captured.update(kw)
+            return rec
+
+        monkeypatch.setattr(recording_io, "bandpass_filter", _stub_bp)
+
+        cfg = SortingPipelineConfig(
+            recording=RecordingConfig(freq_min=200, freq_max=5000),
+        )
+        recording_io.load_single_recording(base_recording, config=cfg)
+        assert captured["freq_min"] == 200
+        assert captured["freq_max"] == 5000
+
+
+@skip_no_spikeinterface
+class TestExtractWaveformsDispatch:
+    """``recording_io.extract_waveforms`` reads two flags from config
+    that determine dispatch:
+
+      - ``config.execution.reextract_waveforms=False`` AND existing
+        ``waveforms/`` dir → cache-hit; load from folder.
+      - ``config.waveform.streaming=True`` (no cache) → streaming path
+        (one pass, no separate compute_templates).
+      - ``config.waveform.streaming=False`` (default, no cache) →
+        chunked path; explicit compute_templates call after.
+
+    Pre-refactor both flags came from `_globals.REEXTRACT_WAVEFORMS` /
+    `_globals.STREAMING_WAVEFORMS`; post-refactor they live on the
+    typed config.
+    """
+
+    @pytest.fixture()
+    def captured_we(self, monkeypatch, tmp_path):
+        """Stub WaveformExtractor.create_initial and
+        load_from_folder so dispatch is observable without doing real
+        extraction work.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        calls = {
+            "create_initial": 0,
+            "load_from_folder": 0,
+            "run_extract_waveforms_streaming": 0,
+            "run_extract_waveforms": 0,
+            "compute_templates": 0,
+        }
+
+        class _StubWE:
+            def __init__(self):
+                pass
+
+            def run_extract_waveforms_streaming(self):
+                calls["run_extract_waveforms_streaming"] += 1
+
+            def run_extract_waveforms(self, **_kw):
+                calls["run_extract_waveforms"] += 1
+
+            def compute_templates(self, **_kw):
+                calls["compute_templates"] += 1
+
+        def _create_initial(*_a, **_kw):
+            calls["create_initial"] += 1
+            return _StubWE()
+
+        def _load_from_folder(*_a, **_kw):
+            calls["load_from_folder"] += 1
+            return _StubWE()
+
+        monkeypatch.setattr(WaveformExtractor, "create_initial", _create_initial)
+        monkeypatch.setattr(WaveformExtractor, "load_from_folder", _load_from_folder)
+        # Also patch the symbol re-exported on recording_io for safety.
+        monkeypatch.setattr(
+            recording_io.WaveformExtractor, "create_initial", _create_initial
+        )
+        monkeypatch.setattr(
+            recording_io.WaveformExtractor, "load_from_folder", _load_from_folder
+        )
+        return calls
+
+    def test_cache_hit_branch_loads_from_folder(self, captured_we, tmp_path):
+        """
+        Tests:
+            (Test Case 1) An existing ``root_folder/waveforms/`` folder
+                with ``reextract_waveforms=False`` takes the cache-hit
+                branch — ``load_from_folder`` is called, ``create_initial``
+                is NOT.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            SortingPipelineConfig,
+        )
+
+        root_folder = tmp_path / "wf_root"
+        (root_folder / "waveforms").mkdir(parents=True)
+        initial_folder = root_folder / "initial"
+        initial_folder.mkdir()
+
+        cfg = SortingPipelineConfig(
+            execution=ExecutionConfig(reextract_waveforms=False),
+        )
+        recording_io.extract_waveforms(
+            recording_path=tmp_path / "r.h5",
+            recording=_make_mock_recording(),
+            sorting=MagicMock(),
+            root_folder=root_folder,
+            initial_folder=initial_folder,
+            config=cfg,
+        )
+
+        assert captured_we["load_from_folder"] == 1
+        assert captured_we["create_initial"] == 0
+
+    def test_streaming_true_takes_streaming_path(self, captured_we, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``config.waveform.streaming=True`` with no
+                cache hit → ``run_extract_waveforms_streaming`` is called,
+                ``run_extract_waveforms`` is NOT.
+            (Test Case 2) ``compute_templates`` is NOT called separately
+                on the streaming path (templates populated by the
+                streaming pass itself).
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            SortingPipelineConfig,
+            WaveformConfig,
+        )
+
+        root_folder = tmp_path / "wf_root_streaming"
+        initial_folder = root_folder / "initial"
+        initial_folder.mkdir(parents=True)
+
+        cfg = SortingPipelineConfig(waveform=WaveformConfig(streaming=True))
+        recording_io.extract_waveforms(
+            recording_path=tmp_path / "r.h5",
+            recording=_make_mock_recording(),
+            sorting=MagicMock(),
+            root_folder=root_folder,
+            initial_folder=initial_folder,
+            config=cfg,
+        )
+        assert captured_we["run_extract_waveforms_streaming"] == 1
+        assert captured_we["run_extract_waveforms"] == 0
+        assert captured_we["compute_templates"] == 0
+
+    def test_streaming_false_takes_chunked_path(self, captured_we, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``config.waveform.streaming=False`` (default)
+                → ``run_extract_waveforms`` is called, streaming is NOT.
+            (Test Case 2) ``compute_templates`` is called after the
+                chunked extraction.
+        """
+        from spikelab.spike_sorting import recording_io
+        from spikelab.spike_sorting.config import (
+            SortingPipelineConfig,
+            WaveformConfig,
+        )
+
+        root_folder = tmp_path / "wf_root_chunked"
+        initial_folder = root_folder / "initial"
+        initial_folder.mkdir(parents=True)
+
+        cfg = SortingPipelineConfig(waveform=WaveformConfig(streaming=False))
+        recording_io.extract_waveforms(
+            recording_path=tmp_path / "r.h5",
+            recording=_make_mock_recording(),
+            sorting=MagicMock(),
+            root_folder=root_folder,
+            initial_folder=initial_folder,
+            config=cfg,
+        )
+        assert captured_we["run_extract_waveforms"] == 1
+        assert captured_we["run_extract_waveforms_streaming"] == 0
+        assert captured_we["compute_templates"] == 1
+
+    def test_config_none_uses_default(self, captured_we, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``extract_waveforms(..., config=None)``
+                constructs a default ``SortingPipelineConfig()`` (the
+                ``WaveformConfig`` default has ``streaming=True``), so
+                the streaming branch fires and ``create_initial`` is
+                called (not the cache-hit branch).
+        """
+        from spikelab.spike_sorting import recording_io
+
+        root_folder = tmp_path / "wf_root_none"
+        initial_folder = root_folder / "initial"
+        initial_folder.mkdir(parents=True)
+
+        recording_io.extract_waveforms(
+            recording_path=tmp_path / "r.h5",
+            recording=_make_mock_recording(),
+            sorting=MagicMock(),
+            root_folder=root_folder,
+            initial_folder=initial_folder,
+            config=None,
+        )
+        # WaveformConfig default streaming=True → streaming path.
+        assert captured_we["create_initial"] == 1
+        assert captured_we["run_extract_waveforms_streaming"] == 1
+        assert captured_we["run_extract_waveforms"] == 0
+
+
+@skip_no_spikeinterface
+class TestWaveformExtractorCreateInitialConfigNone:
+    """``WaveformExtractor.create_initial(..., config=None)`` constructs
+    a default :class:`SortingPipelineConfig` and writes the default
+    waveform parameters to ``extraction_parameters.json``.
+    """
+
+    def test_config_none_writes_default_parameters_to_json(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Resulting ``extraction_parameters.json``
+                contains every documented key.
+            (Test Case 2) ``pos_peak_thresh``, ``max_waveforms_per_unit``,
+                and ``save_waveform_files`` match ``WaveformConfig()``
+                defaults.
+        """
+        import json as _json
+
+        from spikeinterface.core import NumpyRecording
+
+        from spikelab.spike_sorting.config import WaveformConfig
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        fs = 20000.0
+        rec = NumpyRecording(
+            traces_list=[np.zeros((1000, 4), dtype=np.float32)],
+            sampling_frequency=fs,
+        )
+
+        ks_folder = tmp_path / "ks_in"
+        ks_folder.mkdir()
+        np.save(ks_folder / "spike_times.npy", np.array([100, 200], dtype=np.int64))
+        np.save(ks_folder / "spike_clusters.npy", np.array([0, 0], dtype=np.int64))
+        np.save(
+            ks_folder / "templates.npy", np.zeros((1, 41, 4), dtype=np.float32)
+        )
+        np.save(ks_folder / "channel_map.npy", np.arange(4))
+        (ks_folder / "params.py").write_text(
+            f"dat_path = 'r.dat'\nn_channels_dat = 4\ndtype = 'float32'\n"
+            f"offset = 0\nsample_rate = {fs}\nhp_filtered = True\n"
+        )
+        sorting = KilosortSortingExtractor(ks_folder)
+
+        root = tmp_path / "wf_root_default"
+        initial = root / "initial"
+        initial.mkdir(parents=True)
+
+        WaveformExtractor.create_initial(
+            recording_path=tmp_path / "rec.h5",
+            recording=rec,
+            sorting=sorting,
+            root_folder=root,
+            initial_folder=initial,
+            config=None,
+        )
+
+        with open(root / "extraction_parameters.json") as f:
+            params = _json.load(f)
+
+        defaults = WaveformConfig()
+        assert params["pos_peak_thresh"] == defaults.pos_peak_thresh
+        assert params["max_waveforms_per_unit"] == defaults.max_waveforms_per_unit
+        assert params["save_waveform_files"] == defaults.save_waveform_files
+
+
+@skip_no_spikeinterface
+class TestSpikeSortDockerCustomKilosortParamsHonored:
+    """``_spike_sort_docker`` constructs the returned
+    ``KilosortSortingExtractor`` using ``keep_good_only`` and
+    ``pos_peak_thresh`` derived from the caller's kwargs — pinning
+    both round-trip paths.
+    """
+
+    def test_keep_good_only_true_propagates_to_extractor(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Passing ``kilosort_params={"keep_good_only": True}``
+                produces a returned extractor whose unit set reflects
+                ``KSLabel`` filtering (only "good" units survive).
+        """
+        from spikelab.spike_sorting import ks2_runner
+
+        output_folder = tmp_path / "ks_output"
+        output_folder.mkdir()
+        sorter_output = output_folder / "sorter_output"
+        # Two clusters, one labeled good, one labeled mua.
+        spike_times = np.array([10, 20, 100, 200], dtype=np.int64)
+        spike_clusters = np.array([0, 0, 1, 1], dtype=np.int64)
+        tsv = {
+            "cluster_id": [0, 1],
+            "KSLabel": ["good", "mua"],
+            "group": ["good", "mua"],
+        }
+        _write_ks_folder(sorter_output, spike_times, spike_clusters, tsv_data=tsv)
+
+        with (
+            patch.object(ks2_runner, "write_binary_recording"),
+            patch.object(ks2_runner, "BinaryRecordingExtractor"),
+            patch.object(ks2_runner, "run_sorter", MagicMock(return_value=None)),
+        ):
+            result = ks2_runner._spike_sort_docker(
+                _make_mock_recording(),
+                output_folder,
+                kilosort_params={"keep_good_only": True},
+            )
+        # Only the good-labeled cluster (id 0) survives.
+        assert set(result.unit_ids) == {0}
+
+    def test_pos_peak_thresh_propagates_to_extractor(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Passing ``pos_peak_thresh=1.5`` reaches the
+                returned ``KilosortSortingExtractor.pos_peak_thresh``.
+        """
+        from spikelab.spike_sorting import ks2_runner
+
+        output_folder = tmp_path / "ks_output_pp"
+        output_folder.mkdir()
+        sorter_output = output_folder / "sorter_output"
+        _write_ks_folder(
+            sorter_output,
+            spike_times=np.array([10, 20], dtype=np.int64),
+            spike_clusters=np.array([0, 0], dtype=np.int64),
+        )
+
+        with (
+            patch.object(ks2_runner, "write_binary_recording"),
+            patch.object(ks2_runner, "BinaryRecordingExtractor"),
+            patch.object(ks2_runner, "run_sorter", MagicMock(return_value=None)),
+        ):
+            result = ks2_runner._spike_sort_docker(
+                _make_mock_recording(),
+                output_folder,
+                pos_peak_thresh=1.5,
+            )
+        assert result.pos_peak_thresh == 1.5
+
+
+@skip_no_spikeinterface
+class TestSpikeSortKs4EarlyReturnAndPosPeakThresh:
+    """``ks4_runner.spike_sort`` covers two MED-priority gaps:
+
+      - ``recompute_sorting=False`` with existing ``spike_times.npy``
+        → load existing results without invoking the sorter.
+      - ``config.waveform.pos_peak_thresh`` propagates to the returned
+        ``KilosortSortingExtractor``.
+    """
+
+    def test_existing_results_skip_run_sorter(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) When ``spike_times.npy`` exists and
+                ``recompute_sorting=False``, ``ss.run_sorter`` is not
+                invoked.
+            (Test Case 2) Returned object is a KilosortSortingExtractor
+                pointing at the existing folder.
+        """
+        import spikeinterface.sorters as ss
+
+        from spikelab.spike_sorting import ks4_runner
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            SortingPipelineConfig,
+        )
+
+        output_folder = tmp_path / "ks4_out"
+        # KS4 reads from output_folder (no sorter_output subfolder) when
+        # the early-return branch fires — write the fake KS files there.
+        _write_ks_folder(
+            output_folder,
+            spike_times=np.array([10, 20, 30], dtype=np.int64),
+            spike_clusters=np.array([0, 0, 1], dtype=np.int64),
+        )
+
+        called = []
+
+        def _no_call_run_sorter(*args, **kwargs):
+            called.append((args, kwargs))
+
+        monkeypatch.setattr(ss, "run_sorter", _no_call_run_sorter)
+
+        cfg = SortingPipelineConfig(
+            execution=ExecutionConfig(recompute_sorting=False),
+        )
+        result = ks4_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=output_folder,
+            config=cfg,
+        )
+
+        assert called == []
+        assert hasattr(result, "unit_ids")
+        assert set(result.unit_ids) == {0, 1}
+
+    def test_pos_peak_thresh_reaches_returned_extractor(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``config.waveform.pos_peak_thresh=1.5`` is
+                threaded into the returned ``KilosortSortingExtractor``
+                via ``ks4_runner.spike_sort`` on the existing-results
+                short-circuit path.
+        """
+        from spikelab.spike_sorting import ks4_runner
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            SortingPipelineConfig,
+            WaveformConfig,
+        )
+
+        output_folder = tmp_path / "ks4_out_pp"
+        _write_ks_folder(
+            output_folder,
+            spike_times=np.array([10, 20], dtype=np.int64),
+            spike_clusters=np.array([0, 0], dtype=np.int64),
+        )
+
+        cfg = SortingPipelineConfig(
+            execution=ExecutionConfig(recompute_sorting=False),
+            waveform=WaveformConfig(pos_peak_thresh=1.5),
+        )
+        result = ks4_runner.spike_sort(
+            rec_cache=_make_mock_recording(),
+            rec_path="r.h5",
+            recording_dat_path=Path("/tmp/r.dat"),
+            output_folder=output_folder,
+            config=cfg,
+        )
+        assert result.pos_peak_thresh == 1.5
+
+
+@skip_no_torch
+class TestRTSortSpikeSortDetectionWindowWithRecordingWindowNone:
+    """``rt_sort_runner.spike_sort`` with ``detection_window_s`` set
+    and ``recording_window_ms=None`` falls back to ``start_ms=0.0`` and
+    produces ``detect_window_ms=(0.0, detection_window_s*1000)``. The
+    ``sort_offline`` window remains ``None`` (full recording).
+    """
+
+    @pytest.fixture()
+    def captured_calls(self, monkeypatch):
+        captured = {"detect": "<unset>", "sort_offline": "<unset>"}
+
+        class _FakeRTSort:
+            _seq_root_elecs = []
+
+            def sort_offline(self, **kw):
+                captured["sort_offline"] = kw.get("recording_window_ms")
+                return object()
+
+        def _fake_detect_sequences(recording, inter_path, detection_model, **kw):
+            captured["detect"] = kw.get("recording_window_ms")
+            return _FakeRTSort()
+
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._load_detection_model",
+            lambda *a, **k: object(),
+        )
+        import spikelab.spike_sorting.rt_sort as rt_sort_pkg
+
+        monkeypatch.setattr(
+            rt_sort_pkg, "detect_sequences", _fake_detect_sequences, raising=False
+        )
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._save_sorting_cache",
+            lambda *a, **k: None,
+        )
+        return captured
+
+    def test_recording_window_ms_none_with_detection_window_s_yields_zero_start(
+        self, captured_calls, tmp_path
+    ):
+        """
+        Tests:
+            (Test Case 1) ``recording_window_ms=None`` +
+                ``detection_window_s=60`` → ``detect_sequences`` receives
+                ``(0.0, 60_000.0)``.
+            (Test Case 2) ``sort_offline`` receives ``None`` (the full
+                window, since the user never narrowed it).
+        """
+        from spikelab.spike_sorting import rt_sort_runner as runner
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            RTSortConfig,
+            SortingPipelineConfig,
+        )
+
+        config = SortingPipelineConfig(
+            execution=ExecutionConfig(recompute_sorting=True),
+            rt_sort=RTSortConfig(
+                recording_window_ms=None,
+                detection_window_s=60.0,
+                device="cpu",
+                num_processes=1,
+                delete_inter=False,
+                verbose=False,
+                save_rt_sort_pickle=False,
+            ),
+        )
+        runner.spike_sort(
+            rec_cache=object(),
+            rec_path=tmp_path / "fake.h5",
+            recording_dat_path=None,
+            output_folder=tmp_path / "out",
+            config=config,
+        )
+        assert captured_calls["detect"] == (0.0, 60_000.0)
+        assert captured_calls["sort_offline"] is None
+
+
+@skip_no_torch
+class TestRTSortSpikeSortSaveRtSortPickle:
+    """``rt_sort_runner.spike_sort`` with
+    ``config.rt_sort.save_rt_sort_pickle=True`` (default) calls
+    ``rt_sort.save(pickle_path)`` to persist the trained sequences
+    next to the recording. Setting the flag to ``False`` skips the
+    save call.
+    """
+
+    @pytest.fixture()
+    def runner_stubs(self, monkeypatch):
+        """Stub model load + detect_sequences + cache save; capture
+        the .save() calls on the RTSort sentinel.
+        """
+        save_calls = []
+
+        class _FakeRTSort:
+            _seq_root_elecs = []
+
+            def sort_offline(self, **kw):
+                return object()
+
+            def save(self, path):
+                save_calls.append(Path(path))
+
+        def _fake_detect_sequences(recording, inter_path, detection_model, **kw):
+            return _FakeRTSort()
+
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._load_detection_model",
+            lambda *a, **k: object(),
+        )
+        import spikelab.spike_sorting.rt_sort as rt_sort_pkg
+
+        monkeypatch.setattr(
+            rt_sort_pkg, "detect_sequences", _fake_detect_sequences, raising=False
+        )
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.rt_sort_runner._save_sorting_cache",
+            lambda *a, **k: None,
+        )
+        return save_calls
+
+    def _run(self, save_rt_sort_pickle, tmp_path):
+        from spikelab.spike_sorting import rt_sort_runner as runner
+        from spikelab.spike_sorting.config import (
+            ExecutionConfig,
+            RTSortConfig,
+            SortingPipelineConfig,
+        )
+
+        config = SortingPipelineConfig(
+            execution=ExecutionConfig(recompute_sorting=True),
+            rt_sort=RTSortConfig(
+                recording_window_ms=(0.0, 120_000.0),
+                detection_window_s=None,
+                device="cpu",
+                num_processes=1,
+                delete_inter=False,
+                verbose=False,
+                save_rt_sort_pickle=save_rt_sort_pickle,
+            ),
+        )
+        output_folder = tmp_path / "inter" / "rt_sort"
+        runner.spike_sort(
+            rec_cache=object(),
+            rec_path=tmp_path / "fake.h5",
+            recording_dat_path=None,
+            output_folder=output_folder,
+            config=config,
+        )
+        return output_folder
+
+    def test_save_true_persists_pickle_next_to_recording(
+        self, runner_stubs, tmp_path
+    ):
+        """
+        Tests:
+            (Test Case 1) ``save_rt_sort_pickle=True`` triggers exactly
+                one ``RTSort.save(path)`` call.
+            (Test Case 2) The path is ``output_folder.parent.parent / "rt_sort.pickle"``
+                — i.e. the recording directory, not the inter folder
+                (so the pickle survives ``delete_inter=True`` cleanup).
+        """
+        output_folder = self._run(True, tmp_path)
+        assert len(runner_stubs) == 1
+        assert runner_stubs[0] == output_folder.parent.parent / "rt_sort.pickle"
+
+    def test_save_false_skips_pickle(self, runner_stubs, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``save_rt_sort_pickle=False`` → no ``save``
+                calls on the RTSort.
+        """
+        self._run(False, tmp_path)
+        assert runner_stubs == []

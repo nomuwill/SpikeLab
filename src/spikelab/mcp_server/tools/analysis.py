@@ -2763,6 +2763,7 @@ async def pcm_stack_threshold(
     key: str,
     threshold: float,
     out_key: Optional[str] = None,
+    preserve_nan: bool = False,
 ) -> Dict[str, Any]:
     """Apply a binary threshold to a PairwiseCompMatrixStack and store to workspace.
 
@@ -2778,10 +2779,15 @@ async def pcm_stack_threshold(
     The empty string ``""`` is also accepted in place of ``None`` for
     backwards compatibility with callers using the previous default,
     and is treated identically (use input ``key``).
+
+    By default NaN values in the source stack are treated as below
+    threshold and become 0 in the binary output. Pass
+    ``preserve_nan=True`` to keep NaN in the output (useful when
+    "missing" must remain distinguishable from "below threshold").
     """
     ws = _get_workspace(workspace_id)
     stack = _get_pcm_stack(ws, namespace, key)
-    new_stack = stack.threshold(threshold)
+    new_stack = stack.threshold(threshold, preserve_nan=preserve_nan)
     target_key = out_key if out_key else key
     ws.store(namespace, target_key, new_stack)
     return {

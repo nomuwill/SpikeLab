@@ -3595,6 +3595,16 @@ async def _list_tools() -> list[types.Tool]:
                                 "to preserve the source."
                             ),
                         },
+                        "preserve_nan": {
+                            "type": "boolean",
+                            "description": (
+                                "When false (default), NaN values become "
+                                "0 in the binary output. When true, NaN "
+                                "propagates so 'missing' stays "
+                                "distinguishable from 'below threshold'."
+                            ),
+                            "default": False,
+                        },
                     },
                     "required": ["workspace_id", "namespace", "key", "threshold"],
                 },

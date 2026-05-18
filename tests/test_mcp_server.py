@@ -864,6 +864,49 @@ class TestWorkspaceManagement:
 
     @pytestmark_server
     @pytest.mark.asyncio
+    async def test_merge_workspace_all_collisions_full_skip(self, tmp_path):
+        """
+        ``merge_workspace`` with ``overwrite=False`` and *every* source
+        key colliding with a target key: zero items are merged, every
+        key appears in ``skipped_keys``, and all target values are
+        untouched.
+
+        Distinct from ``test_merge_workspace_skip_duplicates`` (single
+        collision) — pins the all-skip path where ``merged == 0``
+        because no items got through.
+
+        Tests:
+            (Test Case 1) ``merged == 0`` and ``skipped == 2``.
+            (Test Case 2) ``skipped_keys`` lists both colliding keys.
+            (Test Case 3) Target retains its original values for every
+                colliding key.
+        """
+        create_target = await analysis.create_workspace(name="target_all_collide")
+        target_id = create_target["workspace_id"]
+        ws_target = get_workspace_manager().get_workspace(target_id)
+        ws_target.store("ns", "a", np.array([1.0]))
+        ws_target.store("ns", "b", np.array([2.0]))
+
+        create_src = await analysis.create_workspace(name="source_all_collide")
+        src_id = create_src["workspace_id"]
+        ws_src = get_workspace_manager().get_workspace(src_id)
+        ws_src.store("ns", "a", np.array([99.0]))
+        ws_src.store("ns", "b", np.array([88.0]))
+        path = str(tmp_path / "source_ws_all")
+        await analysis.save_workspace(src_id, path)
+
+        result = await analysis.merge_workspace(target_id, path, overwrite=False)
+
+        assert result["merged"] == 0
+        assert result["skipped"] == 2
+        skipped_pairs = {(d["namespace"], d["key"]) for d in result["skipped_keys"]}
+        assert skipped_pairs == {("ns", "a"), ("ns", "b")}
+        # Target values are unchanged for both colliding keys.
+        np.testing.assert_array_equal(ws_target.get("ns", "a"), [1.0])
+        np.testing.assert_array_equal(ws_target.get("ns", "b"), [2.0])
+
+    @pytestmark_server
+    @pytest.mark.asyncio
     async def test_merge_workspace_overwrite(self, tmp_path):
         """
         Test that merge_workspace replaces existing keys when overwrite is True.
@@ -4100,6 +4143,39 @@ class TestRenameWorkspaceItem:
         ws_id = wm.create_workspace(name="rename_ws")
         with pytest.raises(KeyError, match="not found"):
             await analysis.rename_workspace_item(ws_id, "ns", "nonexistent", "new_key")
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_rename_old_equals_new_is_blocked(self):
+        """
+        ``rename_workspace_item`` with ``old_key == new_key`` returns
+        ``success=False`` (rename is blocked) and emits the
+        already-exists UserWarning. Pins the contract that the underlying
+        ``AnalysisWorkspace.rename`` treats ``new_key in items`` as a
+        collision regardless of whether ``new_key`` is the same as
+        ``old_key``.
+
+        Tests:
+            (Test Case 1) ``success`` is False.
+            (Test Case 2) The item still exists at the original key
+                (no destructive side effect from the no-op rename).
+        """
+        import warnings
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="rename_same_ws")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "k", np.array([1.0, 2.0]))
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = await analysis.rename_workspace_item(ws_id, "ns", "k", "k")
+
+        assert result["success"] is False
+        # The original key is untouched.
+        np.testing.assert_array_equal(ws.get("ns", "k"), [1.0, 2.0])
+        # Underlying workspace.rename emits an "already exists" warning.
+        assert any("already exists" in str(rec.message) for rec in w)
 
 
 class TestAddWorkspaceNote:

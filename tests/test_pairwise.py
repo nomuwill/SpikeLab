@@ -2190,6 +2190,70 @@ class TestPairwiseCompMatrixNormalize:
         expected = np.array([[0.0, 1 / 3], [2 / 3, 1.0]])
         np.testing.assert_allclose(result, expected)
 
+    def test_normalize_all_nan_row_suppresses_runtime_warning(self):
+        """
+        ``_min_max_normalize`` and ``_z_score_normalize`` with an
+        all-NaN row (axis='row') must not emit ``RuntimeWarning`` (PR
+        #139 contract — scoped suppression around the NaN reductions).
+        The reductions themselves are correct (return NaN for the
+        all-NaN slice); the warning was pure log noise.
+
+        Other rows continue to normalize correctly — pin both the
+        warning suppression and the output correctness so a regression
+        that removes the suppression OR breaks the math is caught.
+
+        Tests:
+            (Test Case 1) No ``RuntimeWarning`` fires for ``axis='row'``
+                on a matrix whose first row is all-NaN.
+            (Test Case 2) The all-NaN row stays all-NaN in the output.
+            (Test Case 3) The non-NaN rows normalize to the expected
+                min-max [0, 1] range.
+            (Test Case 4) Same warning-suppression + output behaviour
+                for ``_z_score_normalize`` on an all-NaN column.
+        """
+        mat_row = np.array(
+            [
+                [np.nan, np.nan, np.nan],
+                [0.0, 5.0, 10.0],
+                [2.0, 4.0, 6.0],
+            ]
+        )
+
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            result = _min_max_normalize(mat_row, axis="row")
+        runtime_warnings = [w for w in rec if issubclass(w.category, RuntimeWarning)]
+        assert (
+            runtime_warnings == []
+        ), f"unexpected RuntimeWarning(s): {[str(w.message) for w in runtime_warnings]}"
+
+        assert np.all(np.isnan(result[0]))
+        np.testing.assert_allclose(result[1], [0.0, 0.5, 1.0])
+        np.testing.assert_allclose(result[2], [0.0, 0.5, 1.0])
+
+        # Same contract for _z_score_normalize on an all-NaN column.
+        mat_col = np.array(
+            [
+                [np.nan, 1.0, 4.0],
+                [np.nan, 2.0, 5.0],
+                [np.nan, 3.0, 6.0],
+            ]
+        )
+        with warnings.catch_warnings(record=True) as rec_z:
+            warnings.simplefilter("always")
+            result_z = _z_score_normalize(mat_col, axis="col")
+        runtime_warnings_z = [
+            w for w in rec_z if issubclass(w.category, RuntimeWarning)
+        ]
+        assert runtime_warnings_z == [], (
+            f"unexpected RuntimeWarning(s): "
+            f"{[str(w.message) for w in runtime_warnings_z]}"
+        )
+        assert np.all(np.isnan(result_z[:, 0]))
+        # Non-NaN columns: mean=2, std=sqrt(2/3); z = (x-mu)/std.
+        expected_col = (mat_col[:, 1] - mat_col[:, 1].mean()) / mat_col[:, 1].std()
+        np.testing.assert_allclose(result_z[:, 1], expected_col)
+
     def test_helper_z_score_normalize_directly(self):
         """Direct call to _z_score_normalize returns correct values.
 

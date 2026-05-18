@@ -173,6 +173,32 @@ class TestHDF5Loaders:
         assert len(sd.train[0]) == 0
         assert len(sd.train[1]) == 0
 
+    def test_hdf5_group_per_unit_no_datasets_zero_units(self, tmp_path):
+        """
+        An HDF5 group-per-unit file with an empty units group (zero
+        datasets) loads as a zero-unit SpikeData with length 0.
+
+        Distinct from ``test_hdf5_group_per_unit_empty_units`` (which
+        creates two empty-train units) — here the group itself contains
+        no datasets at all. Pins the contract that the loader does not
+        error and yields the zero-unit shape invariant.
+
+        Tests:
+            (Test Case 1) ``SpikeData.N == 0``.
+            (Test Case 2) ``SpikeData.length == 0.0``.
+            (Test Case 3) ``SpikeData.train`` is an empty sequence.
+        """
+        path = str(tmp_path / "empty_group.h5")
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.create_group("units")
+
+        sd = loaders.load_spikedata_from_hdf5(
+            path, group_per_unit="units", group_time_unit="ms"
+        )
+        assert sd.N == 0
+        assert sd.length == 0.0
+        assert len(sd.train) == 0
+
     def test_hdf5_ragged_spike_times(self, tmp_path):
         """
         Test loading flat (ragged) spike_times with cumulative index in seconds.
@@ -1129,6 +1155,42 @@ class TestPickleLoaders:
 
         with pytest.raises(Exception):
             loaders.load_spikedata_from_pickle(path)
+
+    @patch("spikelab.data_loaders.s3_utils.ensure_local_file")
+    def test_pickle_temp_file_cleanup_on_load_failure(self, mock_ensure, tmp_path):
+        """
+        When ``pickle.load`` itself raises (not just an EOFError on an
+        empty file), the loader's ``finally`` block still removes the
+        downloaded temp file so the caller does not leak disk.
+
+        Pins the contract of the ``try / finally`` around ``pickle.load``
+        in ``load_spikedata_from_pickle``: cleanup must fire on *any*
+        exception from ``pickle.load``, not just clean returns.
+
+        Tests:
+            (Test Case 1) An UnpicklingError raised by ``pickle.load``
+                on garbage bytes still triggers ``os.remove`` of the
+                temp file.
+            (Test Case 2) The original exception propagates to the
+                caller.
+        """
+        # Write garbage bytes that will trip pickle.UnpicklingError or
+        # similar inside pickle.load (not at file-open time).
+        fd, path = tempfile.mkstemp(suffix=".pkl")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(b"\x80\x04\x95not-a-valid-pickle-stream")
+
+        # Pretend this file came from S3 so the loader treats it as a
+        # temp file and routes through the cleanup path.
+        mock_ensure.return_value = (path, True)
+
+        with pytest.raises(Exception):
+            loaders.load_spikedata_from_pickle("s3://bucket/garbage.pkl")
+
+        # finally block ran → temp file removed even though pickle.load
+        # raised.
+        assert not os.path.exists(path)
 
 
 @skip_no_pandas
@@ -5477,9 +5539,7 @@ class TestRawArraysShapeMismatch:
         with h5py.File(path, "r") as f:  # type: ignore
             with warnings.catch_warnings(record=True) as recwarn:
                 warnings.simplefilter("always")
-                rd, rt = loaders._read_raw_arrays(
-                    f, "raw", "raw_time", "ms", None
-                )
+                rd, rt = loaders._read_raw_arrays(f, "raw", "raw_time", "ms", None)
 
         # Both arrays come back at their stored sizes — no validation.
         assert rd is not None and rt is not None

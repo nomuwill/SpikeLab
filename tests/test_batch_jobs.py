@@ -1249,6 +1249,39 @@ class TestModelValidation:
         spec = ResourceSpec(requests_gpu=0, limits_gpu=0)
         assert spec.requests_gpu == 0
 
+    def test_gpu_fields_reject_none(self):
+        """
+        ``ResourceSpec.requests_gpu`` and ``limits_gpu`` are typed as
+        ``int = Field(default=0, ge=0)``. None is rejected at the
+        pydantic type-validation layer (before the
+        ``_validate_gpu_pairing`` model-validator can run).
+
+        Pins the current contract that one-sided GPU specs cannot be
+        expressed as ``None`` — a previous REVIEW.md entry suggested
+        ``requests_gpu=None, limits_gpu=1`` was a missing case, but
+        the int-typed fields reject ``None`` outright. The default
+        (both 0) is accepted.
+
+        Tests:
+            (Test Case 1) ``requests_gpu=None`` raises pydantic
+                int-type error (not the mismatch validator).
+            (Test Case 2) Default construction yields zero-zero GPU
+                spec (no validation error).
+            (Test Case 3) Asymmetric integer values like (1, 2) still
+                trigger the explicit mismatch validator.
+        """
+        with pytest.raises(PydanticValidationError, match="int_type|valid integer"):
+            ResourceSpec(requests_gpu=None, limits_gpu=1)
+
+        spec = ResourceSpec()
+        assert spec.requests_gpu == 0
+        assert spec.limits_gpu == 0
+
+        with pytest.raises(
+            PydanticValidationError, match="GPU requests and limits must match"
+        ):
+            ResourceSpec(requests_gpu=1, limits_gpu=2)
+
     def test_volume_mount_requires_source(self):
         """VolumeMountSpec rejects when neither secret_name nor pvc_name provided."""
         with pytest.raises(PydanticValidationError, match="secret_name or pvc_name"):

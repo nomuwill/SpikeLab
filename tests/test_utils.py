@@ -2714,6 +2714,31 @@ class TestShuffleZScore:
             z = shuffle_z_score(5.0, dist)
         assert np.isnan(z)
 
+    def test_uses_bessel_corrected_sample_std(self):
+        """
+        ``shuffle_z_score`` uses the Bessel-corrected (``ddof=1``)
+        sample standard deviation, not the population (``ddof=0``)
+        estimator. This is the PR #139 contract.
+
+        For ``dist = [8, 10, 12]`` (mean=10):
+            ``ddof=0`` σ ≈ 1.6330 → z(12) ≈ 1.2247
+            ``ddof=1`` σ = 2.0000 → z(12) = 1.0
+
+        The currently-shipped implementation must return the ``ddof=1``
+        value within tight tolerance. A regression to ``ddof=0`` would
+        flip this assertion by ~22%.
+
+        Tests:
+            (Test Case 1) z-score equals 1.0 (the ``ddof=1`` value).
+            (Test Case 2) z-score does NOT equal the ``ddof=0`` value
+                of ~1.2247.
+        """
+        dist = np.array([8.0, 10.0, 12.0])
+        z = shuffle_z_score(12.0, dist)
+        np.testing.assert_allclose(z, 1.0, atol=1e-10)
+        # The ddof=0 result would be ~1.2247; ensure we are not seeing it.
+        assert not np.isclose(z, 1.2247, atol=1e-3)
+
 
 # ---------------------------------------------------------------------------
 # shuffle_percentile

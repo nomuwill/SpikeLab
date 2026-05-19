@@ -296,6 +296,81 @@ class TestKs4InsufficientActivity:
         assert "a" in text and "b" in text
 
 
+class TestWalkExceptionChainDeduplicates:
+    """
+    Tests for the message-text dedup added in commit 0d91204.
+
+    When SpikeInterface re-raises an inner sklearn/numpy error, the
+    inner and outer exceptions are distinct Python objects but carry
+    identical ``str(exc)`` text — a naive walk would emit the same line
+    twice. The walker uses identity checks to break cycles AND a text
+    dedup so duplicate-message chains collapse to a single line, while
+    distinct messages still each appear.
+
+    Tests:
+        (Test Case 1) Two distinct exception objects with identical
+            ``str(exc)`` text produce exactly one line.
+        (Test Case 2) Two exceptions with different text still produce
+            two lines.
+        (Test Case 3) A three-exception chain with one duplicate and
+            one unique tail produces two lines (one per unique message).
+    """
+
+    def test_duplicate_text_collapses_to_single_line(self):
+        """
+        Tests:
+            (Test Case 1) Outer + inner with identical ``str`` produce
+                a single line (not two).
+        """
+        inner = RuntimeError("identical message")
+        outer = RuntimeError("identical message")
+        outer.__cause__ = inner
+
+        text = _walk_exception_chain(outer)
+        # Single occurrence — dedup collapses the second.
+        assert text.count("identical message") == 1
+        # Single line (no newline since there's only one message).
+        assert "\n" not in text
+
+    def test_distinct_text_still_produces_two_lines(self):
+        """
+        Tests:
+            (Test Case 1) Outer + inner with distinct ``str`` produce
+                two lines.
+            (Test Case 2) Both messages are present in the output.
+        """
+        inner = RuntimeError("inner failure")
+        outer = RuntimeError("outer wrapper")
+        outer.__cause__ = inner
+
+        text = _walk_exception_chain(outer)
+        lines = text.split("\n")
+        assert len(lines) == 2
+        assert "outer wrapper" in text
+        assert "inner failure" in text
+
+    def test_three_level_chain_with_one_duplicate(self):
+        """
+        Tests:
+            (Test Case 1) A three-level chain (outer -> middle -> inner)
+                where outer and middle carry identical text dedups to
+                exactly two unique lines.
+            (Test Case 2) The unique inner message is preserved.
+        """
+        inner = RuntimeError("inner failure")
+        middle = RuntimeError("duplicate text")
+        middle.__cause__ = inner
+        outer = RuntimeError("duplicate text")
+        outer.__cause__ = middle
+
+        text = _walk_exception_chain(outer)
+        lines = text.split("\n")
+        # "duplicate text" appears once; "inner failure" appears once.
+        assert len(lines) == 2
+        assert text.count("duplicate text") == 1
+        assert text.count("inner failure") == 1
+
+
 # ---------------------------------------------------------------------------
 # Environment classifier — HDF5PluginMissingError
 # ---------------------------------------------------------------------------

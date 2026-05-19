@@ -12081,3 +12081,530 @@ class TestRTSortSpikeSortSaveRtSortPickle:
         """
         self._run(False, tmp_path)
         assert runner_stubs == []
+
+
+# ===========================================================================
+# Compiler.include_failed_units opt-in (commit f58dfde)
+# ===========================================================================
+
+
+def _make_sd_with_unit_ids(unit_ids, n_samples=200, fs_Hz=20000.0):
+    """Build a minimal SpikeData with one entry per unit_id and rich attrs.
+
+    Each unit gets a unique fake spike train and a ``neuron_attributes``
+    dict carrying the fields the Compiler reads in ``save_results``:
+    ``unit_id``, ``has_pos_peak``, ``amplitude``, ``spike_train_samples``,
+    ``electrode``, and a minimal ``template`` placeholder. This lets the
+    Compiler iterate through ``sd.N`` units without raising.
+    """
+    from spikelab.spikedata import SpikeData
+
+    trains = [np.array([10.0 + i, 20.0 + i, 30.0 + i]) for i in range(len(unit_ids))]
+    neuron_attrs = []
+    for i, uid in enumerate(unit_ids):
+        neuron_attrs.append(
+            {
+                "unit_id": int(uid),
+                "has_pos_peak": False,
+                "amplitude": float(50 - i),
+                "spike_train_samples": np.array([100, 200, 300], dtype=np.int64),
+                "electrode": int(uid),
+                "template": np.zeros(40),
+                "template_windowed": np.zeros(40),
+                "template_peak_ind": 20,
+                "x": 0.0,
+                "y": 0.0,
+                "channel": 0,
+                "channel_id": 0,
+            }
+        )
+    sd = SpikeData(
+        trains,
+        length=100.0,
+        neuron_attributes=neuron_attrs,
+        metadata={"fs_Hz": fs_Hz, "n_samples": n_samples, "channel_locations": None},
+    )
+    return sd
+
+
+def _new_compiler(include_failed_units_cfg=False):
+    """Return a Compiler with figures disabled, npz only, fast happy path."""
+    from spikelab.spike_sorting.pipeline import Compiler
+    from spikelab.spike_sorting.config import SortingPipelineConfig
+
+    cfg = SortingPipelineConfig()
+    cfg.figures.create_figures = False
+    cfg.compilation.compile_to_mat = False
+    cfg.compilation.compile_to_npz = True
+    cfg.compilation.compile_waveforms = False
+    cfg.compilation.save_electrodes = False
+    cfg.compilation.include_failed_units = include_failed_units_cfg
+    return Compiler(cfg)
+
+
+class TestCompilerIncludeFailedUnitsDefault:
+    """
+    Tests for ``Compiler.add_recording`` default behaviour:
+    ``include_failed_units=False`` writes only curated units, every
+    cached entry is flagged as a fully-curated SpikeData, and the
+    per-unit ``is_curated`` flag reaching the compiled output is True.
+
+    Tests:
+        (Test Case 1) Default ``add_recording`` stores
+            ``include_failed_units=False`` in recs_cache.
+        (Test Case 2) Every unit in the saved ``sorted.npz`` file
+            corresponds to a unit_id that was in the SpikeData (i.e.
+            no failed-unit rows leak in).
+    """
+
+    def test_default_flag_is_false_in_recs_cache(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) recs_cache stores include_failed_units=False
+                when the caller omits the kwarg.
+            (Test Case 2) recs_cache stores the supplied rec_name and sd.
+        """
+        compiler = _new_compiler()
+        sd = _make_sd_with_unit_ids([10, 20, 30])
+        compiler.add_recording("rec_a", sd, curation_history=None)
+
+        assert len(compiler.recs_cache) == 1
+        rec_name, sd_cached, history, include_flag = compiler.recs_cache[0]
+        assert rec_name == "rec_a"
+        assert sd_cached is sd
+        assert history is None
+        assert include_flag is False
+
+    def test_save_results_writes_only_curated_units(self, tmp_path):
+        """
+        With default ``include_failed_units=False`` every unit in the
+        SpikeData is treated as curated; the saved ``sorted.npz`` has a
+        ``units`` entry for every unit_id in the input.
+
+        Tests:
+            (Test Case 1) ``sorted.npz`` exists on disk after save_results.
+            (Test Case 2) The number of compiled units equals sd.N.
+            (Test Case 3) Each compiled unit_id matches an input unit_id.
+        """
+        compiler = _new_compiler()
+        unit_ids = [101, 202, 303]
+        sd = _make_sd_with_unit_ids(unit_ids)
+        compiler.add_recording("rec_a", sd, curation_history=None)
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        npz_path = out_folder / "sorted.npz"
+        assert npz_path.is_file()
+        loaded = np.load(str(npz_path), allow_pickle=True)
+        units = loaded["units"]
+        assert len(units) == len(unit_ids)
+        compiled_ids = {int(u["unit_id"]) for u in units}
+        assert compiled_ids == set(unit_ids)
+
+
+class TestCompilerIncludeFailedUnitsTrue:
+    """
+    Tests for ``Compiler.add_recording(include_failed_units=True)``:
+    failed (non-curated) units are tracked in the pre-curation SpikeData,
+    and the per-unit ``is_curated`` flag computed during ``save_results``
+    is True only for units whose unit_id is in
+    ``curation_history['curated_final']``.
+
+    Pinned current behaviour: ``sorted.npz`` itself only contains
+    ``is_curated=True`` units (the compile_dict loop writes the unit dict
+    only inside ``if is_curated:`` — see pipeline.py:549). To verify the
+    per-unit ``is_curated`` decision, we intercept ``np.savez`` and
+    inspect the compile_dict the Compiler hands to it.
+
+    Tests:
+        (Test Case 1) recs_cache stores include_failed_units=True and
+            the supplied curation_history.
+        (Test Case 2) Only units whose unit_id is in
+            ``curated_final`` end up in the compiled ``sorted.npz``.
+        (Test Case 3) The compile_dict captured pre-savez contains
+            exactly the curated unit_ids — failed units are excluded
+            from the compiled output (current behaviour).
+    """
+
+    def test_recs_cache_records_include_flag_and_history(self):
+        """
+        Tests:
+            (Test Case 1) include_failed_units=True is stored in cache.
+            (Test Case 2) curation_history is stored unchanged.
+        """
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        sd = _make_sd_with_unit_ids([1, 2, 3, 4])
+        history = {"curated_final": [2, 4], "initial": [1, 2, 3, 4]}
+        compiler.add_recording(
+            "rec_a", sd, curation_history=history, include_failed_units=True
+        )
+
+        assert len(compiler.recs_cache) == 1
+        rec_name, sd_cached, hist_cached, include_flag = compiler.recs_cache[0]
+        assert rec_name == "rec_a"
+        assert sd_cached is sd
+        assert hist_cached is history
+        assert include_flag is True
+
+    def test_only_curated_unit_ids_reach_compiled_output(self, tmp_path):
+        """
+        With include_failed_units=True the SpikeData passed in carries
+        every sorter-emitted unit. The is_curated flag is computed from
+        ``curation_history['curated_final']`` membership. The compile
+        loop writes only is_curated units into compile_dict, so the
+        saved ``sorted.npz`` contains exactly the curated ids.
+
+        Tests:
+            (Test Case 1) Compiled unit_ids equal curated_final.
+            (Test Case 2) Failed unit_ids (1, 3) are not in the npz.
+        """
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        all_ids = [1, 2, 3, 4]
+        curated_final = [2, 4]
+        sd = _make_sd_with_unit_ids(all_ids)
+        history = {"curated_final": curated_final, "initial": all_ids}
+        compiler.add_recording(
+            "rec_a", sd, curation_history=history, include_failed_units=True
+        )
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        npz_path = out_folder / "sorted.npz"
+        assert npz_path.is_file()
+        loaded = np.load(str(npz_path), allow_pickle=True)
+        units = loaded["units"]
+        compiled_ids = {int(u["unit_id"]) for u in units}
+        assert compiled_ids == set(curated_final)
+        for failed in (1, 3):
+            assert failed not in compiled_ids
+
+    def test_is_curated_flag_matches_curated_final_membership(self, tmp_path):
+        """
+        Verify the per-unit ``is_curated`` flag computed inside
+        ``save_results``. We monkey-patch ``np.savez`` to capture the
+        ``compile_dict`` the Compiler hands to it. The compile_dict's
+        ``units`` entries should be exactly the curated units (since
+        the inner loop wraps the write in ``if is_curated:``).
+
+        Tests:
+            (Test Case 1) compile_dict was captured.
+            (Test Case 2) Curated unit_ids appear in compile_dict["units"].
+            (Test Case 3) Failed unit_ids do not appear in compile_dict["units"].
+        """
+        import spikelab.spike_sorting.pipeline as pipeline_mod
+
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        all_ids = [10, 20, 30]
+        curated_final = [20]
+        sd = _make_sd_with_unit_ids(all_ids)
+        history = {"curated_final": curated_final, "initial": all_ids}
+        compiler.add_recording(
+            "rec_a", sd, curation_history=history, include_failed_units=True
+        )
+
+        captured = {}
+
+        def fake_savez(path, **kwargs):
+            captured["path"] = path
+            captured["kwargs"] = kwargs
+
+        original_savez = pipeline_mod.np.savez
+        pipeline_mod.np.savez = fake_savez
+        try:
+            compiler.save_results(tmp_path / "out")
+        finally:
+            pipeline_mod.np.savez = original_savez
+
+        assert "kwargs" in captured
+        units = captured["kwargs"]["units"]
+        compiled_ids = {int(u["unit_id"]) for u in units}
+        assert compiled_ids == set(curated_final)
+        assert 10 not in compiled_ids
+        assert 30 not in compiled_ids
+
+
+class TestCompilerIncludeFailedUnitsRaisesWithoutHistory:
+    """
+    Tests for the input validation on ``add_recording``: passing
+    ``include_failed_units=True`` without a usable curation_history
+    must raise ValueError naming the missing ``curated_final`` key.
+
+    Tests:
+        (Test Case 1) curation_history=None raises ValueError.
+        (Test Case 2) curation_history without the curated_final key
+            raises ValueError.
+        (Test Case 3) The error message names ``curated_final``.
+    """
+
+    def test_none_curation_history_raises(self):
+        """
+        Tests:
+            (Test Case 1) ValueError raised when curation_history is None.
+            (Test Case 2) Error message mentions ``curated_final``.
+        """
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        sd = _make_sd_with_unit_ids([1, 2])
+        with pytest.raises(ValueError, match="curated_final"):
+            compiler.add_recording(
+                "rec_a", sd, curation_history=None, include_failed_units=True
+            )
+
+    def test_missing_curated_final_key_raises(self):
+        """
+        Tests:
+            (Test Case 1) ValueError raised when curation_history dict
+                lacks the ``curated_final`` key.
+            (Test Case 2) Error message mentions ``curated_final``.
+        """
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        sd = _make_sd_with_unit_ids([1, 2])
+        history = {"initial": [1, 2]}  # no "curated_final"
+        with pytest.raises(ValueError, match="curated_final"):
+            compiler.add_recording(
+                "rec_a", sd, curation_history=history, include_failed_units=True
+            )
+
+    def test_recs_cache_unchanged_after_raise(self):
+        """
+        Tests:
+            (Test Case 1) recs_cache is empty after a raise (the entry
+                must not be appended on the failure path).
+        """
+        compiler = _new_compiler(include_failed_units_cfg=True)
+        sd = _make_sd_with_unit_ids([1])
+        with pytest.raises(ValueError):
+            compiler.add_recording(
+                "rec_a", sd, curation_history=None, include_failed_units=True
+            )
+        assert compiler.recs_cache == []
+
+
+# ===========================================================================
+# save_traces_mea samp_freq consolidation (commit 888636b)
+# ===========================================================================
+
+
+@skip_no_torch
+@skip_no_spikeinterface
+class TestSaveTracesMeaSampFreqAutoDetect:
+    """
+    Tests for ``save_traces_mea`` reading ``sampling_frequency`` from the
+    recording when ``samp_freq=None`` (commit 888636b removed the hard-
+    coded 20 kHz default).
+
+    Tests:
+        (Test Case 1) With samp_freq=None and a recording reporting
+            10000 Hz, the allocated time axis matches 10 kHz (not 20 kHz).
+        (Test Case 2) An explicit samp_freq overrides the recording.
+
+    Notes:
+        ``save_traces_mea`` requires torch (transitively via the rt_sort
+        package's model.py top-level import). Tests skip when torch is
+        unavailable. The h5py + MaxwellRecordingExtractor + memmap +
+        thread-map are all mocked so the test stays hermetic.
+    """
+
+    @pytest.fixture()
+    def patched_save_traces_mea(self, monkeypatch):
+        """Patch h5py.File, MaxwellRecordingExtractor, open_memmap,
+        and _thread_map inside _algorithm so save_traces_mea is
+        hermetically callable. Returns the captured-allocations dict."""
+        import spikelab.spike_sorting.rt_sort._algorithm as algo
+
+        captured = {}
+
+        # Mock h5py.File: behave like a dict-of-groups with "sig" key.
+        class _FakeH5:
+            def __init__(self, path, *a, **kw):
+                pass
+
+            def __contains__(self, key):
+                return key == "sig"
+
+            def __getitem__(self, key):
+                if key == "sig":
+                    return np.zeros((0, 0))
+                raise KeyError(key)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(algo, "h5py", SimpleNamespace(File=_FakeH5))
+
+        # Mock MaxwellRecordingExtractor with parameterizable fs.
+        def make_extractor(fs_hz, n_chan=4, n_samples=1_000_000):
+            ext = SimpleNamespace()
+            ext.get_sampling_frequency = lambda: fs_hz
+            ext.get_channel_ids = lambda: list(range(n_chan))
+            ext.get_num_channels = lambda: n_chan
+            ext.get_total_samples = lambda: n_samples
+            ext.has_scaleable_traces = lambda: False
+            return ext
+
+        # Mock open_memmap to capture the requested shape without
+        # touching the filesystem.
+        def fake_open_memmap(path, mode, dtype, shape):
+            captured["shape"] = shape
+            captured["dtype"] = dtype
+            captured["save_path"] = path
+            # Return a real ndarray-like object that supports __del__.
+            return np.empty(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            algo.np.lib.format, "open_memmap", fake_open_memmap, raising=True
+        )
+
+        # No-op _thread_map: just iterate the tasks list silently.
+        def fake_thread_map(num_workers, fn, items):
+            captured["n_tasks"] = len(list(items))
+            return iter([])
+
+        monkeypatch.setattr(algo, "_thread_map", fake_thread_map)
+        monkeypatch.setattr(algo, "tqdm", lambda x, **k: x)
+        return algo, captured, make_extractor
+
+    def test_samp_freq_none_reads_from_recording(self, patched_save_traces_mea):
+        """
+        Tests:
+            (Test Case 1) With recording reporting 10000 Hz and
+                end_ms=100, the allocated time axis is round(100*10) = 1000
+                samples (not the historical 20*100 = 2000).
+        """
+        algo, captured, make_extractor = patched_save_traces_mea
+        # Replace MaxwellRecordingExtractor inside the module with a
+        # constructor that returns our 10kHz fake.
+        algo.MaxwellRecordingExtractor = lambda path: make_extractor(
+            fs_hz=10000.0, n_chan=4
+        )
+
+        algo.save_traces_mea(
+            rec_path="not-a-real-path.h5",
+            save_path="dummy.npy",
+            start_ms=0,
+            end_ms=100,
+            samp_freq=None,
+            num_processes=1,
+            verbose=False,
+        )
+
+        # samp_freq derived from recording = 10000/1000 = 10 kHz.
+        # end_frame - start_frame = round(100*10) - round(0*10) = 1000.
+        assert captured["shape"] == (4, 1000)
+
+    def test_samp_freq_explicit_overrides_recording(self, patched_save_traces_mea):
+        """
+        Tests:
+            (Test Case 1) Explicit samp_freq=15 (kHz) overrides the
+                recording's reported 10000 Hz. With end_ms=100 the
+                allocated axis is round(100*15) = 1500 samples.
+        """
+        algo, captured, make_extractor = patched_save_traces_mea
+        algo.MaxwellRecordingExtractor = lambda path: make_extractor(
+            fs_hz=10000.0, n_chan=4
+        )
+
+        algo.save_traces_mea(
+            rec_path="not-a-real-path.h5",
+            save_path="dummy.npy",
+            start_ms=0,
+            end_ms=100,
+            samp_freq=15.0,
+            num_processes=1,
+            verbose=False,
+        )
+
+        # samp_freq=15 kHz overrides recording 10000 Hz → 100*15 = 1500.
+        assert captured["shape"] == (4, 1500)
+
+
+# ===========================================================================
+# KilosortSortingExtractor cluster_id int coercion (commit 0d91204)
+# ===========================================================================
+
+
+@skip_no_spikeinterface
+@skip_no_pandas
+class TestKilosortSortingExtractorClusterIdCoercion:
+    """
+    Tests for the up-front int coercion of the ``cluster_id`` column in
+    ``KilosortSortingExtractor.__init__``. Pandas infers dtypes per
+    column on read, so a TSV that writes ids as ``1.0`` (float literal)
+    or ``"001"`` (zero-padded string) ends up as float or object dtype.
+    The extractor must coerce these to int up front and surface a clean
+    ValueError on non-coercible values.
+
+    Tests:
+        (Test Case 1) Float cluster_id (``1.0, 2.0``) is coerced to int.
+        (Test Case 2) Zero-padded string cluster_id (``"001", "002"``)
+            is coerced to int.
+        (Test Case 3) Non-coercible cluster_id (``"abc"``) raises
+            ValueError naming the dtype and the underlying error.
+    """
+
+    def test_float_cluster_id_coerced_to_int(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) TSV with cluster_id 1.0, 2.0 succeeds.
+            (Test Case 2) unit_ids are returned as ints.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+
+        spike_times = np.array([10, 20, 100, 200], dtype=np.int64)
+        spike_clusters = np.array([1, 1, 2, 2], dtype=np.int64)
+        _write_ks_folder(tmp_path, spike_times, spike_clusters)
+        # Overwrite with floats so pandas reads as float dtype.
+        (tmp_path / "cluster_info.tsv").write_text(
+            "cluster_id\tgroup\n1.0\tgood\n2.0\tgood"
+        )
+
+        kse = KilosortSortingExtractor(tmp_path)
+        assert set(kse.unit_ids) == {1, 2}
+        for uid in kse.unit_ids:
+            assert isinstance(uid, int)
+
+    def test_zero_padded_string_cluster_id_coerced_to_int(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) TSV with cluster_id "001", "002" succeeds.
+            (Test Case 2) unit_ids are returned as plain ints (not "001").
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+
+        spike_times = np.array([10, 20, 100, 200], dtype=np.int64)
+        spike_clusters = np.array([1, 1, 2, 2], dtype=np.int64)
+        _write_ks_folder(tmp_path, spike_times, spike_clusters)
+        # Overwrite with zero-padded strings (object dtype on read).
+        (tmp_path / "cluster_info.tsv").write_text(
+            'cluster_id\tgroup\n"001"\tgood\n"002"\tgood'
+        )
+
+        kse = KilosortSortingExtractor(tmp_path)
+        assert set(kse.unit_ids) == {1, 2}
+        for uid in kse.unit_ids:
+            assert isinstance(uid, int)
+
+    def test_non_coercible_cluster_id_raises_valueerror(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) TSV with non-numeric cluster_id raises ValueError.
+            (Test Case 2) Error message names the offending dtype.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+
+        spike_times = np.array([10, 20], dtype=np.int64)
+        spike_clusters = np.array([1, 1], dtype=np.int64)
+        _write_ks_folder(tmp_path, spike_times, spike_clusters)
+        (tmp_path / "cluster_info.tsv").write_text(
+            "cluster_id\tgroup\nabc\tgood\ndef\tgood"
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            KilosortSortingExtractor(tmp_path)
+        msg = str(exc_info.value)
+        assert "cluster_id" in msg
+        # The error message includes the dtype (object) of the offending
+        # column. Accept either "object" or "dtype" so the test stays
+        # robust to formatting tweaks.
+        assert "dtype" in msg.lower() or "object" in msg.lower()

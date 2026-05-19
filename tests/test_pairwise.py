@@ -2669,3 +2669,111 @@ class TestPairwiseToNetworkxThresholdNaN:
         G = pcm.to_networkx(threshold=np.nan)
         assert G.number_of_edges() == 0
         assert G.number_of_nodes() == 3
+
+
+# ============================================================================
+# Parallel-session source: PairwiseCompMatrix(Stack).threshold(preserve_nan=True)
+# Commit 57c0d8a — pins the opt-in NaN-preservation contract.
+# ============================================================================
+
+
+class TestPairwiseCompMatrixThresholdPreserveNan:
+    """``PairwiseCompMatrix.threshold(preserve_nan=True)`` keeps NaN
+    positions in the binary output instead of coercing them to 0.
+    Non-NaN positions still binarize to 0 / 1 per the usual rule.
+    """
+
+    def test_preserve_nan_keeps_nan_positions(self):
+        """
+        Tests:
+            (Test Case 1) NaN cells in the input remain NaN in the
+                thresholded output.
+            (Test Case 2) Non-NaN cells above the threshold map to 1.0.
+            (Test Case 3) Non-NaN cells below the threshold map to 0.0.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        mat = np.array(
+            [
+                [1.0, 0.8, np.nan],
+                [0.8, 1.0, 0.2],
+                [np.nan, 0.2, 1.0],
+            ]
+        )
+        pcm = PairwiseCompMatrix(matrix=mat)
+        out = pcm.threshold(threshold=0.5, preserve_nan=True)
+
+        # NaN positions preserved.
+        assert np.isnan(out.matrix[0, 2])
+        assert np.isnan(out.matrix[2, 0])
+        # Above-threshold cells binarize to 1.
+        assert out.matrix[0, 0] == 1.0
+        assert out.matrix[0, 1] == 1.0
+        # Below-threshold cells binarize to 0.
+        assert out.matrix[1, 2] == 0.0
+        assert out.matrix[2, 1] == 0.0
+
+    def test_preserve_nan_false_default_coerces_nan_to_zero(self):
+        """Regression guard on the default behaviour (preserve_nan=False).
+
+        Tests:
+            (Test Case 1) Default keeps the historical contract: NaN
+                cells become 0 (not preserved).
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        mat = np.array([[1.0, np.nan], [np.nan, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        out = pcm.threshold(threshold=0.5)  # default preserve_nan=False
+        assert not np.isnan(out.matrix).any()
+        # NaN positions specifically resolve to 0 (abs(NaN) > 0.5 is False).
+        assert out.matrix[0, 1] == 0.0
+        assert out.matrix[1, 0] == 0.0
+
+
+class TestPairwiseCompMatrixStackThresholdPreserveNan:
+    """``PairwiseCompMatrixStack.threshold(preserve_nan=True)`` — same
+    contract as the per-matrix variant, applied across the stack axis.
+    """
+
+    def test_preserve_nan_keeps_nan_positions_in_stack(self):
+        """
+        Tests:
+            (Test Case 1) NaN positions in any slice remain NaN in the
+                same slice of the thresholded stack.
+            (Test Case 2) Non-NaN positions binarize per the usual rule.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        stack = np.stack(
+            [
+                np.array([[1.0, 0.8], [0.8, 1.0]]),
+                np.array([[1.0, np.nan], [np.nan, 1.0]]),
+            ],
+            axis=2,
+        )
+        s = PairwiseCompMatrixStack(stack=stack)
+        out = s.threshold(threshold=0.5, preserve_nan=True)
+
+        # Slice 0: no NaN, regular binarization.
+        assert out.stack[0, 0, 0] == 1.0
+        assert out.stack[0, 1, 0] == 1.0
+        # Slice 1: NaN preserved off-diagonal, diagonal 1.0 stays 1.0.
+        assert np.isnan(out.stack[0, 1, 1])
+        assert np.isnan(out.stack[1, 0, 1])
+        assert out.stack[0, 0, 1] == 1.0
+        assert out.stack[1, 1, 1] == 1.0
+
+    def test_preserve_nan_false_default_coerces_nan_to_zero_in_stack(self):
+        """
+        Tests:
+            (Test Case 1) Default preserve_nan=False coerces NaN to 0
+                across every slice of the stack.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        stack = np.array([[[np.nan]], [[np.nan]]]).reshape(1, 1, 2)
+        s = PairwiseCompMatrixStack(stack=stack)
+        out = s.threshold(threshold=0.5)
+        assert not np.isnan(out.stack).any()
+        assert (out.stack == 0.0).all()

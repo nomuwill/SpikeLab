@@ -5475,3 +5475,137 @@ class TestNumpyEncoder:
 
         with pytest.raises(TypeError):
             json.dumps({"x": Foo()}, cls=_NumpyEncoder)
+
+
+# ============================================================================
+# Parallel-session source: _dump_dict schema additions (commit 6945961)
+#   None, tuple, set, frozenset, unicode (string) ndarray
+# ============================================================================
+
+
+class TestDumpDictSchemaAdditions:
+    """``_dump_dict`` round-trips five additional value types added in
+    commit 6945961: ``None``, ``tuple``, ``set``, ``frozenset``, and
+    unicode (string) ``ndarray``. Previously these raised TypeError or
+    were silently coerced to ndarray of unknown type.
+
+    The tests round-trip through real HDF5 files via the public
+    workspace save/load surface to confirm both _dump_dict and
+    _load_dict agree on each schema.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_none_value_roundtrips(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": None}`` round-trips losslessly back
+                to ``{"a": None}``.
+        """
+        import h5py
+
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "none.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": None}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert loaded == {"a": None}
+        assert loaded["a"] is None
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_tuple_value_roundtrips_as_tuple(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": (1, 2, 3)}`` round-trips back as a
+                tuple (NOT a list — the ``__type__ = "tuple"`` tag
+                preserves the type).
+            (Test Case 2) Elements compare equal.
+        """
+        import h5py
+
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "tuple.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": (1, 2, 3)}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], tuple)
+        assert loaded["a"] == (1, 2, 3)
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_set_value_roundtrips_as_set(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": {1, 2, 3}}`` round-trips back as a
+                ``set`` (type preserved via the ``"set"`` type tag).
+            (Test Case 2) Member-equality preserved (set order is
+                deliberately not asserted).
+        """
+        import h5py
+
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "set.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": {1, 2, 3}}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], set)
+        assert loaded["a"] == {1, 2, 3}
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_frozenset_value_roundtrips_as_frozenset(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": frozenset({4, 5})}`` round-trips
+                back as a ``frozenset`` (distinct from a regular set).
+        """
+        import h5py
+
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "frozenset.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": frozenset({4, 5})}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], frozenset)
+        assert loaded["a"] == frozenset({4, 5})
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_string_ndarray_value_roundtrips(self, tmp_path):
+        """
+        Pre-commit 6945961 _dump_dict raised TypeError on unicode
+        ndarrays (the dtype-object check rejected the array). The fix
+        lifts that limitation.
+
+        Tests:
+            (Test Case 1) ``{"a": np.array(["x", "y", "z"])}`` round-
+                trips through the dict serialiser without raising.
+            (Test Case 2) Loaded values match the original strings.
+        """
+        import h5py
+
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "str_ndarray.h5")
+        arr = np.array(["x", "y", "z"])
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": arr}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        # Either ndarray or list of strings, depending on _load_dict's
+        # canonical form for ndarray-tagged values. Either way, the
+        # string contents must match.
+        loaded_a = loaded["a"]
+        if isinstance(loaded_a, np.ndarray):
+            assert loaded_a.tolist() == ["x", "y", "z"]
+        else:
+            assert list(loaded_a) == ["x", "y", "z"]

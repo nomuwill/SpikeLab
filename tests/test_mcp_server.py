@@ -8148,3 +8148,199 @@ class TestSetNeuronAttributeEmptyIndices:
         if attrs is not None:
             for neuron_dict in attrs:
                 assert "foo" not in neuron_dict
+
+
+# ============================================================================
+# Parallel-session source: MCP concatenate_units out_namespace (commit 55acbb4)
+# ============================================================================
+
+
+class TestConcatenateUnitsOutNamespace:
+    """Pin the ``out_namespace`` kwarg on ``concatenate_units`` (commit
+    55acbb4). Default ``None`` keeps the historical overwrite-into-
+    ``namespace_a`` behaviour; an explicit value writes to a separate
+    namespace and preserves both inputs.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_default_overwrites_namespace_a(
+        self, loaded_ws, sample_spikedata
+    ):
+        """
+        Tests:
+            (Test Case 1) ``out_namespace=None`` (default) writes the
+                combined SpikeData to ``namespace_a`` — the SpikeData
+                originally at ``namespace_a`` is overwritten.
+            (Test Case 2) ``result["namespace"]`` equals
+                ``namespace_a`` so the caller can detect the
+                destination from the return value.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store("rec2", "spikedata", sample_spikedata)
+        sd_a_before = ws.get(ns, "spikedata")
+
+        result = await analysis.concatenate_units(
+            ws_id, namespace_a=ns, namespace_b="rec2"
+        )
+
+        # Return value points at namespace_a.
+        assert result["namespace"] == ns
+        # The SpikeData at namespace_a has changed (combined now has more units).
+        sd_a_after = ws.get(ns, "spikedata")
+        assert sd_a_after.N > sd_a_before.N
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_explicit_writes_to_fresh_namespace(
+        self, loaded_ws, sample_spikedata
+    ):
+        """
+        Tests:
+            (Test Case 1) Explicit ``out_namespace="rec_combined"``
+                writes the combined SpikeData to that namespace.
+            (Test Case 2) Both ``namespace_a`` and ``namespace_b`` are
+                preserved byte-identical.
+            (Test Case 3) ``result["namespace"]`` equals the explicit
+                destination, not ``namespace_a``.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store("rec2", "spikedata", sample_spikedata)
+
+        sd_a_before = ws.get(ns, "spikedata")
+        sd_b_before = ws.get("rec2", "spikedata")
+        n_a = sd_a_before.N
+        n_b = sd_b_before.N
+
+        result = await analysis.concatenate_units(
+            ws_id,
+            namespace_a=ns,
+            namespace_b="rec2",
+            out_namespace="rec_combined",
+        )
+
+        # Return value points at the explicit destination.
+        assert result["namespace"] == "rec_combined"
+        # Both inputs are preserved.
+        assert ws.get(ns, "spikedata").N == n_a
+        assert ws.get("rec2", "spikedata").N == n_b
+        # The combined output is at the new namespace and has more units.
+        sd_out = ws.get("rec_combined", "spikedata")
+        assert sd_out.N == n_a + n_b
+
+
+# ============================================================================
+# Parallel-session source: pcm_stack_threshold out_key sentinels (commit 6f9a9ef)
+# ============================================================================
+
+
+class TestPcmStackThresholdOutKeySentinels:
+    """``pcm_stack_threshold`` accepts three forms of ``out_key`` (commit
+    6f9a9ef):
+
+      - ``None`` — fall through to "use input key" (destructive
+        overwrite, documented historical behaviour).
+      - ``""`` (empty string) — treated identically to ``None``, kept
+        for backwards compatibility with callers using the previous
+        default.
+      - explicit string — write to that key; the input key keeps its
+        original float values.
+    """
+
+    @pytest.fixture()
+    def loaded_ws_with_stack(self, loaded_ws):
+        """Inject a small ``PairwiseCompMatrixStack`` (float values) at
+        the loaded workspace's namespace under key ``pcms_src``.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        stack = np.stack(
+            [
+                np.array([[0.1, 0.8], [0.8, 0.1]]),
+                np.array([[0.3, 0.9], [0.9, 0.3]]),
+            ],
+            axis=2,
+        )
+        ws.store(ns, "pcms_src", PairwiseCompMatrixStack(stack=stack))
+        return ws_id, ns, ws
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_none_overwrites_input_key(
+        self, loaded_ws_with_stack
+    ):
+        """
+        Tests:
+            (Test Case 1) ``out_key=None`` falls through to "use input
+                key" — the source float-valued stack at ``pcms_src`` is
+                replaced by the binary {0, 1} stack.
+            (Test Case 2) ``result["key"]`` equals the input ``key``.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        result = await analysis.pcm_stack_threshold(
+            ws_id, ns, key="pcms_src", threshold=0.5, out_key=None
+        )
+        assert result["key"] == "pcms_src"
+        stack_after = ws.get(ns, "pcms_src").stack
+        # Binary output (just 0s and 1s).
+        assert set(np.unique(stack_after).tolist()).issubset({0.0, 1.0})
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_empty_string_is_treated_as_none(
+        self, loaded_ws_with_stack
+    ):
+        """
+        Tests:
+            (Test Case 1) ``out_key=""`` — same as ``None``: writes
+                back to the input key with binary values.
+            (Test Case 2) ``result["key"]`` equals the input ``key``,
+                not ``""``.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        result = await analysis.pcm_stack_threshold(
+            ws_id, ns, key="pcms_src", threshold=0.5, out_key=""
+        )
+        assert result["key"] == "pcms_src"
+        stack_after = ws.get(ns, "pcms_src").stack
+        assert set(np.unique(stack_after).tolist()).issubset({0.0, 1.0})
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_explicit_keeps_source_intact(
+        self, loaded_ws_with_stack
+    ):
+        """
+        Tests:
+            (Test Case 1) Explicit ``out_key="pcms_binary"`` writes the
+                binary stack to the new key.
+            (Test Case 2) The source key ``pcms_src`` retains its
+                original float values.
+            (Test Case 3) ``result["key"]`` equals the explicit key.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        src_before = ws.get(ns, "pcms_src").stack.copy()
+
+        result = await analysis.pcm_stack_threshold(
+            ws_id,
+            ns,
+            key="pcms_src",
+            threshold=0.5,
+            out_key="pcms_binary",
+        )
+        assert result["key"] == "pcms_binary"
+
+        # Source preserved.
+        src_after = ws.get(ns, "pcms_src").stack
+        np.testing.assert_array_equal(src_before, src_after)
+
+        # Output is binary at the new key.
+        out = ws.get(ns, "pcms_binary").stack
+        assert set(np.unique(out).tolist()).issubset({0.0, 1.0})

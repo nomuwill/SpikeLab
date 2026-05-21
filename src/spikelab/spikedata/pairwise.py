@@ -55,7 +55,11 @@ class PairwiseCompMatrix:
 
         Parameters:
             threshold (float or None): If provided, only edges with absolute
-                weight > threshold will be included.
+                weight > threshold will be included. ``None`` means "no
+                threshold" (every non-NaN off-diagonal entry becomes an
+                edge). NaN/Inf raise :class:`ValueError` — a NaN threshold
+                silently produced an edge-free graph in earlier versions
+                because ``abs(weight) > NaN`` is always False.
             invert_weights (bool): If True, edge weights are set to
                 (1 - value) instead of value. This is useful for weighted
                 network metrics like shortest path length, where strong
@@ -65,6 +69,9 @@ class PairwiseCompMatrix:
         Returns:
             G (networkx.Graph): The exported graph.
 
+        Raises:
+            ValueError: If ``threshold`` is NaN or infinite.
+
         Notes:
             When using NetworkX for weighted shortest path algorithms (e.g.,
             ``nx.shortest_path_length``), edge weights are interpreted as
@@ -73,6 +80,18 @@ class PairwiseCompMatrix:
             - Strong correlation (0.9) -> weight 0.1 (short path)
             - Weak correlation (0.1) -> weight 0.9 (long path)
         """
+        # Boundary guard: NaN/Inf threshold almost always indicates a
+        # config bug (e.g. unguarded division producing NaN). Raise
+        # rather than silently returning an edge-free graph.
+        if threshold is not None:
+            t = float(threshold)
+            if np.isnan(t) or np.isinf(t):
+                raise ValueError(
+                    f"threshold must be a finite number or None, "
+                    f"got {threshold!r}."
+                )
+            threshold = t
+
         try:
             import networkx as nx
         except ImportError:

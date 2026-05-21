@@ -2642,33 +2642,40 @@ class TestPairwiseCompMatrixStackTimesShapeMismatch:
 
 
 class TestPairwiseToNetworkxThresholdNaN:
-    """``PairwiseCompMatrix.to_networkx(threshold=NaN)``: the edge
-    filter ``abs(weight) > threshold`` returns False for every
-    comparison against NaN (NaN comparisons propagate to False), so
-    no edges are added. Nodes are still added (one per matrix row).
+    """``PairwiseCompMatrix.to_networkx(threshold=NaN | Inf)``: the
+    source now raises ``ValueError`` rather than silently producing
+    an edge-free graph (which was the prior behavior — ``abs(weight)
+    > NaN`` is always False so no edges were added).
 
-    This pins existing behavior — see REVIEW.md for the gap on
-    silently dropping all edges when threshold is NaN (a clearer
-    contract would be to raise).
+    A NaN/Inf threshold almost always indicates a config bug, so the
+    raise turns a silent corruption into an actionable error.
     """
 
-    def test_threshold_nan_yields_no_edges(self):
+    def test_threshold_nan_raises_value_error(self):
         """
-        Passing ``threshold=NaN`` filters out every candidate edge
-        because ``abs(value) > NaN`` is always False. Nodes are still
-        added; the resulting graph has the expected node count and
-        zero edges.
-
         Tests:
-            (Test Case 1) ``G.number_of_edges() == 0``.
-            (Test Case 2) ``G.number_of_nodes() == matrix.shape[0]``.
-            (Test Case 3) No exception is raised.
+            (Test Case 1) ``threshold=NaN`` raises ValueError.
+            (Test Case 2) The error message mentions "finite number or
+                None" and the offending value.
         """
         mat = np.array([[1.0, 0.5, 0.3], [0.5, 1.0, 0.8], [0.3, 0.8, 1.0]])
         pcm = PairwiseCompMatrix(matrix=mat)
-        G = pcm.to_networkx(threshold=np.nan)
-        assert G.number_of_edges() == 0
-        assert G.number_of_nodes() == 3
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=np.nan)
+
+    def test_threshold_inf_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold=+Inf`` raises ValueError (also
+                covered by the finite-check guard).
+            (Test Case 2) ``threshold=-Inf`` also raises.
+        """
+        mat = np.array([[1.0, 0.5], [0.5, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=np.inf)
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=-np.inf)
 
 
 # ============================================================================

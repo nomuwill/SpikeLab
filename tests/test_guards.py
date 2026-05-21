@@ -13823,73 +13823,158 @@ class TestRunPreflightDuckTypedIterables:
 
 
 class TestComputeInactivityTimeoutSNaNBaseAndMax:
-    """``compute_inactivity_timeout_s`` NaN handling for ``base_s`` and
-    ``max_s``.
+    """``compute_inactivity_timeout_s`` strict NaN handling on config
+    parameters.
 
-    The source explicitly guards ``recording_duration_min=NaN``
-    (coerces to zero), but the symmetric NaN cases on ``base_s`` and
-    ``max_s`` are NOT guarded. Pin the existing behaviour as
-    documented gaps:
+    The source treats ``recording_duration_min`` as runtime metadata
+    (defensively coerced — NaN/None/numpy-NaN → 0.0) but treats
+    ``base_s``, ``per_min_s``, and ``max_s`` as config parameters
+    where NaN/Inf almost always indicates a configuration bug.
+    Config-param NaN raises :class:`ValueError` with a clear
+    "must be a finite number" message rather than silently producing
+    a NaN timeout (which would propagate through every downstream
+    comparison and disable the watchdog).
 
-    * ``base_s=NaN`` propagates NaN through ``float(base_s) + ...`` and
-      returns NaN, which silently disables every downstream comparison
-      (``inactivity >= NaN`` is always False). Watchdog becomes a
-      no-op.
-    * ``max_s=NaN`` does NOT propagate the same way on CPython because
-      ``min(x, nan)`` returns ``x`` (the first operand) — the timeout
-      survives intact. This is platform-dependent in principle, but
-      CPython's stable ``min`` semantics make it deterministic.
-
-    Both are gaps the source's docstring promises to handle. Pin
-    behaviour so a later strict-NaN-guard fix has a regression target.
+    The ``recording_duration_min`` asymmetry is intentional: upstream
+    metadata is often malformed in ways the operator cannot control,
+    so defensive coercion is appropriate there. Config parameters
+    are caller-controlled — fail loudly on bogus input.
     """
 
-    def test_base_s_nan_returns_nan(self):
+    def test_base_s_nan_raises(self):
         """
-        ``base_s=NaN`` propagates NaN through the formula. The result
-        is a NaN float, which silently disables the watchdog.
+        ``base_s=NaN`` raises :class:`ValueError` (config-param strict
+        guard).
 
         Tests:
-            (Test Case 1) Result is NaN (``math.isnan`` returns True).
-            (Test Case 2) Source oddity: this is an unguarded NaN
-                input — pinned, not fixed.
+            (Test Case 1) Call raises ``ValueError`` with
+                "base_s must be a finite number" substring.
+            (Test Case 2) The result is never silently a NaN float.
         """
         from spikelab.spike_sorting.guards._inactivity import (
             compute_inactivity_timeout_s,
         )
 
-        result = compute_inactivity_timeout_s(
-            recording_duration_min=10.0,
-            base_s=float("nan"),
-            per_min_s=30.0,
-            max_s=7200.0,
-        )
-        assert math.isnan(result)
+        with pytest.raises(ValueError, match="base_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=float("nan"),
+                per_min_s=30.0,
+                max_s=7200.0,
+            )
 
-    def test_max_s_nan_returns_finite(self):
+    def test_max_s_nan_raises(self):
         """
-        ``max_s=NaN`` does NOT propagate to the result because the
-        ``min(timeout, NaN)`` call returns ``timeout`` (CPython
-        deterministic). The watchdog timeout stays finite.
+        ``max_s=NaN`` raises :class:`ValueError` rather than silently
+        skipping the cap. (Pre-fix: ``min(timeout, NaN)`` on CPython
+        returned ``timeout`` and let the cap silently disappear.)
 
         Tests:
-            (Test Case 1) Result is the un-capped timeout
-                (``base_s + per_min_s * duration``).
-            (Test Case 2) Result is not NaN.
+            (Test Case 1) Call raises ``ValueError`` with
+                "max_s must be a finite number" substring.
+            (Test Case 2) ``max_s=None`` still means "no cap" — that
+                sentinel remains the canonical way to disable the
+                cap; NaN is NOT a synonym.
         """
         from spikelab.spike_sorting.guards._inactivity import (
             compute_inactivity_timeout_s,
         )
 
+        with pytest.raises(ValueError, match="max_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=600.0,
+                per_min_s=30.0,
+                max_s=float("nan"),
+            )
+        # Confirm None still means "no cap"
         result = compute_inactivity_timeout_s(
-            recording_duration_min=10.0,
+            recording_duration_min=1000.0,
             base_s=600.0,
             per_min_s=30.0,
-            max_s=float("nan"),
+            max_s=None,
         )
-        # base + per_min * 10 = 600 + 300 = 900
-        assert result == 900.0
-        assert not math.isnan(result)
+        assert result == 600.0 + 30.0 * 1000.0
+
+    def test_per_min_s_nan_raises(self):
+        """
+        ``per_min_s=NaN`` raises :class:`ValueError` (config-param
+        strict guard). Pre-fix this would propagate NaN through
+        ``per_min_s * duration``.
+
+        Tests:
+            (Test Case 1) Call raises ``ValueError`` with
+                "per_min_s must be a finite number" substring.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(
+            ValueError, match="per_min_s must be a finite number"
+        ):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=600.0,
+                per_min_s=float("nan"),
+                max_s=7200.0,
+            )
+
+    def test_config_inf_also_raises(self):
+        """
+        ``Inf`` config values raise too (same boundary-guard contract).
+
+        Tests:
+            (Test Case 1) ``base_s=inf`` raises.
+            (Test Case 2) ``max_s=inf`` raises (use ``None`` for "no cap").
+            (Test Case 3) ``per_min_s=-inf`` raises.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(ValueError, match="base_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, base_s=float("inf")
+            )
+        with pytest.raises(ValueError, match="max_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, max_s=float("inf")
+            )
+        with pytest.raises(
+            ValueError, match="per_min_s must be a finite number"
+        ):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, per_min_s=float("-inf")
+            )
+
+    def test_recording_duration_min_nan_still_defensive(self):
+        """
+        ``recording_duration_min=NaN`` is asymmetric — it's runtime
+        metadata, not a config parameter, so defensive coercion
+        (NaN/None → 0.0) is preserved.
+
+        Tests:
+            (Test Case 1) ``recording_duration_min=float('nan')`` →
+                returns ``base_s`` (i.e. the duration coerced to 0).
+            (Test Case 2) ``recording_duration_min=None`` → same.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=float("nan"),
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=None,
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
 
 
 class TestHostMemoryWatchdogDoubleEnter:

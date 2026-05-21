@@ -44,7 +44,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
@@ -217,6 +217,33 @@ def make_in_process_kill_callback(
     return _callback
 
 
+def _require_finite(
+    name: str, value: Any, *, allow_none: bool = False
+) -> Optional[float]:
+    """Reject NaN/Inf at the config-param boundary with a clear error.
+
+    Used by :func:`compute_inactivity_timeout_s` for config parameters
+    (``base_s``, ``per_min_s``, ``max_s``) where NaN almost always
+    indicates a configuration bug rather than legitimate degenerate
+    metadata. Asymmetric with the function's ``recording_duration_min``
+    parameter, which is runtime metadata read from a recording file —
+    NaN there is silently coerced to 0.0 because the upstream is messy
+    and the operator can't always control it.
+    """
+    if allow_none and value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a finite number, got {value!r} "
+            f"({type(value).__name__})."
+        ) from exc
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    return v
+
+
 def compute_inactivity_timeout_s(
     *,
     recording_duration_min: float,
@@ -228,28 +255,46 @@ def compute_inactivity_timeout_s(
 
     Parameters:
         recording_duration_min (float): Recording length in minutes.
-            Negative or NaN values are clamped to zero.
+            **Runtime metadata** — defensively coerced: negative or
+            NaN values become 0.0, numpy scalars are accepted. A
+            malformed upstream never produces a NaN timeout.
         base_s (float): Minimum tolerance applied even for tiny
-            recordings. Defaults to 600 (10 min).
+            recordings. Defaults to 600 (10 min). **Config parameter**
+            — rejected with :class:`ValueError` if NaN or Inf.
         per_min_s (float): Extra seconds of tolerance per minute of
-            recording. Defaults to 30.
+            recording. Defaults to 30. **Config parameter** —
+            rejected with :class:`ValueError` if NaN or Inf.
         max_s (float or None): Hard cap on the tolerance. ``None``
-            means no cap. Defaults to 7200 (2 h).
+            means no cap. Defaults to 7200 (2 h). **Config parameter**
+            — rejected with :class:`ValueError` if NaN or Inf (use
+            ``None`` for "no cap"; NaN-as-no-cap would overload the
+            sentinel and hide misconfig bugs).
 
     Returns:
         timeout_s (float): Resolved inactivity tolerance in seconds.
+
+    Raises:
+        ValueError: If ``base_s``, ``per_min_s``, or ``max_s`` is
+            NaN, Inf, or not coercible to ``float``.
     """
-    # NaN is truthy in Python, so ``recording_duration_min or 0.0``
-    # leaves NaN intact. ``max(0.0, NaN)`` returns NaN on CPython.
-    # Coerce NaN/None to 0 before arithmetic so a malfunctioning
-    # upstream never produces a NaN timeout (NaN comparisons would
-    # silently disable the watchdog). The previous ``isinstance(raw,
-    # float)`` check missed numpy scalars (``np.float64``,
-    # ``np.float32``) which are not Python ``float`` instances — NaN
-    # values coming from numpy-typed metadata could slip through.
-    # ``math.isnan`` accepts any real-valued scalar, so guard
-    # ``isinstance`` widely against types ``math.isnan`` rejects
-    # (str, list, etc.).
+    # Config params: strict boundary guard. NaN/Inf in these almost
+    # always indicates a config bug (typo, leaked computation,
+    # missing default); silently propagating produces a NaN timeout
+    # that disables the watchdog without any signal.
+    base_s = _require_finite("base_s", base_s)
+    per_min_s = _require_finite("per_min_s", per_min_s)
+    max_s = _require_finite("max_s", max_s, allow_none=True)
+
+    # Runtime metadata: defensive coerce. NaN is truthy in Python, so
+    # ``recording_duration_min or 0.0`` leaves NaN intact. ``max(0.0,
+    # NaN)`` returns NaN on CPython. Coerce NaN/None to 0 before
+    # arithmetic so a malformed upstream never produces a NaN
+    # timeout. The previous ``isinstance(raw, float)`` check missed
+    # numpy scalars (``np.float64``, ``np.float32``) which are not
+    # Python ``float`` instances — NaN values coming from
+    # numpy-typed metadata could slip through. ``math.isnan``
+    # accepts any real-valued scalar, so guard ``isinstance`` widely
+    # against types ``math.isnan`` rejects (str, list, etc.).
     raw = recording_duration_min
     is_nan = False
     if raw is not None:
@@ -261,9 +306,9 @@ def compute_inactivity_timeout_s(
         duration = 0.0
     else:
         duration = max(0.0, float(raw))
-    timeout = float(base_s) + float(per_min_s) * duration
+    timeout = base_s + per_min_s * duration
     if max_s is not None:
-        timeout = min(timeout, float(max_s))
+        timeout = min(timeout, max_s)
     return timeout
 
 

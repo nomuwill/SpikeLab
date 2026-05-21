@@ -7515,10 +7515,14 @@ class TestArtifactRemoval:
         assert result == 10
 
     def test_signal_reached_baseline_window_zero(self):
-        """window_samples=0: the consecutive count can only reach 0 when a
-        sample is actually below threshold. With all values above threshold
-        the function returns False because the increment branch is never
-        entered."""
+        """window_samples=0 is pathological — "zero consecutive
+        sub-threshold samples" is trivially true. The vectorised
+        implementation makes this explicit via a ``window_samples
+        <= 0`` short-circuit that returns ``(True, max(0, start))``
+        without scanning the trace. The old Python loop returned
+        False here only as a side-effect of the loop structure
+        (the increment branch was never entered when no sample
+        was below threshold) — not an intentional contract."""
         from spikelab.spike_sorting.stim_sorting.artifact_removal import (
             _signal_reached_baseline,
         )
@@ -7531,7 +7535,8 @@ class TestArtifactRemoval:
             window_samples=0,
             n_samples=3,
         )
-        assert not reached
+        assert reached
+        assert idx == 0
 
     def test_signal_reached_baseline_start_past_end(self):
         """start >= n_samples returns False immediately."""

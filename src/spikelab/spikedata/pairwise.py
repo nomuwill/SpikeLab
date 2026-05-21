@@ -87,8 +87,7 @@ class PairwiseCompMatrix:
             t = float(threshold)
             if np.isnan(t) or np.isinf(t):
                 raise ValueError(
-                    f"threshold must be a finite number or None, "
-                    f"got {threshold!r}."
+                    f"threshold must be a finite number or None, " f"got {threshold!r}."
                 )
             threshold = t
 

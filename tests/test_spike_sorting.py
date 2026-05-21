@@ -2907,8 +2907,9 @@ class TestAtomicWritePickle:
         Tests:
             (Test Case 1) When pickling raises, the previous target
                 file is preserved (no partial overwrite).
-            (Test Case 2) The .tmp file may remain on disk; the
-                contract is only that the final file is intact.
+            (Test Case 2) The .tmp file is removed on failure (the
+                ``except BaseException`` block calls
+                ``tmp.unlink(missing_ok=True)`` before re-raising).
         """
         from spikelab.spike_sorting.pipeline import _atomic_write_pickle
         import pickle as _pkl
@@ -2924,6 +2925,73 @@ class TestAtomicWritePickle:
         # The final target must still hold the previous contents.
         with open(target, "rb") as f:
             assert _pkl.load(f) == "OLD"
+        # And the .tmp file is gone — cleaned up by the except block.
+        assert not (target.with_suffix(target.suffix + ".tmp")).exists()
+
+    def test_tmp_cleaned_up_on_pickle_dump_failure(self, tmp_path, monkeypatch):
+        """
+        ``pickle.dump`` raising mid-write triggers the
+        ``except BaseException`` cleanup, removing the ``.tmp`` file
+        before the exception propagates.
+
+        Tests:
+            (Test Case 1) Patched ``pickle.dump`` raises a synthetic
+                ``RuntimeError`` mid-write — the error propagates to
+                the caller.
+            (Test Case 2) The ``.tmp`` file does not exist after the
+                exception, even though it was opened for writing.
+            (Test Case 3) No final file is created.
+        """
+        from spikelab.spike_sorting import pipeline as _pipeline_mod
+        from spikelab.spike_sorting.pipeline import _atomic_write_pickle
+
+        target = tmp_path / "fresh.pkl"
+
+        def _boom(obj, f, *a, **kw):
+            # Touch the file (the open call already created an empty
+            # .tmp), then raise.
+            raise RuntimeError("synthetic pickle failure")
+
+        # Patch pickle at the module-import site inside _atomic_write_pickle.
+        import pickle as _pkl
+
+        monkeypatch.setattr(_pkl, "dump", _boom)
+
+        with pytest.raises(RuntimeError, match="synthetic pickle failure"):
+            _atomic_write_pickle({"k": 1}, target)
+
+        assert not target.exists()
+        assert not (target.with_suffix(target.suffix + ".tmp")).exists()
+
+    def test_tmp_cleaned_up_on_keyboard_interrupt(self, tmp_path, monkeypatch):
+        """
+        ``KeyboardInterrupt`` mid-write (simulating the inactivity
+        watchdog interrupting via ``_thread.interrupt_main``) is
+        caught by the ``except BaseException`` block, the ``.tmp`` is
+        removed, and the interrupt re-propagates.
+
+        Tests:
+            (Test Case 1) ``KeyboardInterrupt`` propagates out of
+                ``_atomic_write_pickle``.
+            (Test Case 2) The ``.tmp`` file does not exist after the
+                interrupt.
+            (Test Case 3) The final file does not exist.
+        """
+        from spikelab.spike_sorting.pipeline import _atomic_write_pickle
+        import pickle as _pkl
+
+        target = tmp_path / "interrupted.pkl"
+
+        def _interrupt(obj, f, *a, **kw):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(_pkl, "dump", _interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            _atomic_write_pickle({"k": 1}, target)
+
+        assert not target.exists()
+        assert not (target.with_suffix(target.suffix + ".tmp")).exists()
 
 
 # ===========================================================================

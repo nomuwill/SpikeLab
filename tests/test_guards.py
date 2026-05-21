@@ -27,6 +27,8 @@ import sys
 import tempfile
 import threading
 import time
+
+import numpy as np
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -14344,3 +14346,203 @@ class TestIOStallWatchdogBlindReadTrip:
             "_warn_blind should fire once per blind episode (2 total); "
             f"got {warn_count['n']} — blind_warned not cleared on recovery."
         )
+
+
+# ============================================================================
+# _resolve_device_index — logging side. Existing TestResolveDeviceIndex pins
+# only return values; this class pins the operator-visibility contract
+# (the watchdog should *log* a warning whenever it falls back to device 0
+# silently, so a typo'd device string is debuggable).
+# ============================================================================
+
+
+class TestResolveDeviceIndexWarningSignal:
+    """``_resolve_device_index`` emits a ``_logger.warning`` whenever it
+    falls back to device 0 on an unparseable input. Valid inputs are
+    silent. Pinning the log side prevents a regression that would
+    silently route the watchdog to the wrong GPU.
+    """
+
+    def test_bad_suffix_after_colon_logs_could_not_parse(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``"cuda:abc"`` returns 0.
+            (Test Case 2) Exactly one ``WARNING`` is captured from the
+                ``spikelab.spike_sorting.guards._gpu_watchdog`` logger.
+            (Test Case 3) The message contains ``"could not parse
+                device index"`` and the offending string.
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index("cuda:abc") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert len(gpu_records) == 1
+        msg = gpu_records[0].getMessage()
+        assert "could not parse device index" in msg
+        assert "cuda:abc" in msg
+
+    def test_unrecognised_string_logs_unrecognised(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``"cpu0"`` (no colon, not all digits) returns 0.
+            (Test Case 2) Exactly one ``WARNING`` is captured.
+            (Test Case 3) The message contains ``"unrecognised device
+                string"`` and the offending value.
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index("cpu0") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert len(gpu_records) == 1
+        msg = gpu_records[0].getMessage()
+        assert "unrecognised device string" in msg
+        assert "cpu0" in msg
+
+    def test_valid_inputs_emit_no_warning(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``None`` is silent (returns 0, no log).
+            (Test Case 2) ``"cuda"`` is silent (returns 0).
+            (Test Case 3) ``"cuda:0"`` is silent (returns 0).
+            (Test Case 4) ``"cuda:1"`` is silent (returns 1).
+            (Test Case 5) ``"2"`` is silent (returns 2).
+            (Test Case 6) ``""`` is silent (returns 0 — empty is the
+                same as ``"cuda"``).
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index(None) == 0
+            assert _resolve_device_index("cuda") == 0
+            assert _resolve_device_index("cuda:0") == 0
+            assert _resolve_device_index("cuda:1") == 1
+            assert _resolve_device_index("2") == 2
+            assert _resolve_device_index("") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert gpu_records == []
+
+
+# ============================================================================
+# compute_inactivity_timeout_s — numpy scalar inputs. Existing tests cover
+# Python float NaN; the source comment specifically calls out that the
+# old isinstance(raw, float) check missed numpy scalars. This class pins
+# the new (math.isnan-based) contract against numpy types.
+# ============================================================================
+
+
+class TestComputeInactivityTimeoutSNumpyScalars:
+    """``compute_inactivity_timeout_s`` handles numpy scalar inputs
+    (``np.float64``, ``np.int64``) the same as their Python counterparts.
+    Non-numeric strings propagate ValueError from the underlying
+    ``float()`` cast (no special handling).
+    """
+
+    def test_numpy_float64_nan_collapses_to_base(self):
+        """
+        Pre-fix, the ``isinstance(raw, float)`` check missed numpy
+        scalars — ``np.float64('nan')`` slipped through and produced a
+        NaN timeout that silently disabled the watchdog. The current
+        implementation uses ``math.isnan`` (with a TypeError guard)
+        which accepts numpy scalars.
+
+        Tests:
+            (Test Case 1) ``np.float64('nan')`` collapses to ``base_s``
+                — same as ``float('nan')``.
+            (Test Case 2) Result is finite (not NaN).
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=np.float64("nan"),
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
+        assert not math.isnan(result)
+
+    def test_numpy_int64_duration_computes_normally(self):
+        """
+        Numpy integer types pass through the ``math.isnan`` guard
+        (``math.isnan(np.int64)`` returns False) and reach
+        ``float(raw)`` which converts cleanly. The arithmetic produces
+        the same value as a Python int input.
+
+        Tests:
+            (Test Case 1) ``np.int64(60)`` produces
+                ``600 + 30 * 60 = 2400`` (matches Python int).
+            (Test Case 2) Result is a finite float.
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=np.int64(60),
+            base_s=600.0,
+            per_min_s=30.0,
+            max_s=None,
+        )
+        assert result == 2400.0
+        assert isinstance(result, float)
+        assert not math.isnan(result)
+
+    def test_numeric_string_duration_works(self):
+        """
+        ``"60"`` is a non-NaN, non-None input; the function falls
+        through the NaN guard to ``float("60")`` which produces 60.0.
+
+        Tests:
+            (Test Case 1) ``"60"`` (numeric string) produces the same
+                result as the Python int 60.
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min="60",
+            base_s=600.0,
+            per_min_s=30.0,
+            max_s=None,
+        )
+        assert result == 2400.0
+
+    def test_non_numeric_string_propagates_value_error(self):
+        """
+        ``"abc"`` (non-numeric) doesn't satisfy ``math.isnan`` (the
+        TypeError-guard catches it), falls through to ``float("abc")``
+        which raises ``ValueError``. The error is NOT swallowed by
+        the function.
+
+        Tests:
+            (Test Case 1) Non-numeric string raises ValueError from
+                the float() cast.
+        """
+        with pytest.raises(ValueError):
+            compute_inactivity_timeout_s(
+                recording_duration_min="abc",
+                base_s=600.0,
+                per_min_s=30.0,
+            )

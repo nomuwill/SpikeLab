@@ -82,17 +82,33 @@ class KubernetesBatchJobBackend:
         return payload["metadata"]["name"]
 
     def delete_job(self, name: str) -> None:
-        """Delete a job and its pods."""
+        """Delete a job and its pods. Idempotent: missing jobs are a no-op.
+
+        Matches the ``kubectl --ignore-not-found=true`` semantic on
+        the fallback path so the two delete paths behave the same
+        way for the missing-job case. Previously the Python
+        kubernetes-client path propagated ``ApiException(404)``
+        verbatim while the kubectl path exited cleanly.
+        """
         if self._batch_api is None:
             self._run_kubectl(
                 ["delete", "job", name, "-n", self.namespace, "--ignore-not-found=true"]
             )
             return
-        self._batch_api.delete_namespaced_job(
-            name=name,
-            namespace=self.namespace,
-            body=client.V1DeleteOptions(propagation_policy="Background"),
-        )
+        try:
+            self._batch_api.delete_namespaced_job(
+                name=name,
+                namespace=self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background"),
+            )
+        except client.exceptions.ApiException as exc:
+            if exc.status == 404:
+                # Missing job — idempotent no-op, matches kubectl
+                # ``--ignore-not-found`` behaviour. Any other API
+                # error (403 Forbidden, 500 Server Error, etc.)
+                # still propagates.
+                return
+            raise
 
     def job_status(self, name: str) -> str:
         """Return one of Pending/Running/Complete/Failed/Unknown."""

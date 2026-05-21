@@ -4505,17 +4505,16 @@ class TestS3StorageDownloadOutputPathTraversalGuard:
 
 
 class TestK8sBackendDeleteJobNotFound:
-    """``KubernetesBatchJobBackend.delete_job`` for a non-existent job has
-    asymmetric behaviour between the two paths:
+    """``KubernetesBatchJobBackend.delete_job`` is idempotent on both
+    paths: a missing job is a clean no-op rather than an error.
 
-    - **kubectl-fallback path** uses ``--ignore-not-found=true``, so a
-      missing job exits cleanly (no error propagated).
-    - **Python kubernetes-client path** has no such guard; the underlying
-      ``delete_namespaced_job`` raises an ``ApiException(404)`` which
-      propagates verbatim to the caller.
+    - **kubectl-fallback path** uses ``--ignore-not-found=true``.
+    - **Python kubernetes-client path** catches ``ApiException`` with
+      ``status == 404`` and returns; any other API error
+      (403 Forbidden, 500 Server Error, etc.) still propagates.
 
-    Pin both halves so any future symmetry-fix (e.g. catching 404 in the
-    K8s-client path) surfaces here as a deliberate behavior change.
+    Resolves the prior asymmetry where the client path propagated
+    404s verbatim while the kubectl path swallowed them.
     """
 
     def test_kubectl_path_ignores_missing_job(self, monkeypatch):
@@ -4548,12 +4547,15 @@ class TestK8sBackendDeleteJobNotFound:
         assert "missing-job" in cmd
         assert "--ignore-not-found=true" in cmd
 
-    def test_k8s_client_path_propagates_404(self):
+    def test_k8s_client_path_ignores_404(self):
         """
         Tests:
             (Test Case 1) ``delete_job`` on the Python kubernetes-client
-                path propagates whatever exception the underlying
-                ``delete_namespaced_job`` raises — no ``404`` swallowing.
+                path catches ``ApiException`` with ``status == 404`` and
+                returns cleanly — matches the kubectl path's
+                ``--ignore-not-found`` semantic.
+            (Test Case 2) ``delete_namespaced_job`` is still called once
+                (we don't short-circuit before the API call).
         """
 
         class _FakeApiException(Exception):
@@ -4571,8 +4573,38 @@ class TestK8sBackendDeleteJobNotFound:
         )
         backend._batch_api = mock_batch_api
 
-        with patch("spikelab.batch_jobs.backend_k8s.client", MagicMock()):
-            with pytest.raises(_FakeApiException, match=r"Not Found"):
-                backend.delete_job("missing-job")
+        # Patch ``client.exceptions.ApiException`` to our stand-in so the
+        # ``except`` catches our fake exception class.
+        fake_client = MagicMock()
+        fake_client.exceptions.ApiException = _FakeApiException
+        with patch("spikelab.batch_jobs.backend_k8s.client", fake_client):
+            # No exception expected.
+            backend.delete_job("missing-job")
 
         mock_batch_api.delete_namespaced_job.assert_called_once()
+
+    def test_k8s_client_path_propagates_non_404(self):
+        """
+        Tests:
+            (Test Case 1) Other ``ApiException`` statuses (e.g. 403
+                Forbidden) still propagate — only 404 is swallowed.
+        """
+
+        class _FakeApiException(Exception):
+            def __init__(self, status, reason):
+                self.status = status
+                self.reason = reason
+                super().__init__(f"({status}) {reason}")
+
+        backend = KubernetesBatchJobBackend(namespace="test-ns")
+        mock_batch_api = MagicMock()
+        mock_batch_api.delete_namespaced_job.side_effect = _FakeApiException(
+            403, "Forbidden"
+        )
+        backend._batch_api = mock_batch_api
+
+        fake_client = MagicMock()
+        fake_client.exceptions.ApiException = _FakeApiException
+        with patch("spikelab.batch_jobs.backend_k8s.client", fake_client):
+            with pytest.raises(_FakeApiException, match=r"Forbidden"):
+                backend.delete_job("forbidden-job")

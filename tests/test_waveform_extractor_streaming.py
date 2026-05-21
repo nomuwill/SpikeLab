@@ -885,3 +885,170 @@ class TestParallelPreallocationAndFlush:
                     "write."
                 ),
             )
+
+
+# ============================================================================
+# WaveformExtractor.__init__ JSON-fallback warning paths. The constructor
+# reads three keys from extraction_parameters.json (pos_peak_thresh,
+# max_waveforms_per_unit, save_waveform_files) and falls back to
+# WaveformConfig defaults when any are absent. A recent source change
+# added a _logger.warning per missing key so operators reloading
+# pre-Phase-2.4 extractors see that defaults were substituted; this
+# class pins the warning contract by hand-building extraction_parameters.json
+# fixtures that omit one or more keys.
+# ============================================================================
+
+
+@skip_no_spikeinterface
+class TestWaveformExtractorInitMissingJsonKeysWarn:
+    """``WaveformExtractor.__init__`` emits one ``_logger.warning``
+    per missing JSON key from the set ``{pos_peak_thresh,
+    max_waveforms_per_unit, save_waveform_files}``. Pre-fix the
+    fallback was silent; the warning surfaces a defaults-substitution
+    that would otherwise look identical to a fresh extractor written
+    with the same defaults.
+    """
+
+    def _minimal_recording(self):
+        """Recording mock whose `has_scaleable_traces` is True so the
+        constructor takes the µV-scaling branch (no `dtype` needed).
+        """
+        import unittest.mock as _mock
+
+        rec = _mock.MagicMock()
+        rec.has_scaleable_traces.return_value = True
+        return rec
+
+    def _minimal_params(self, **overrides):
+        """JSON parameters with only the required keys; pass overrides
+        to add the optional keys per test.
+        """
+        params = {
+            "sampling_frequency": 20000.0,
+            "ms_before": 2.0,
+            "ms_after": 2.0,
+            "peak_ind": 40,
+            "dtype": "float32",
+        }
+        params.update(overrides)
+        return params
+
+    def _write_params_and_construct(self, tmp_path, params, caplog):
+        """Write hand-built ``extraction_parameters.json`` and build a
+        ``WaveformExtractor`` against it, capturing warnings from the
+        relevant module logger.
+        """
+        import json
+        import logging
+        import unittest.mock as _mock
+
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        root = tmp_path / "wf_root_warn"
+        root.mkdir()
+        (root / "extraction_parameters.json").write_text(json.dumps(params))
+        initial = root / "initial"
+
+        rec = self._minimal_recording()
+        sorting = _mock.MagicMock()
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="spikelab.spike_sorting.waveform_extractor",
+        ):
+            we = WaveformExtractor(rec, sorting, root, initial)
+
+        wf_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.waveform_extractor"
+            and r.levelno >= logging.WARNING
+        ]
+        return we, wf_records
+
+    def test_all_three_keys_missing_emits_three_warnings(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON lacks all three fallback keys → exactly
+                three WARNING records on the waveform_extractor logger.
+            (Test Case 2) Each warning's message names a different key
+                from ``{pos_peak_thresh, max_waveforms_per_unit,
+                save_waveform_files}``.
+            (Test Case 3) Each warning includes the root folder so
+                the operator can identify the source.
+            (Test Case 4) Attributes still resolve to ``WaveformConfig``
+                defaults despite the JSON omission.
+        """
+        from spikelab.spike_sorting.config import WaveformConfig
+
+        params = self._minimal_params()  # none of the three optional keys
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert len(records) == 3
+        keys_in_messages = set()
+        defaults = WaveformConfig()
+        for rec in records:
+            msg = rec.getMessage()
+            for key in (
+                "pos_peak_thresh",
+                "max_waveforms_per_unit",
+                "save_waveform_files",
+            ):
+                if key in msg:
+                    keys_in_messages.add(key)
+            # Each warning includes the root folder path.
+            assert "wf_root_warn" in msg
+        assert keys_in_messages == {
+            "pos_peak_thresh",
+            "max_waveforms_per_unit",
+            "save_waveform_files",
+        }
+
+        # Attributes resolved to WaveformConfig defaults.
+        assert we.pos_peak_thresh == defaults.pos_peak_thresh
+        assert we.max_waveforms_per_unit == defaults.max_waveforms_per_unit
+        assert we.save_waveform_files == defaults.save_waveform_files
+
+    def test_one_key_missing_emits_one_warning(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON has ``pos_peak_thresh`` and
+                ``max_waveforms_per_unit`` but omits
+                ``save_waveform_files`` → exactly one WARNING.
+            (Test Case 2) The warning names ``save_waveform_files``.
+            (Test Case 3) The two present keys round-trip from the
+                JSON (no warning, no default substitution).
+        """
+        params = self._minimal_params(
+            pos_peak_thresh=3.0,
+            max_waveforms_per_unit=200,
+            # save_waveform_files deliberately omitted
+        )
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "save_waveform_files" in msg
+        # And the present keys flow through.
+        assert we.pos_peak_thresh == 3.0
+        assert we.max_waveforms_per_unit == 200
+
+    def test_all_keys_present_emits_no_warning(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON with all three optional keys present
+                emits ZERO warnings on the waveform_extractor logger.
+            (Test Case 2) Attributes reflect the supplied values
+                (not defaults).
+        """
+        params = self._minimal_params(
+            pos_peak_thresh=2.5,
+            max_waveforms_per_unit=400,
+            save_waveform_files=False,
+        )
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert records == []
+        assert we.pos_peak_thresh == 2.5
+        assert we.max_waveforms_per_unit == 400
+        assert we.save_waveform_files is False

@@ -14774,3 +14774,154 @@ class TestComputeInactivityTimeoutSNumpyScalars:
                 base_s=600.0,
                 per_min_s=30.0,
             )
+
+
+class TestRunPreflightFolderCountMismatch:
+    """``run_preflight`` emits a ``folder_count_mismatch`` finding
+    (level=fail, category=environment) whenever the
+    ``intermediate_folders`` or ``results_folders`` sequence has a
+    different length than ``recording_files``. The check was added
+    so a future ``zip(...)``-based refactor of the disk-check loop
+    can't silently truncate work to the shortest list. The function
+    does not raise — caller escalates via ``preflight_strict``.
+    """
+
+    def test_intermediate_folders_shorter_emits_one_finding(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) 3 recording files + 2 intermediate folders →
+                exactly one ``folder_count_mismatch`` finding.
+            (Test Case 2) Finding level == "fail".
+            (Test Case 3) Finding category == "environment".
+            (Test Case 4) Message names both counts (2 and 3) and the
+                offending sequence ("intermediate_folders").
+            (Test Case 5) Finding has a non-empty remediation string.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        # Stub the disk / RAM / VRAM probes so the only findings come
+        # from the length check.
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]  # 3
+        inter = ["/inter1", "/inter2"]  # 2 — mismatch
+        results = ["/r1", "/r2", "/r3"]  # 3
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 1
+        f = mismatch[0]
+        assert f.level == "fail"
+        assert f.category == "environment"
+        assert "intermediate_folders" in f.message
+        assert "2 entries" in f.message
+        assert "3" in f.message
+        assert f.remediation
+
+    def test_results_folders_shorter_emits_one_finding(self, monkeypatch):
+        """
+        Symmetric coverage for the ``results_folders`` sequence.
+
+        Tests:
+            (Test Case 1) 3 recordings + 1 results folder → one
+                ``folder_count_mismatch`` finding naming
+                ``results_folders``.
+            (Test Case 2) Counts (1 and 3) in the message.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]
+        inter = ["/i1", "/i2", "/i3"]
+        results = ["/r1"]  # 1 — mismatch
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 1
+        assert mismatch[0].level == "fail"
+        assert "results_folders" in mismatch[0].message
+        assert "1 entries" in mismatch[0].message
+        assert "3" in mismatch[0].message
+
+    def test_both_sequences_mismatched_emits_two_findings(self, monkeypatch):
+        """
+        When both folder sequences are wrong, the function emits two
+        separate findings (one per sequence) so each issue can be
+        surfaced and remediated independently.
+
+        Tests:
+            (Test Case 1) Two ``folder_count_mismatch`` findings.
+            (Test Case 2) One names ``intermediate_folders``, the
+                other names ``results_folders``.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock()]  # 2
+        inter = ["/i1"]  # 1
+        results = ["/r1", "/r2", "/r3"]  # 3
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 2
+        seqs_named = " ".join(f.message for f in mismatch)
+        assert "intermediate_folders" in seqs_named
+        assert "results_folders" in seqs_named
+
+    def test_equal_lengths_no_mismatch_finding(self, monkeypatch):
+        """
+        Matched lengths emit zero ``folder_count_mismatch`` findings.
+        Other findings (disk, RAM, etc.) may still appear — only the
+        count-mismatch ones are asserted absent.
+
+        Tests:
+            (Test Case 1) 3 / 3 / 3 sequences produce no
+                ``folder_count_mismatch`` finding.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]
+        inter = ["/i1", "/i2", "/i3"]
+        results = ["/r1", "/r2", "/r3"]
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        assert not any(f.code == "folder_count_mismatch" for f in findings)
+
+    def test_empty_folder_sequence_takes_other_finding_not_mismatch(
+        self, monkeypatch
+    ):
+        """
+        Empty ``intermediate_folders`` produces a ``no_intermediate_folders``
+        finding (the pre-existing empty-sequence check) but NOT a
+        ``folder_count_mismatch`` — the mismatch check is guarded by
+        ``if intermediate_folders and ...``.
+
+        Tests:
+            (Test Case 1) Empty intermediate_folders → no
+                ``folder_count_mismatch`` finding for that sequence.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock()]
+        # Empty intermediate; matched-length results.
+        findings = run_preflight(cfg, rec_files, [], ["/r1", "/r2"])
+        codes = [f.code for f in findings]
+        # The empty-sequence check fires, but the length-mismatch
+        # check is guarded by ``if intermediate_folders``.
+        assert "folder_count_mismatch" not in codes

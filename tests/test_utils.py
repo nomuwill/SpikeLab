@@ -4630,3 +4630,87 @@ class TestUtilsShuffleZScoreAllNaNStd:
         assert runtime_warns == [], (
             f"unexpected RuntimeWarnings: {[str(w.message) for w in runtime_warns]}"
         )
+
+
+class TestResampledIsiUniformGridPositive:
+    """``_resampled_isi`` accepts uniform time grids — both round-number
+    grids (``np.arange``) and float-arithmetic grids (``np.linspace``)
+    where successive differences may have tiny floating-point drift.
+    Counterpart to the existing ``TestResampledIsi::test_non_uniform_time_grid``
+    which pins the rejection path; this class pins the positive side.
+
+    Also exercises the empty-times and single-element short-circuit
+    paths added in commit cbdec22 / sibling commits.
+    """
+
+    def test_arange_grid_round_numbers_accepted(self):
+        """
+        Round-number uniform grid via ``np.arange`` — exact integer
+        differences — passes the ``np.allclose(diffs, diffs[0])``
+        check without floating-point complications.
+
+        Tests:
+            (Test Case 1) ``times = np.arange(0, 20, 1.0)`` succeeds
+                without raising.
+            (Test Case 2) Output shape matches ``times.shape``.
+            (Test Case 3) Output is finite (no NaN leak).
+        """
+        spikes = np.array([2.0, 5.0, 9.0, 14.0])
+        times = np.arange(0, 20, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=2.0)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+    def test_linspace_grid_with_float_drift_accepted(self):
+        """
+        Float-arithmetic uniform grid via ``np.linspace`` — successive
+        differences may drift by ULP amounts, but ``np.allclose``
+        accepts them within its default tolerance.
+
+        Tests:
+            (Test Case 1) ``times = np.linspace(0, 10, 101)`` (100
+                intervals of 0.1 ms with float drift) succeeds.
+            (Test Case 2) Output shape matches ``times.shape``.
+            (Test Case 3) Output is finite.
+        """
+        spikes = np.array([1.0, 3.0, 6.0, 9.0])
+        times = np.linspace(0, 10, 101)
+        # Confirm the test premise: diffs are NOT bit-identical but
+        # are within np.allclose tolerance.
+        diffs = np.diff(times)
+        assert not np.all(diffs == diffs[0])  # there IS float drift
+        assert np.allclose(diffs, diffs[0])  # but allclose accepts it
+
+        result = _resampled_isi(spikes, times, sigma_ms=2.0)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+    def test_single_element_grid_takes_fast_path(self):
+        """
+        ``len(times) == 1`` short-circuits through the single-time
+        fast path (line 209+ of utils.py). With a real spike interval
+        containing the query time, the return is a 1-element array
+        with the instantaneous ISI-derived rate; outside any
+        interval, the return is zeros.
+
+        Tests:
+            (Test Case 1) Query time inside a spike interval returns
+                a 1-element array whose value is
+                ``1.0 / isi_ms * 1000`` (the inverse-ISI rate in Hz).
+            (Test Case 2) Query time outside any spike interval
+                returns zeros.
+            (Test Case 3) Both shapes match ``times.shape``.
+        """
+        spikes = np.array([10.0, 30.0])  # one ISI of 20 ms → 50 Hz
+        # Query at t=15: inside the [10, 30] interval.
+        times_inside = np.array([15.0])
+        result_inside = _resampled_isi(spikes, times_inside, sigma_ms=2.0)
+        assert result_inside.shape == (1,)
+        # 1/20ms * 1000 = 50 Hz
+        assert result_inside[0] == pytest.approx(50.0)
+
+        # Query at t=100: outside any spike interval.
+        times_outside = np.array([100.0])
+        result_outside = _resampled_isi(spikes, times_outside, sigma_ms=2.0)
+        assert result_outside.shape == (1,)
+        assert result_outside[0] == 0.0

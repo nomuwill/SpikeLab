@@ -9,6 +9,7 @@ Heavy external dependencies are mocked throughout.
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import sys
 import textwrap
@@ -13085,3 +13086,193 @@ class TestSortingUtilsBannerConstantsExport:
         su.print_stage("TEST")
         captured = capsys.readouterr().out
         assert "#" * 70 in captured
+
+
+class TestFindKs2Ks4LogCandidateOrdering:
+    """``_find_ks2_log`` and ``_find_ks4_log`` walk a two-element
+    candidate list and short-circuit on the first ``is_file()``.
+    Pre-existing tests cover ``_find_rt_sort_log`` only; this class
+    pins the KS2 and KS4 variants (identical helper pattern, but each
+    has its own log filename so the test must be independent).
+
+    The contract:
+      1. Top-level ``<output_folder>/<sorter>.log`` wins if present.
+      2. Otherwise ``<output_folder>/sorter_output/<sorter>.log``
+         (Docker output layout) is returned.
+      3. Returns ``None`` when neither candidate exists.
+    """
+
+    def test_ks2_top_level_log_takes_priority(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) When both candidates exist, the top-level
+                ``kilosort2.log`` is returned (the first candidate
+                in the search order).
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        top = tmp_path / "kilosort2.log"
+        sub = tmp_path / "sorter_output" / "kilosort2.log"
+        sub.parent.mkdir(parents=True)
+        top.write_text("top")
+        sub.write_text("sub")
+        assert _find_ks2_log(tmp_path) == top
+
+    def test_ks2_sorter_output_fallback_when_top_missing(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Only the Docker-layout
+                ``sorter_output/kilosort2.log`` exists; it is
+                returned.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        sub = tmp_path / "sorter_output" / "kilosort2.log"
+        sub.parent.mkdir(parents=True)
+        sub.write_text("sub")
+        assert _find_ks2_log(tmp_path) == sub
+
+    def test_ks2_returns_none_when_neither_exists(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Neither candidate exists → ``None``.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        assert _find_ks2_log(tmp_path) is None
+
+    def test_ks2_directory_at_candidate_path_is_skipped(self, tmp_path):
+        """
+        ``is_file()`` short-circuits a directory at the candidate
+        path — a folder named ``kilosort2.log`` should NOT be
+        mistaken for the log file.
+
+        Tests:
+            (Test Case 1) A directory at the top-level candidate
+                path is skipped; the function returns the fallback
+                (or None if the fallback doesn't exist either).
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        # Top-level "kilosort2.log" is a DIRECTORY (not a file).
+        (tmp_path / "kilosort2.log").mkdir()
+        # Real log file at the fallback location.
+        sub = tmp_path / "sorter_output" / "kilosort2.log"
+        sub.parent.mkdir(parents=True)
+        sub.write_text("sub")
+        assert _find_ks2_log(tmp_path) == sub
+
+    def test_ks4_top_level_log_takes_priority(self, tmp_path):
+        """KS4 variant — same contract, different filename.
+
+        Tests:
+            (Test Case 1) When both ``kilosort4.log`` candidates
+                exist, the top-level one is returned.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks4_log
+
+        top = tmp_path / "kilosort4.log"
+        sub = tmp_path / "sorter_output" / "kilosort4.log"
+        sub.parent.mkdir(parents=True)
+        top.write_text("top")
+        sub.write_text("sub")
+        assert _find_ks4_log(tmp_path) == top
+
+    def test_ks4_sorter_output_fallback_when_top_missing(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Only the Docker-layout
+                ``sorter_output/kilosort4.log`` exists; it is
+                returned.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks4_log
+
+        sub = tmp_path / "sorter_output" / "kilosort4.log"
+        sub.parent.mkdir(parents=True)
+        sub.write_text("sub")
+        assert _find_ks4_log(tmp_path) == sub
+
+    def test_ks4_returns_none_when_neither_exists(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Neither candidate exists → ``None``.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks4_log
+
+        assert _find_ks4_log(tmp_path) is None
+
+
+class TestResolveInactivityTimeoutSNanDuration:
+    """``SorterBackend._resolve_inactivity_timeout_s`` propagates NaN
+    via the recording → duration → helper chain. The helper
+    (``compute_inactivity_timeout_s``) defensively coerces
+    ``recording_duration_min=NaN`` to 0, so the resolve path returns
+    ``base_s`` rather than NaN — pin this defensive-fallback contract
+    so a future strict-NaN refactor surfaces here.
+    """
+
+    def _make_recording(self, n_samples, fs_hz):
+        """Duck-typed recording with the two methods we need."""
+        rec = MagicMock()
+        rec.get_num_samples.return_value = n_samples
+        rec.get_sampling_frequency.return_value = fs_hz
+        return rec
+
+    def _make_backend(self):
+        from spikelab.spike_sorting.backends.kilosort2 import Kilosort2Backend
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        cfg = SortingPipelineConfig()
+        cfg.sorter.sorter_path = "/fake/path"
+        return Kilosort2Backend(cfg)
+
+    def test_nan_fs_returns_base_s_via_defensive_coercion(self):
+        """
+        ``fs_hz = NaN`` is NOT caught by the ``fs_hz <= 0.0`` guard
+        (NaN comparisons are always False). It reaches
+        ``duration_min = n_samples / fs_hz / 60`` → NaN, which the
+        ``compute_inactivity_timeout_s`` defensive guard coerces
+        to 0, producing ``base_s`` (the default 600.0).
+
+        Tests:
+            (Test Case 1) ``fs_hz = NaN`` returns ``base_s``
+                (600.0 for default config) — not None, not NaN.
+        """
+        backend = self._make_backend()
+        rec = self._make_recording(20000, float("nan"))
+        result = backend._resolve_inactivity_timeout_s(rec)
+        # Defensive fallback: base_s (600.0) — the post-cbdec22 helper
+        # treats recording_duration_min=NaN as 0 (runtime metadata,
+        # not config), so the timeout collapses to base_s.
+        assert result == 600.0
+        assert not math.isnan(result)
+
+    def test_nan_num_samples_returns_base_s(self):
+        """
+        ``n_samples = NaN`` with a valid ``fs_hz`` also produces
+        ``duration_min = NaN`` → defensive 0 coercion → ``base_s``.
+
+        Tests:
+            (Test Case 1) ``n_samples = NaN``, ``fs_hz = 20000`` →
+                ``base_s`` (600.0).
+        """
+        backend = self._make_backend()
+        rec = self._make_recording(float("nan"), 20000)
+        result = backend._resolve_inactivity_timeout_s(rec)
+        assert result == 600.0
+        assert not math.isnan(result)
+
+    def test_nan_fs_with_custom_base_s_returns_custom_base(self):
+        """
+        Confirms the result comes from ``base_s`` specifically (not
+        a hard-coded 600.0 elsewhere) by varying the config knob.
+
+        Tests:
+            (Test Case 1) ``sorter_inactivity_base_s = 900.0`` and
+                ``fs_hz = NaN`` returns 900.0.
+        """
+        backend = self._make_backend()
+        backend.config.execution.sorter_inactivity_base_s = 900.0
+        rec = self._make_recording(20000, float("nan"))
+        result = backend._resolve_inactivity_timeout_s(rec)
+        assert result == 900.0

@@ -8660,3 +8660,82 @@ class TestConcatenateUnitsToolSchema:
         required = tool.inputSchema.get("required", [])
         assert "out_namespace" not in required
         assert set(required) == {"workspace_id", "namespace_a", "namespace_b"}
+
+
+class TestSanitizeForJsonZeroDArrayAndCapAdjustable:
+    """``_sanitize_for_json`` 0-D array handling + ``MAX_INLINE_ARRAY_SIZE``
+    monkey-patchability — two boundary contracts the existing inlining
+    tests don't cover.
+
+    0-D arrays are special-cased by ``.tolist()`` (returns a Python
+    scalar, not a list); the sanitiser then routes through the
+    scalar branch. The cap is a module-level integer that the
+    docstring documents as adjustable; pin that raising the cap lets
+    larger arrays through.
+    """
+
+    def test_zero_d_array_raises_type_error_current_bug(self):
+        """
+        **Pins a current source bug** (not the documented contract).
+
+        ``_sanitize_for_json`` for a 0-D ``np.ndarray`` (e.g.
+        ``np.array(5.0)``) takes the ``isinstance(obj, np.ndarray)``
+        branch (``obj.size == 1`` so it's under the cap) and then
+        evaluates ``[_sanitize_for_json(v) for v in obj.tolist()]``.
+        But ``np.array(5.0).tolist()`` returns a Python *scalar*
+        (5.0), not a list. Iterating that raises
+        ``TypeError: 'float' object is not iterable``.
+
+        The intent for 0-D arrays is presumably to fall through to
+        the ``np.generic`` branch (via ``.item()`` → scalar) or to
+        special-case the 0-D shape. Pin the crash so the future fix
+        flips the assertion from ``raises`` to a successful scalar
+        coercion. Until then, callers should ``arr.item()`` upstream
+        to avoid this path.
+
+        Tests:
+            (Test Case 1) ``np.array(5.0)`` raises ``TypeError``.
+            (Test Case 2) ``np.array(7)`` raises ``TypeError``.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        with pytest.raises(TypeError, match="not iterable"):
+            _sanitize_for_json(np.array(5.0))
+        with pytest.raises(TypeError, match="not iterable"):
+            _sanitize_for_json(np.array(7))
+
+    def test_max_inline_array_size_monkeypatch_raises_cap(self):
+        """
+        ``MAX_INLINE_ARRAY_SIZE`` is a module attribute; monkey-patching
+        it to a higher value lets larger arrays through. Confirms the
+        docstring contract that the cap is adjustable at runtime.
+
+        Tests:
+            (Test Case 1) Before monkeypatch, an array sized 11 raises
+                under cap=10.
+            (Test Case 2) Under monkeypatched cap=100, the same array
+                inlines successfully and returns the expected
+                element count.
+            (Test Case 3) After the monkeypatch tear-down, the
+                original cap is restored (no bleed into subsequent
+                tests).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        original = srv_mod.MAX_INLINE_ARRAY_SIZE
+        try:
+            # Lower the cap to a small value, then exceed it.
+            srv_mod.MAX_INLINE_ARRAY_SIZE = 10
+            small_above_cap = np.zeros(11)
+            with pytest.raises(ValueError, match="exceeds the inline JSON cap"):
+                srv_mod._sanitize_for_json(small_above_cap)
+
+            # Raise the cap; same array now inlines.
+            srv_mod.MAX_INLINE_ARRAY_SIZE = 100
+            out = srv_mod._sanitize_for_json(small_above_cap)
+            assert isinstance(out, list)
+            assert len(out) == 11
+            assert all(v == 0.0 for v in out)
+        finally:
+            srv_mod.MAX_INLINE_ARRAY_SIZE = original
+        assert srv_mod.MAX_INLINE_ARRAY_SIZE == original

@@ -12449,6 +12449,336 @@ class TestCompilerIncludeFailedUnitsRaisesWithoutHistory:
         assert compiler.recs_cache == []
 
 
+class TestCompilerIncludeFailedUnitsBarNSelected:
+    """``Compiler.save_results`` figure path: when figures are enabled,
+    the per-recording ``bar_n_selected`` value passed to
+    ``plot_curation_bar`` reflects the **curated** subset, not the
+    cached SpikeData's ``N`` — even though the SpikeData passed to
+    ``add_recording`` contains all sorter-emitted units when
+    ``include_failed_units=True``.
+    """
+
+    def _compiler_with_figures(self, include_failed_units_cfg):
+        """Build a Compiler with create_figures=True and bare-minimum
+        post-sort exporters enabled so save_results actually invokes
+        ``plot_curation_bar``.
+        """
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+        from spikelab.spike_sorting.pipeline import Compiler
+
+        cfg = SortingPipelineConfig()
+        cfg.figures.create_figures = True
+        cfg.compilation.compile_to_mat = False
+        cfg.compilation.compile_to_npz = False
+        cfg.compilation.compile_waveforms = False
+        cfg.compilation.save_electrodes = False
+        cfg.compilation.include_failed_units = include_failed_units_cfg
+        # The std-scatter plot requires curate_second + thresholds; the
+        # default config keeps the scatter disabled which is what we
+        # want here.
+        return Compiler(cfg)
+
+    def test_bar_n_selected_reflects_curated_final_under_include_failed_units(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        With ``include_failed_units=True`` the SpikeData carries all
+        original sorter-emitted units, but the bar chart should still
+        show the *curated* subset count in the "selected" bars (and
+        the *initial* count in the "total" bars).
+
+        Tests:
+            (Test Case 1) ``plot_curation_bar`` is called once.
+            (Test Case 2) ``n_selected == [len(curated_final)]`` — not
+                ``sd.N``.
+            (Test Case 3) ``n_total == [len(initial)]`` — from
+                ``curation_history["initial"]``, not the cached set
+                of unit_ids.
+            (Test Case 4) ``rec_names == ["rec_a"]``.
+        """
+        import spikelab.spike_sorting.pipeline as pipeline_mod
+
+        compiler = self._compiler_with_figures(include_failed_units_cfg=True)
+        all_ids = [1, 2, 3, 4, 5]
+        curated_final = [2, 4]
+        sd = _make_sd_with_unit_ids(all_ids)
+        history = {"curated_final": curated_final, "initial": all_ids}
+        compiler.add_recording(
+            "rec_a", sd, curation_history=history, include_failed_units=True
+        )
+
+        captured = {"calls": 0, "args": None, "kwargs": None}
+
+        def _fake_plot_curation_bar(rec_names, n_total, n_selected, **kw):
+            captured["calls"] += 1
+            captured["args"] = (list(rec_names), list(n_total), list(n_selected))
+            captured["kwargs"] = kw
+
+        # save_results imports plot_curation_bar lazily inside the
+        # ``if self.create_figures`` block, so patch the source module.
+        import spikelab.spike_sorting.figures as figures_mod
+
+        monkeypatch.setattr(
+            figures_mod, "plot_curation_bar", _fake_plot_curation_bar
+        )
+        # std_scatter_plot is guarded off in the helper config; no need
+        # to patch.
+
+        compiler.save_results(tmp_path / "out")
+
+        assert captured["calls"] == 1
+        rec_names, n_total, n_selected = captured["args"]
+        assert rec_names == ["rec_a"]
+        assert n_selected == [len(curated_final)]
+        assert n_total == [len(all_ids)]
+
+    def test_bar_n_selected_falls_back_to_sd_N_under_default(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Default ``include_failed_units=False`` keeps the historical
+        behaviour: ``n_selected = sd.N`` (every unit in the cached
+        SpikeData is curated). ``n_total`` still comes from
+        ``curation_history["initial"]`` if available.
+
+        Tests:
+            (Test Case 1) ``n_selected == [sd.N]``.
+            (Test Case 2) ``n_total == [len(initial)]`` when
+                curation_history carries it; otherwise the cached
+                unit_id count.
+        """
+        compiler = self._compiler_with_figures(include_failed_units_cfg=False)
+        unit_ids = [10, 20, 30]
+        sd = _make_sd_with_unit_ids(unit_ids)
+        # curation_history is supplied so bar_n_total reads from it.
+        history = {"initial": [10, 20, 30, 40, 50]}
+        compiler.add_recording("rec_a", sd, curation_history=history)
+
+        captured = {"args": None}
+
+        def _fake_plot_curation_bar(rec_names, n_total, n_selected, **kw):
+            captured["args"] = (list(rec_names), list(n_total), list(n_selected))
+
+        import spikelab.spike_sorting.figures as figures_mod
+
+        monkeypatch.setattr(
+            figures_mod, "plot_curation_bar", _fake_plot_curation_bar
+        )
+
+        compiler.save_results(tmp_path / "out")
+
+        rec_names, n_total, n_selected = captured["args"]
+        assert rec_names == ["rec_a"]
+        assert n_selected == [sd.N]
+        assert n_total == [5]  # len(initial) from curation_history
+
+
+@skip_no_spikeinterface
+class TestCompileResultsForwardsIncludeFailedUnits:
+    """``compile_results`` reads ``config.compilation.include_failed_units``
+    and forwards it to ``Compiler.add_recording`` as a kwarg. This pins
+    the wiring that ``_process_recording_body`` relies on when it
+    selects the pre-curation ``sd`` for the compile step.
+    """
+
+    def test_flag_forwarded_to_compiler_add_recording(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) ``Compiler.add_recording`` receives
+                ``include_failed_units=True`` from the config.
+            (Test Case 2) ``curation_history`` is forwarded unchanged.
+        """
+        import spikelab.spike_sorting.pipeline as pipeline_mod
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        captured = {"calls": []}
+
+        # Stub Compiler so we don't actually save anything.
+        class _StubCompiler:
+            def __init__(self, config):
+                self.config = config
+
+            def add_recording(self, rec_name, sd, curation_history, **kw):
+                captured["calls"].append(
+                    {
+                        "rec_name": rec_name,
+                        "sd": sd,
+                        "curation_history": curation_history,
+                        "kwargs": kw,
+                    }
+                )
+
+            def save_results(self, _folder):
+                pass
+
+        monkeypatch.setattr(pipeline_mod, "Compiler", _StubCompiler)
+
+        cfg = SortingPipelineConfig()
+        cfg.compilation.compile_single_recording = True
+        cfg.compilation.include_failed_units = True
+        cfg.execution.recompile_single_recording = True
+
+        sd = _make_sd_with_unit_ids([1, 2, 3])
+        history = {"curated_final": [2], "initial": [1, 2, 3]}
+        out = tmp_path / "out"
+        out.mkdir()
+
+        pipeline_mod.compile_results(
+            cfg,
+            rec_name="rec_a",
+            rec_path="rec_a.h5",
+            results_path=out,
+            sd=sd,
+            curation_history=history,
+            rec_chunks=None,
+        )
+
+        assert len(captured["calls"]) == 1
+        call = captured["calls"][0]
+        assert call["rec_name"] == "rec_a"
+        assert call["sd"] is sd
+        assert call["curation_history"] is history
+        assert call["kwargs"].get("include_failed_units") is True
+
+    def test_flag_default_false_when_config_unset(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Default ``include_failed_units=False`` on the
+                config produces an ``include_failed_units=False`` kwarg
+                to ``Compiler.add_recording``.
+        """
+        import spikelab.spike_sorting.pipeline as pipeline_mod
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        captured = {"calls": []}
+
+        class _StubCompiler:
+            def __init__(self, config):
+                pass
+
+            def add_recording(self, rec_name, sd, curation_history, **kw):
+                captured["calls"].append(kw)
+
+            def save_results(self, _folder):
+                pass
+
+        monkeypatch.setattr(pipeline_mod, "Compiler", _StubCompiler)
+
+        cfg = SortingPipelineConfig()
+        cfg.compilation.compile_single_recording = True
+        # include_failed_units left at default (False).
+        cfg.execution.recompile_single_recording = True
+
+        sd = _make_sd_with_unit_ids([1])
+        out = tmp_path / "out"
+        out.mkdir()
+
+        pipeline_mod.compile_results(
+            cfg,
+            rec_name="rec_a",
+            rec_path="rec_a.h5",
+            results_path=out,
+            sd=sd,
+            curation_history=None,
+            rec_chunks=None,
+        )
+
+        assert len(captured["calls"]) == 1
+        assert captured["calls"][0].get("include_failed_units") is False
+
+
+class TestPlotCurationBarRotationApi:
+    """``plot_curation_bar`` was changed (commit 0d91204) to set tick
+    labels and rotation separately so the matplotlib 3.5+ deprecation
+    warning ("set_xticklabels with rotation kwarg + FixedLocator")
+    no longer fires. Pin both contracts: rotation is still applied
+    (via ``tick_params(labelrotation=…)``) and no matplotlib
+    deprecation warning is emitted.
+    """
+
+    def test_no_matplotlib_deprecation_warning(self):
+        """
+        Tests:
+            (Test Case 1) Calling ``plot_curation_bar(...,
+                label_rotation=45)`` emits zero
+                ``MatplotlibDeprecationWarning``.
+        """
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        from spikelab.spike_sorting.figures import plot_curation_bar
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fig = plot_curation_bar(
+                ["recA", "recB"], [10, 20], [5, 15], label_rotation=45
+            )
+            try:
+                # Look for the matplotlib-deprecation flavour
+                # specifically — other warnings (e.g. categorical
+                # x-axis units, NumPy depr) are OK.
+                dep_warnings = [
+                    rec
+                    for rec in w
+                    if "MatplotlibDeprecationWarning" in type(rec.category).__name__
+                    or "matplotlib" in str(rec.message).lower()
+                    and "deprecat" in str(rec.message).lower()
+                ]
+                assert dep_warnings == []
+            finally:
+                plt.close(fig)
+
+    def test_labelrotation_reaches_axis(self):
+        """
+        Tests:
+            (Test Case 1) After ``plot_curation_bar(...,
+                label_rotation=30)`` returns, the figure's first axis
+                has its x-tick labels rotated to 30 degrees (the
+                ``tick_params(labelrotation=…)`` call took effect).
+        """
+        import matplotlib.pyplot as plt
+
+        from spikelab.spike_sorting.figures import plot_curation_bar
+
+        fig = plot_curation_bar(
+            ["recA", "recB"], [10, 20], [5, 15], label_rotation=30
+        )
+        try:
+            ax = fig.axes[0]
+            rotations = {
+                round(lbl.get_rotation(), 6)
+                for lbl in ax.get_xticklabels()
+                if lbl.get_text()
+            }
+            assert rotations == {30.0}
+        finally:
+            plt.close(fig)
+
+    def test_default_rotation_zero_when_unset(self):
+        """
+        Tests:
+            (Test Case 1) When ``label_rotation`` is left at the
+                function's default (0), the axis x-tick labels are
+                unrotated (rotation == 0).
+        """
+        import matplotlib.pyplot as plt
+
+        from spikelab.spike_sorting.figures import plot_curation_bar
+
+        fig = plot_curation_bar(["recA"], [3], [2])
+        try:
+            ax = fig.axes[0]
+            rotations = {
+                round(lbl.get_rotation(), 6)
+                for lbl in ax.get_xticklabels()
+                if lbl.get_text()
+            }
+            assert rotations == {0.0}
+        finally:
+            plt.close(fig)
+
+
 # ===========================================================================
 # save_traces_mea samp_freq consolidation (commit 888636b)
 # ===========================================================================

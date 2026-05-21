@@ -2695,17 +2695,24 @@ class TestShuffleZScore:
 
     def test_empty_distribution(self):
         """
-        An empty shuffle distribution causes np.nanmean and np.nanstd over
-        empty arrays. np.nanmean of empty array returns NaN with a
-        RuntimeWarning.
+        An empty shuffle distribution still returns NaN (the degenerate
+        result is well-defined). The "Mean of empty slice" and
+        "Degrees of freedom <= 0" RuntimeWarnings that numpy would
+        emit are now suppressed at the source via narrow
+        ``catch_warnings`` filters — only those two specific
+        messages are silenced.
 
         Tests:
-            (Test Case 1) Empty distribution array. The function returns NaN.
+            (Test Case 1) Empty distribution returns NaN.
+            (Test Case 2) No ``RuntimeWarning`` is emitted.
         """
         dist = np.array([])
-        with pytest.warns(RuntimeWarning):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             z = shuffle_z_score(5.0, dist)
         assert np.isnan(z)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert runtime == [], f"unexpected RuntimeWarnings: {[str(w.message) for w in runtime]}"
 
     def test_uses_bessel_corrected_sample_std(self):
         """
@@ -4597,30 +4604,29 @@ class TestUtilsButterFilterShortInput:
 
 
 class TestUtilsShuffleZScoreAllNaNStd:
-    """``shuffle_z_score(observed, shuffle=full-NaN)``: ``np.nanmean``
-    of all-NaN returns NaN and emits a ``RuntimeWarning`` ("Mean of
-    empty slice"); ``np.nanstd`` with ``ddof=1`` likewise returns NaN
-    and emits "Degrees of freedom <= 0 for slice." The downstream
-    ``safe_std`` guard checks ``std == 0`` (False for NaN), so the
-    division proceeds and the final z is NaN. Pin both the NaN result
-    and the upstream warnings so a regression that silenced them
-    (e.g. by adding ``np.errstate(invalid='ignore')``) would surface.
+    """``shuffle_z_score(observed, shuffle=full-NaN)`` returns NaN
+    cleanly without emitting RuntimeWarnings. The ``np.nanmean`` /
+    ``np.nanstd`` calls are wrapped in narrow ``catch_warnings``
+    filters that suppress only the two specific noise messages
+    ("Mean of empty slice" and "Degrees of freedom <= 0 for slice");
+    any other warning still propagates.
     """
 
-    def test_all_nan_shuffle_returns_nan_with_runtime_warnings(self):
+    def test_all_nan_shuffle_returns_nan_silently(self):
         """
         An all-NaN shuffle distribution yields a NaN z-score and emits
-        the two upstream NumPy RuntimeWarnings ("Mean of empty slice"
-        and "Degrees of freedom <= 0 for slice.").
+        ZERO RuntimeWarnings. The two upstream NumPy noise messages
+        are suppressed at source.
 
         Tests:
             (Test Case 1) The returned z is NaN.
-            (Test Case 2) At least one ``RuntimeWarning`` is emitted
-                during the call.
+            (Test Case 2) No ``RuntimeWarning`` is emitted.
         """
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             z = shuffle_z_score(5.0, np.full(10, np.nan))
         assert np.isnan(z)
         runtime_warns = [w for w in caught if issubclass(w.category, RuntimeWarning)]
-        assert len(runtime_warns) >= 1
+        assert runtime_warns == [], (
+            f"unexpected RuntimeWarnings: {[str(w.message) for w in runtime_warns]}"
+        )

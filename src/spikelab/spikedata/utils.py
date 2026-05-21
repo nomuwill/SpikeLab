@@ -1835,8 +1835,26 @@ def shuffle_z_score(observed, shuffle_distribution):
           freedom), which also propagates to NaN.
     """
     shuffle_distribution = np.asarray(shuffle_distribution)
-    mean = np.nanmean(shuffle_distribution, axis=0)
-    std = np.nanstd(shuffle_distribution, axis=0, ddof=1)
+    # All-NaN slices along axis 0 are a documented degenerate case
+    # (caller wants NaN out). ``nanmean`` and ``nanstd`` produce the
+    # correct NaN but each emit one ``RuntimeWarning`` per call.
+    # Suppress only those two specific messages so unrelated warnings
+    # still propagate. Two narrow filters rather than one broad
+    # ``RuntimeWarning`` filter so we don't accidentally silence
+    # other numerical issues (overflow, invalid operations, etc.).
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            message="Mean of empty slice",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            category=RuntimeWarning,
+            message="Degrees of freedom <= 0",
+        )
+        mean = np.nanmean(shuffle_distribution, axis=0)
+        std = np.nanstd(shuffle_distribution, axis=0, ddof=1)
     safe_std = np.where(std == 0, 1.0, std)
     z = (np.asarray(observed) - mean) / safe_std
     z = np.where(std == 0, np.nan, z)

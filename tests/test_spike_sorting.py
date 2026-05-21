@@ -7313,56 +7313,70 @@ class TestRecentering:
 
 
 class TestBuildReferenceTraceZeroChannels:
-    """``_build_reference_trace`` called with a zero-channel ``traces``
-    array ``(0, T)``.
-
-    Pinned behaviour: the call does NOT crash. NumPy's
-    ``np.max(traces, axis=1)`` over a zero-length axis-0 produces an
-    empty ``(0,)`` amps array, and ``np.argpartition([], -1)[-1:]``
-    returns an empty index array. The final ``traces[empty_idx].sum``
-    over axis 0 yields an all-zero ``(T,)`` reference. Source oddity:
-    callers downstream may treat this silent zero-reference as a real
-    signal — there is no explicit guard for empty input. Pin the
-    current behaviour so any later fix has a regression target.
+    """``_build_reference_trace`` rejects any input with zero channels
+    or non-2-D shape with a ``ValueError`` at the boundary. Resolves
+    the prior asymmetry where ``(0, T)`` silently returned a
+    zero-reference while ``(0, 0)`` raised from the underlying numpy
+    reduction — both empty-channel cases now raise the same clear
+    error.
     """
 
-    def test_zero_channels_returns_zero_reference(self):
+    def test_zero_channels_raises(self):
         """
-        ``traces.shape == (0, T)`` returns ``np.zeros((T,))`` instead
-        of raising.
+        ``traces.shape == (0, T)`` raises ``ValueError`` with a
+        message identifying the offending shape and the
+        ``n_channels >= 1`` requirement. Pre-fix this silently
+        returned ``np.zeros((T,))`` — indistinguishable from a real
+        zero signal.
 
         Tests:
-            (Test Case 1) Returned array has shape ``(T,)``.
-            (Test Case 2) Every element is zero.
+            (Test Case 1) ``ValueError`` raised.
+            (Test Case 2) Message mentions "at least one channel"
+                and the shape.
         """
         from spikelab.spike_sorting.stim_sorting.recentering import (
             _build_reference_trace,
         )
 
         traces = np.zeros((0, 100), dtype=np.float32)
-        ref = _build_reference_trace(traces, n_reference_channels=1)
-        assert ref.shape == (100,)
-        assert np.all(ref == 0.0)
+        with pytest.raises(ValueError, match="at least one channel"):
+            _build_reference_trace(traces, n_reference_channels=1)
 
     def test_zero_channels_zero_samples_raises_value_error(self):
         """
-        Doubly empty ``(0, 0)`` input DOES raise: ``np.max`` over
-        ``axis=1`` of a zero-row, zero-column array reduces over an
-        empty axis with no identity, which raises ``ValueError``.
-        This differs from the ``(0, T>0)`` case above and is a source
-        oddity worth pinning explicitly.
+        Doubly empty ``(0, 0)`` input also raises ``ValueError`` —
+        same guard as the ``(0, T)`` case. Both produce the new
+        "at least one channel" error message (not the prior
+        "zero-size array" message from numpy internals).
 
         Tests:
-            (Test Case 1) ``ValueError`` raised, message references
-                the zero-size reduction.
+            (Test Case 1) ``ValueError`` raised with the new
+                consistent message.
         """
         from spikelab.spike_sorting.stim_sorting.recentering import (
             _build_reference_trace,
         )
 
         traces = np.zeros((0, 0), dtype=np.float32)
-        with pytest.raises(ValueError, match="zero-size array"):
+        with pytest.raises(ValueError, match="at least one channel"):
             _build_reference_trace(traces, n_reference_channels=3)
+
+    def test_one_d_raises(self):
+        """
+        A 1-D ``traces`` input is rejected with the same clear
+        message rather than crashing deeper inside numpy with an
+        axis error.
+
+        Tests:
+            (Test Case 1) ``ValueError`` raised, message identifies
+                the wrong ndim.
+        """
+        from spikelab.spike_sorting.stim_sorting.recentering import (
+            _build_reference_trace,
+        )
+
+        with pytest.raises(ValueError, match="at least one channel"):
+            _build_reference_trace(np.zeros(100), n_reference_channels=1)
 
 
 # ===========================================================================

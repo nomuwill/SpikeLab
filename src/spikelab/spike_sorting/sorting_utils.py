@@ -120,6 +120,46 @@ class Stopwatch:
             print(f"{text} Time: {time.time() - self._time_start:.2f}s")
 
 
+class _TeeWriter:
+    """File-like wrapper that mirrors writes to both a file and stdout.
+
+    Internal helper for :class:`Tee`. Encapsulates the dual-write
+    behaviour as an explicit class with a public ``write`` method,
+    replacing the prior ``types.MethodType`` monkey-patch on the
+    file object. Behaviour is identical:
+
+      - Every ``write(s)`` writes ``s`` to the underlying file.
+      - When ``mirror_to_stdout`` is True and ``s`` is more than a
+        single newline or space, ``s`` is also printed to the
+        original stdout (with the trailing newline that ``print``
+        appends).
+
+    The ``mirror_to_stdout`` flag is toggled off by :class:`Tee`'s
+    exit path so traceback writes go to the log file only, not to
+    a possibly-defunct stdout.
+    """
+
+    def __init__(self, file_path: Union[str, Path], file_mode: str) -> None:
+        self._file = open(file_path, file_mode)
+        # Plain attribute (not a property) so existing tests + callers
+        # can swap in a mock stdout for verification.
+        self.stdout = sys.stdout
+        self.mirror_to_stdout = True
+
+    def write(self, s: str) -> None:
+        self._file.write(s)
+        if self.mirror_to_stdout and s != "\n" and s != " ":
+            print(s, file=self.stdout)
+
+    def flush(self) -> None:
+        self._file.flush()
+        if self.mirror_to_stdout:
+            self.stdout.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
 class Tee:
     """Context manager that mirrors ``stdout`` to a log file.
 
@@ -134,34 +174,25 @@ class Tee:
     """
 
     def __init__(self, file_path: Union[str, Path], file_mode: str = "a") -> None:
-        from types import MethodType
-
-        _file = open(file_path, file_mode)
-        _file.stdout = sys.stdout
-        _file.file_write = _file.write
-        _file.write = MethodType(Tee._write, _file)
-        self._file = _file
+        self._writer = _TeeWriter(file_path, file_mode)
 
     def __enter__(self) -> Any:
-        sys.stdout = self._file
-        return self._file
+        sys.stdout = self._writer
+        return self._writer
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         import traceback
 
         if exc_type:
-            self._file.write = self._file.file_write
+            # Disable stdout mirror for traceback output — the original
+            # behaviour was to restore ``_file.write`` to the unwrapped
+            # ``file_write`` so traceback lines went to the file only.
+            self._writer.mirror_to_stdout = False
             print("Traceback (most recent call last):")
-            traceback.print_tb(exc_tb, file=self._file)
+            traceback.print_tb(exc_tb, file=self._writer)
             print(f"{exc_type.__name__}: {exc_val}")
-        sys.stdout = self._file.stdout
-        self._file.close()
-
-    @staticmethod
-    def _write(self, s: str) -> None:
-        self.file_write(s)
-        if s != "\n" and s != " ":
-            print(s, file=self.stdout)
+        sys.stdout = self._writer.stdout  # original stdout captured at __init__
+        self._writer.close()
 
 
 def create_folder(folder: Union[str, Path], parents: bool = True) -> None:

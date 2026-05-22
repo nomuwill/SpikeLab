@@ -5023,22 +5023,28 @@ class TestGetTotalRamBytes:
 
 
 class TestLogInactivityWatchdogReadSignals:
-    """``LogInactivityWatchdog._read_signals`` returns (mtime, size)."""
+    """``LogInactivityWatchdog._read_signals`` returns (mtime, size, ino).
 
-    def test_returns_mtime_size_for_existing_file(self, tmp_path):
+    The third element (inode) lets the watchdog detect log rotation
+    via delete+recreate even when mtime and size happen to be
+    identical to the prior signal.
+    """
+
+    def test_returns_mtime_size_ino_for_existing_file(self, tmp_path):
         """
-        Existing log file → tuple of (mtime, size) as floats/ints.
+        Existing log file → tuple of (mtime, size, ino).
 
         Tests:
-            (Test Case 1) After writing content to a log file, the
-                helper returns a tuple whose first value matches the
-                file's mtime and second value matches its byte size
-                (compared against the on-disk byte count to avoid
-                Windows CRLF line-ending differences).
+            (Test Case 1) ``_read_signals`` returns a 3-tuple.
+            (Test Case 2) mtime matches the file's mtime.
+            (Test Case 3) size matches the on-disk byte count.
+            (Test Case 4) inode matches ``os.stat(...).st_ino`` (may
+                be 0 on Windows + FAT/exFAT/some network shares;
+                the change-check in the poll loop tolerates that).
         """
         log = tmp_path / "rec.log"
         log.write_bytes(b"hello\nworld\n")
-        on_disk_size = log.stat().st_size
+        on_disk = log.stat()
         wd = LogInactivityWatchdog(
             log_path=log,
             popen=mock.Mock(spec=subprocess.Popen),
@@ -5047,11 +5053,13 @@ class TestLogInactivityWatchdogReadSignals:
         )
         signals = wd._read_signals()
         assert signals is not None
-        mtime, size = signals
+        mtime, size, ino = signals
         assert isinstance(mtime, float)
         assert isinstance(size, int)
-        assert size == on_disk_size
-        assert abs(mtime - log.stat().st_mtime) < 1e-6
+        assert isinstance(ino, int)
+        assert size == on_disk.st_size
+        assert abs(mtime - on_disk.st_mtime) < 1e-6
+        assert ino == on_disk.st_ino
 
     def test_returns_none_for_missing_file(self, tmp_path):
         """
@@ -13910,9 +13918,7 @@ class TestComputeInactivityTimeoutSNaNBaseAndMax:
             compute_inactivity_timeout_s,
         )
 
-        with pytest.raises(
-            ValueError, match="per_min_s must be a finite number"
-        ):
+        with pytest.raises(ValueError, match="per_min_s must be a finite number"):
             compute_inactivity_timeout_s(
                 recording_duration_min=10.0,
                 base_s=600.0,
@@ -13941,9 +13947,7 @@ class TestComputeInactivityTimeoutSNaNBaseAndMax:
             compute_inactivity_timeout_s(
                 recording_duration_min=10.0, max_s=float("inf")
             )
-        with pytest.raises(
-            ValueError, match="per_min_s must be a finite number"
-        ):
+        with pytest.raises(ValueError, match="per_min_s must be a finite number"):
             compute_inactivity_timeout_s(
                 recording_duration_min=10.0, per_min_s=float("-inf")
             )
@@ -14142,12 +14146,8 @@ class TestIOStallWatchdogDoubleEnter:
 
         # Mock the PID-mode counter probe so the watchdog enables.
         # _read_io_bytes_for_pids returns (initial_counter, alive_count).
-        with mock.patch.object(
-            iom, "_read_io_bytes_for_pids", return_value=(1000, 1)
-        ):
-            wd = IOStallWatchdog(
-                pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0
-            )
+        with mock.patch.object(iom, "_read_io_bytes_for_pids", return_value=(1000, 1)):
+            wd = IOStallWatchdog(pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0)
             wd.__enter__()
             first_token = wd._token
             assert first_token is not None
@@ -14169,12 +14169,8 @@ class TestIOStallWatchdogDoubleEnter:
         """
         from spikelab.spike_sorting.guards import _io_stall as iom
 
-        with mock.patch.object(
-            iom, "_read_io_bytes_for_pids", return_value=(1000, 1)
-        ):
-            wd = IOStallWatchdog(
-                pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0
-            )
+        with mock.patch.object(iom, "_read_io_bytes_for_pids", return_value=(1000, 1)):
+            wd = IOStallWatchdog(pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0)
             wd.__enter__()
             first_token = wd._token
             wd.__exit__(None, None, None)
@@ -14899,9 +14895,7 @@ class TestRunPreflightFolderCountMismatch:
         findings = run_preflight(cfg, rec_files, inter, results)
         assert not any(f.code == "folder_count_mismatch" for f in findings)
 
-    def test_empty_folder_sequence_takes_other_finding_not_mismatch(
-        self, monkeypatch
-    ):
+    def test_empty_folder_sequence_takes_other_finding_not_mismatch(self, monkeypatch):
         """
         Empty ``intermediate_folders`` produces a ``no_intermediate_folders``
         finding (the pre-existing empty-sequence check) but NOT a

@@ -394,6 +394,14 @@ class LogInactivityWatchdog:
         self._tripped = False
         self._last_seen_mtime: Optional[float] = None
         self._last_seen_size: Optional[int] = None
+        # Track inode too so a log rotated via delete-and-recreate
+        # registers as progress even when the new file inherits the
+        # old file's mtime + size (e.g. ``touch -r`` after recreate,
+        # or external rotation that preserves both signals). On
+        # Windows + FAT/exFAT/some network shares ``st_ino`` is 0
+        # for every file; the change-check below tolerates that by
+        # falling back to mtime+size when both ino values are 0.
+        self._last_seen_ino: Optional[int] = None
         self._inactivity_at_trip: Optional[float] = None
         # Disabled when there is no timeout to enforce, or when there
         # is no kill target at all (neither a subprocess nor a
@@ -441,14 +449,21 @@ class LogInactivityWatchdog:
     def __enter__(self) -> "LogInactivityWatchdog":
         if not self._enabled:
             return self
-        # Capture the pre-existing mtime + size so a stale log from
-        # a previous run does not register as a fresh trip.
+        # Capture the pre-existing mtime + size + inode so a stale
+        # log from a previous run does not register as a fresh trip,
+        # and a same-mtime-same-size recreate is still detected via
+        # the inode change.
         signals = self._read_signals()
         if signals is not None:
-            self._last_seen_mtime, self._last_seen_size = signals
+            (
+                self._last_seen_mtime,
+                self._last_seen_size,
+                self._last_seen_ino,
+            ) = signals
         else:
             self._last_seen_mtime = None
             self._last_seen_size = None
+            self._last_seen_ino = None
         _logger.info(
             "active: sorter=%s tolerance=%.1fs poll=%.1fs log=%s",
             self.sorter,
@@ -475,11 +490,19 @@ class LogInactivityWatchdog:
     # Internals
     # ------------------------------------------------------------------
 
-    def _read_signals(self) -> Optional[Tuple[float, int]]:
-        """Return ``(mtime, size)`` for the log file, or None if absent."""
+    def _read_signals(self) -> Optional[Tuple[float, int, int]]:
+        """Return ``(mtime, size, inode)`` for the log file, or None if absent.
+
+        The inode is included so external log replacement
+        (delete + recreate with the same mtime and size) registers
+        as progress. On Windows + FAT/exFAT/some network shares
+        ``st_ino`` is always 0; the change-check in the poll loop
+        falls back to mtime + size when both old and new inode are
+        0, so the loss of signal is silent on those platforms.
+        """
         try:
             st = os.stat(self.log_path)
-            return float(st.st_mtime), int(st.st_size)
+            return float(st.st_mtime), int(st.st_size), int(st.st_ino)
         except (OSError, FileNotFoundError):
             return None
 
@@ -502,21 +525,38 @@ class LogInactivityWatchdog:
             now = time.time()
 
             if signals is not None:
-                cur_mtime, cur_size = signals
+                cur_mtime, cur_size, cur_ino = signals
                 if not seen_any:
                     # File just appeared.
                     seen_any = True
                     self._last_seen_mtime = cur_mtime
                     self._last_seen_size = cur_size
+                    self._last_seen_ino = cur_ino
                     last_progress_t = now
-                elif (
-                    cur_mtime != self._last_seen_mtime
-                    or cur_size != self._last_seen_size
-                ):
-                    # Either signal advanced — reset the inactivity clock.
-                    self._last_seen_mtime = cur_mtime
-                    self._last_seen_size = cur_size
-                    last_progress_t = now
+                else:
+                    # Inode change indicates the file was replaced
+                    # (delete+recreate, rotation, etc.) — count as
+                    # progress even when mtime + size happen to be
+                    # identical to the prior signal. The ``!= 0``
+                    # guard preserves the prior mtime+size-only
+                    # behaviour on platforms where ``st_ino`` is
+                    # always 0 (Windows + FAT/exFAT/some network
+                    # shares): if neither old nor new ino is
+                    # informative, the ino comparison contributes
+                    # nothing and mtime+size drive the decision.
+                    ino_changed = cur_ino != self._last_seen_ino and (
+                        cur_ino != 0 or self._last_seen_ino != 0
+                    )
+                    if (
+                        cur_mtime != self._last_seen_mtime
+                        or cur_size != self._last_seen_size
+                        or ino_changed
+                    ):
+                        # Any signal advanced — reset the inactivity clock.
+                        self._last_seen_mtime = cur_mtime
+                        self._last_seen_size = cur_size
+                        self._last_seen_ino = cur_ino
+                        last_progress_t = now
                 # Recovered after a previous lost-file episode.
                 lost_warned = False
             elif seen_any:

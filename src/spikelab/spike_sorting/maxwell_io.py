@@ -49,6 +49,103 @@ def list_maxwell_wells(h5_path: Any) -> List[Tuple[str, str]]:
     return pairs
 
 
+def load_maxwell_with_fallback(rec_path: Any, *, stream_id: Optional[str] = None):
+    """Load a Maxwell ``.h5`` recording with native-loader fallback.
+
+    Tries :class:`MaxwellRecordingExtractor` first. When the file's
+    ``settings/mapping`` table has duplicate channel IDs (mxw v25.x),
+    neo's ``MaxwellRawIO`` raises
+    ``ValueError("signal_channels do not have unique ids")``; this
+    function catches that specific error and falls back to
+    :func:`load_maxwell_native`, which reads the file with ``h5py``
+    and dedupes the mapping table directly.
+
+    The extractor path additionally probes the file via ``h5py`` to
+    detect a missing HDF5 compression plugin (raising a helpful
+    install message) and reconciles routed vs. declared channels via
+    ``rec.select_channels``. The native path needs neither because it
+    bypasses neo entirely.
+
+    Parameters:
+        rec_path: Path to the Maxwell ``.h5`` file.
+        stream_id (str, optional): Stream / well identifier for
+            multi-well files. Passed through to
+            :class:`MaxwellRecordingExtractor` as ``stream_id`` and to
+            :func:`load_maxwell_native` as ``well_id`` on the fallback
+            path. Defaults to ``None`` (extractor default — usually
+            ``"well000"``).
+
+    Returns:
+        rec (BaseRecording): SpikeInterface recording ready for sorting.
+
+    Raises:
+        ValueError: Any non-uniqueness-related ``ValueError`` from the
+            extractor is re-raised unchanged.
+        OSError: When the HDF5 compression plugin is missing — the
+            error includes operator-actionable install instructions.
+    """
+    # Lazy imports so the module-level import surface stays minimal —
+    # neither h5py nor SpikeInterface should be a hard prerequisite
+    # for ``spikelab.spike_sorting.maxwell_io``.
+    import h5py
+    from spikeinterface.extractors.extractor_classes import (
+        MaxwellRecordingExtractor,
+    )
+
+    extractor_kwargs = {}
+    if stream_id is not None:
+        extractor_kwargs["stream_id"] = stream_id
+
+    try:
+        rec = MaxwellRecordingExtractor(rec_path, **extractor_kwargs)
+    except ValueError as exc:
+        # neo's MaxwellRawIO rejects mxw v25.x files whose
+        # settings/mapping table has duplicate channel IDs. Fall
+        # back to the native loader, which dedupes and bypasses neo
+        # entirely. Any other ValueError is re-raised.
+        if "do not have unique ids" not in str(exc):
+            raise
+        print(
+            "MaxwellRecordingExtractor rejected the file (non-unique "
+            "channel IDs in settings/mapping); falling back to "
+            "spikelab.spike_sorting.maxwell_io.load_maxwell_native()."
+        )
+        well_id = stream_id if stream_id is not None else "well000"
+        return load_maxwell_native(rec_path, well_id=well_id)
+
+    # The HDF5-plugin probe and routed-channel reconciliation below
+    # are specific to the MaxwellRecordingExtractor path. The native
+    # loader already opened the file with h5py (which would have
+    # errored out without the plugin) and only returns the routed
+    # channels.
+    test_file = h5py.File(rec_path)
+    if "sig" not in test_file:  # Test if hdf5_plugin_path is needed
+        try:
+            test_file["/data_store/data0000/groups/routed/raw"][0, 0]
+        except OSError as exception:
+            test_file.close()
+            print("*" * 10)
+            print("""This MaxWell Biosystems file format is based on HDF5.
+The internal compression requires a custom plugin.
+Please visit this page and install the missing decompression libraries:
+https://share.mxwbio.com/d/4742248b2e674a85be97/
+
+Setup options (choose one):
+    1. Pass hdf5_plugin_path='/path/to/plugin/' to sort_with_kilosort2().
+    2. Set os.environ['HDF5_PLUGIN_PATH'] BEFORE importing this module.
+    3. Follow the Maxwell instructions at the link above.
+""")
+            print("*" * 10)
+            raise exception
+    test_file.close()
+    # Reconcile declared vs. routed channels. MaxOne recordings report
+    # 1024 readout channels but get_traces() returns the full 1024-wide
+    # array regardless of routing; slicing by the extractor's own
+    # channel_ids forces the width to match get_num_channels(). No-op
+    # when all channels are routed (MaxTwo).
+    return rec.select_channels(rec.get_channel_ids())
+
+
 def load_maxwell_native(
     h5_path: Any,
     well_id: str = "well000",

@@ -8674,35 +8674,35 @@ class TestSanitizeForJsonZeroDArrayAndCapAdjustable:
     larger arrays through.
     """
 
-    def test_zero_d_array_raises_type_error_current_bug(self):
+    def test_zero_d_array_coerces_via_scalar_branch(self):
         """
-        **Pins a current source bug** (not the documented contract).
-
-        ``_sanitize_for_json`` for a 0-D ``np.ndarray`` (e.g.
-        ``np.array(5.0)``) takes the ``isinstance(obj, np.ndarray)``
-        branch (``obj.size == 1`` so it's under the cap) and then
-        evaluates ``[_sanitize_for_json(v) for v in obj.tolist()]``.
-        But ``np.array(5.0).tolist()`` returns a Python *scalar*
-        (5.0), not a list. Iterating that raises
-        ``TypeError: 'float' object is not iterable``.
-
-        The intent for 0-D arrays is presumably to fall through to
-        the ``np.generic`` branch (via ``.item()`` → scalar) or to
-        special-case the 0-D shape. Pin the crash so the future fix
-        flips the assertion from ``raises`` to a successful scalar
-        coercion. Until then, callers should ``arr.item()`` upstream
-        to avoid this path.
+        0-D ``np.ndarray`` routes through the scalar branch (via
+        ``.item()``) so the result is a native Python scalar — not a
+        list. The ``obj.ndim == 0`` guard added to the source
+        side-steps the ``[_sanitize_for_json(v) for v in obj.tolist()]``
+        list-comprehension trap (``.tolist()`` on a 0-D array returns
+        a scalar, which isn't iterable).
 
         Tests:
-            (Test Case 1) ``np.array(5.0)`` raises ``TypeError``.
-            (Test Case 2) ``np.array(7)`` raises ``TypeError``.
+            (Test Case 1) ``np.array(5.0)`` → Python ``float`` 5.0.
+            (Test Case 2) ``np.array(7)`` → Python ``int`` 7.
+            (Test Case 3) ``np.array(float('nan'))`` → ``None`` (NaN
+                handling propagates from the float branch via
+                ``.item()``).
+            (Test Case 4) ``np.array(float('inf'))`` → ``None``.
         """
         from spikelab.mcp_server.server import _sanitize_for_json
 
-        with pytest.raises(TypeError, match="not iterable"):
-            _sanitize_for_json(np.array(5.0))
-        with pytest.raises(TypeError, match="not iterable"):
-            _sanitize_for_json(np.array(7))
+        out_f = _sanitize_for_json(np.array(5.0))
+        assert out_f == 5.0
+        assert type(out_f) is float
+
+        out_i = _sanitize_for_json(np.array(7))
+        assert out_i == 7
+        assert type(out_i) is int
+
+        assert _sanitize_for_json(np.array(float("nan"))) is None
+        assert _sanitize_for_json(np.array(float("inf"))) is None
 
     def test_max_inline_array_size_monkeypatch_raises_cap(self):
         """

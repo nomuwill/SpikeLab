@@ -4234,6 +4234,13 @@ def _sanitize_for_json(obj: Any) -> Any:
                     "MAX_INLINE_ARRAY_SIZE`` to a larger value before "
                     "invoking the tool."
                 )
+            if obj.ndim == 0:
+                # 0-D array: ``.tolist()`` returns a Python scalar (not
+                # a list), so the list comprehension below would raise
+                # ``TypeError: 'float' object is not iterable``. Route
+                # through the scalar branch instead so NaN/Inf
+                # propagate to None and numpy-scalar types coerce.
+                return _sanitize_for_json(obj.item())
             return [_sanitize_for_json(v) for v in obj.tolist()]
         if isinstance(obj, _np.generic):
             # Numpy scalar — convert to Python equivalent so the float

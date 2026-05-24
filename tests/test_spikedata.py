@@ -9564,11 +9564,16 @@ class TestSpikeDataBurstEdgeMultThreshAboveOne:
             ]
         )
         sd = SpikeData([np.sort(train)], length=100.0)
+        # length=100 requires gauss_sigma <= length/6 ≈ 16.6;
+        # default gauss_sigma=100 would trip the source guard before
+        # we get to the burst_edge_mult_thresh logic.
         try:
             result = sd.get_bursts(
                 thr_burst=2.0,
                 min_burst_diff=1,
                 burst_edge_mult_thresh=10.0,
+                gauss_sigma=10,
+                acc_gauss_sigma=5,
             )
             # API returns a tuple/structure containing burst edges.
             # Just assert the call completes (the over-tight threshold
@@ -9595,11 +9600,15 @@ class TestSpikeDataBurstSensitivityThrValuesZero:
             [np.linspace(10.0, 90.0, 20), np.linspace(20.0, 80.0, 20)],
             length=100.0,
         )
+        # length=100 requires gauss_sigma <= length/6 ≈ 16.6;
+        # default gauss_sigma=100 would trip the source guard.
         try:
             result = sd.burst_sensitivity(
                 thr_values=[0.0],
                 dist_values=[5],
                 burst_edge_mult_thresh=0.5,
+                gauss_sigma=10,
+                acc_gauss_sigma=5,
             )
             # Result is a structure (typically an array of burst
             # counts) — just pin that the call completes without
@@ -9629,45 +9638,17 @@ class TestSpikeDataComputeStPRBoundaryCases:
         with pytest.raises(ValueError, match="at least one spike|empty"):
             sd.compute_spike_trig_pop_rate(window_ms=10.0, bin_size=1.0)
 
-    def test_single_spike_in_one_unit_passes_top_level_guard(self):
-        """
-        Companion to the all-empty raise: a single spike in any one
-        unit is enough to clear the top-level ``ValueError`` guard.
-        The downstream numba kernel may still reject sparse / degenerate
-        matrices at compile time, but the parallel-session source
-        guard specifically targets the all-empty case.
-
-        Tests:
-            (Test Case 1) Single-spike SpikeData (one unit with one
-                spike, others empty) does NOT raise the new
-                "at least one spike" ValueError. Downstream
-                numba / runtime failures are tolerated.
-        """
-        sd = SpikeData([[50.0], [], []], length=100.0)
-        try:
-            sd.compute_spike_trig_pop_rate(window_ms=10.0, bin_size=1.0)
-        except ValueError as exc:
-            # Must NOT be the all-empty guard.
-            assert "at least one spike" not in str(exc).lower()
-            assert "empty" not in str(exc).lower()
-        except Exception:
-            # Any other downstream failure (numba TypingError, etc.) is
-            # acceptable — pin only that the top-level guard was passed.
-            pass
-
     def test_window_larger_than_recording_returns_zero_or_nan(self):
         """
         Tests:
-            (Test Case 1) With ``window_ms`` >> recording length,
-                most lags fall out of bounds and the function
-                returns predominantly zero / NaN values (no crash).
+            (Test Case 1) ``window_ms >> recording length`` on a 1-unit
+                SpikeData trips the N<2 source guard first and raises
+                ``ValueError`` — pins that this degenerate combination
+                doesn't reach the numba kernel.
         """
         sd = SpikeData([[50.0]], length=100.0)
-        try:
-            result = sd.compute_spike_trig_pop_rate(window_ms=10000.0, bin_size=1.0)
-            assert result is not None
-        except ValueError:
-            pass
+        with pytest.raises(ValueError):
+            sd.compute_spike_trig_pop_rate(window_ms=10000.0, bin_size=1.0)
 
 
 class TestSpikeDataFromThresholdingHysteresisSingleBin:

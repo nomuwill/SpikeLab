@@ -1303,6 +1303,12 @@ class SpikeData:
         """
         if np.isnan(bin_size) or bin_size <= 0:
             raise ValueError(f"bin_size must be > 0, got {bin_size}.")
+        if time_offset < -self.length:
+            raise ValueError(
+                f"time_offset ({time_offset}) cannot be less than -length "
+                f"({-self.length}); the resulting raster would have a negative "
+                f"number of bins."
+            )
         length = int(np.ceil((self.length + time_offset) / bin_size))
         # N==0 short-circuit: np.hstack on an empty list raises, so
         # build the empty (0, T) sparse matrix directly.
@@ -2488,6 +2494,19 @@ class SpikeData:
             raise ValueError(f"gauss_sigma must be non-negative, got {gauss_sigma}")
         if square_width < 0:
             raise ValueError(f"square_width must be non-negative, got {square_width}")
+        if square_width > self.length:
+            raise ValueError(
+                f"square_width ({square_width} ms) cannot exceed recording length "
+                f"({self.length} ms); np.convolve(mode='same') would otherwise "
+                f"return an output sized to the kernel rather than the raster."
+            )
+        if 6 * gauss_sigma > self.length:
+            raise ValueError(
+                f"gauss_sigma ({gauss_sigma} ms) is too large for recording length "
+                f"({self.length} ms); the Gaussian kernel spans 6*sigma ms, which "
+                f"would exceed the raster and yield an output sized to the kernel "
+                f"rather than the raster."
+            )
 
         # Convert ms to bins
         square_width_bins = max(0, int(round(square_width / raster_bin_size_ms)))
@@ -2579,6 +2598,12 @@ class SpikeData:
             raise ValueError("window_ms must be at least 1.")
         if self.N < 2:
             raise ValueError("compute_spike_trig_pop_rate requires at least 2 units.")
+        if not any(len(ts) > 0 for ts in self.train):
+            raise ValueError(
+                "compute_spike_trig_pop_rate requires at least one spike across all "
+                "units; got an all-empty spike matrix (the numba kernel cannot infer "
+                "types for a zero-spike input)."
+            )
 
         # Bin spike data to a spike matrix
         spike_matrix = self.sparse_raster(bin_size=bin_size).toarray()
@@ -2995,6 +3020,13 @@ class SpikeData:
                 "fit_gplvm requires 'poor_man_gplvm' and 'jax'. "
                 "Install with: pip install poor-man-gplvm jax jaxlib jaxopt optax"
             ) from e
+
+        if bin_size_ms > self.length:
+            raise ValueError(
+                f"bin_size_ms ({bin_size_ms}) cannot exceed recording length "
+                f"({self.length}); the resulting spike-count matrix would have "
+                f"zero or one bins, producing a degenerate GPLVM fit."
+            )
 
         if model_class is None:
             model_class = pmg.PoissonGPLVMJump1D

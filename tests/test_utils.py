@@ -4871,3 +4871,197 @@ class TestUtilsRankOrderCorrelationMinOverlapZero:
             assert result is not None
         except (ValueError, TypeError):
             pass  # acceptable if signature differs
+
+
+# ============================================================================
+# Core review (2026-05-24) — utils edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestResampledIsiBoundaries:
+    """``_resampled_isi`` boundaries: ``sigma_ms=0`` skips Gaussian
+    smoothing; spikes with negative times (event-centered data) are
+    handled correctly.
+    """
+
+    def test_sigma_ms_zero_skips_smoothing(self):
+        """
+        Tests:
+            (Test Case 1) ``sigma_ms=0`` does not raise.
+            (Test Case 2) Result is non-negative everywhere (raw ISI
+                rate without smoothing artifacts).
+        """
+        from spikelab.spikedata.utils import _resampled_isi
+
+        spikes = np.array([1.0, 2.0, 5.0, 9.0])
+        times = np.arange(0.0, 10.0, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=0)
+        assert result.shape == times.shape
+        # With sigma=0, smoothing is bypassed; output should be
+        # non-negative everywhere.
+        assert np.all(result >= 0)
+
+    def test_negative_spike_times_handled(self):
+        """
+        Tests:
+            (Test Case 1) Spike times in [-5, 5] with matching grid
+                produce a finite-shape result.
+        """
+        from spikelab.spikedata.utils import _resampled_isi
+
+        spikes = np.array([-3.0, -1.0, 1.0, 3.0])
+        times = np.arange(-5.0, 5.0, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=0.5)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+
+class TestClampUmapNeighborsBoundaries:
+    """``_clamp_umap_n_neighbors`` boundary tests for ``n_samples=2``
+    (lowest valid) and ``n_neighbors=0`` (clamped up to 2).
+    """
+
+    def test_n_samples_below_two_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_samples=1`` raises ValueError.
+            (Test Case 2) ``n_samples=0`` raises ValueError.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        with pytest.raises(ValueError, match="at least 2 samples"):
+            _clamp_umap_n_neighbors(1, 5)
+        with pytest.raises(ValueError, match="at least 2 samples"):
+            _clamp_umap_n_neighbors(0, 5)
+
+    def test_n_samples_exactly_two_returns_one(self):
+        """
+        Tests:
+            (Test Case 1) ``n_samples=2`` yields ``max_nn = 1`` per
+                ``max(1, ceil(2/2) - 1)``.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        # Even when n_neighbors is large, clamps down to max_nn=1.
+        assert _clamp_umap_n_neighbors(2, 5) == 1
+
+    def test_n_neighbors_zero_clamped_up(self):
+        """
+        Tests:
+            (Test Case 1) ``n_neighbors=0`` is clamped up to ``max(0, 2)=2``
+                before the max_nn cap is applied.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        # n_samples=10 → max_nn = max(1, ceil(10/2)-1) = 4.
+        # n_neighbors=0 → max(0,2)=2 → min(2,4)=2.
+        assert _clamp_umap_n_neighbors(10, 0) == 2
+
+
+class TestValidateTimeStartToEndSingleWindow:
+    """``_validate_time_start_to_end`` with a list of length 1 skips
+    the equal-duration check at line ``len(time_diff_check) > 1``. Pin
+    the single-window passthrough.
+    """
+
+    def test_single_window_no_equal_duration_check(self):
+        """
+        Tests:
+            (Test Case 1) ``[(0, 10)]`` passes validation.
+            (Test Case 2) ``[(0, 5)]`` (different duration) also passes,
+                proving the equal-duration check is skipped.
+        """
+        from spikelab.spikedata.utils import _validate_time_start_to_end
+
+        result1 = _validate_time_start_to_end([(0.0, 10.0)])
+        result2 = _validate_time_start_to_end([(0.0, 5.0)])
+        assert result1 == [(0.0, 10.0)]
+        assert result2 == [(0.0, 5.0)]
+
+
+class TestCountMatchingSpikesBoundaries:
+    """``_count_matching_spikes`` boundary contracts: ``delta=inf``
+    matches every pair (capped at ``min(n1, n2)`` by greedy match);
+    duplicate spike times produce greedy consumption.
+    """
+
+    def test_delta_inf_caps_at_min_count(self):
+        """
+        Tests:
+            (Test Case 1) ``delta=inf`` matches ``min(n1, n2)`` pairs.
+        """
+        from spikelab.spikedata.utils import _count_matching_spikes
+
+        t1 = np.array([1.0, 2.0, 3.0])
+        t2 = np.array([100.0, 200.0])
+        assert _count_matching_spikes(t1, t2, delta=np.inf) == 2
+
+    def test_duplicate_spikes_greedy_one_per_pair(self):
+        """
+        Tests:
+            (Test Case 1) Triplet of identical times in t1 matched
+                against single t2 only consumes one pair (greedy).
+        """
+        from spikelab.spikedata.utils import _count_matching_spikes
+
+        t1 = np.array([5.0, 5.0, 5.0])
+        t2 = np.array([5.0])
+        assert _count_matching_spikes(t1, t2, delta=0.0) == 1
+
+
+class TestComputeFootprintSimilarityLagBoundary:
+    """``_compute_footprint_similarity`` with ``max_lag >= n_samples``
+    still returns the lag=0 similarity because the zero-lag branch
+    always operates on the full-length vectors. Only the non-zero
+    lag branches produce empty slices and skip via the ``isnan`` check.
+    """
+
+    def test_max_lag_equals_n_samples_uses_lag_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``max_lag = n_samples`` returns the lag=0
+                cosine similarity (not NaN) for identical templates.
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.array([[0.0, 1.0, 2.0, 1.0, 0.0]])
+        fp2 = fp1.copy()
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=5)
+        assert sim == pytest.approx(1.0)
+
+    def test_max_lag_far_exceeds_returns_lag_zero_similarity(self):
+        """
+        Tests:
+            (Test Case 1) ``max_lag = 10 * n_samples`` returns the
+                zero-lag similarity (not NaN) for non-zero templates.
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.array([[0.0, 1.0, 2.0]])
+        fp2 = np.array([[0.0, 2.0, 4.0]])  # scalar multiple → cosine = 1
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=30)
+        assert sim == pytest.approx(1.0)
+
+
+class TestConsecutiveDurationsNaNThreshold:
+    """``consecutive_durations(threshold=NaN)`` silently returns an
+    empty list because every comparison ``signal >= NaN`` is False.
+    Pin the contract — NaN threshold is currently NOT rejected.
+    """
+
+    def test_nan_threshold_returns_empty(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold=NaN`` yields an empty result.
+
+        Notes:
+            - Mirrors the silent-False semantics noted at
+              [REVIEW_core_edge_case.tmp.md utils section]; pinning
+              this contract surfaces any future change to validation.
+        """
+        signal = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        result = consecutive_durations(signal, threshold=np.nan)
+        # The function returns an array (possibly empty) of durations.
+        result_arr = np.asarray(result)
+        assert result_arr.size == 0

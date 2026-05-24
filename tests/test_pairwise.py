@@ -2877,3 +2877,147 @@ class TestPairwiseCompMatrixExtractPairsByGroupSingleUnit:
                 assert arr.size == 0 or arr.shape[0] == 0
         except (ValueError, IndexError):
             pass  # Acceptable: 1-unit input rejected upstream
+
+
+# ============================================================================
+# Core review (2026-05-24) — Pairwise edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestPairwiseCompMatrixThresholdBoundaries:
+    """Boundary contracts for ``PairwiseCompMatrix.threshold``: NaN
+    thresholds silently produce an all-zero binary matrix (because
+    ``abs(x) > NaN`` is False for every finite x), and negative
+    thresholds turn every off-diagonal into 1. Unlike ``to_networkx``,
+    ``threshold`` does NOT reject NaN — pin the asymmetry.
+    """
+
+    def test_threshold_nan_produces_all_zero_when_preserve_false(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(NaN)`` on a finite-valued matrix
+                returns an all-zero binary matrix.
+            (Test Case 2) Shape preserved.
+        """
+        mat = np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(np.nan, preserve_nan=False)
+        assert binary.matrix.shape == (3, 3)
+        np.testing.assert_array_equal(binary.matrix, np.zeros((3, 3)))
+
+    def test_threshold_nan_with_preserve_nan_propagates_nan(self):
+        """
+        Tests:
+            (Test Case 1) Input NaN positions remain NaN in output
+                when ``preserve_nan=True``.
+        """
+        mat = np.array([[1.0, np.nan, 0.2], [np.nan, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(np.nan, preserve_nan=True)
+        # NaN positions preserved
+        assert np.isnan(binary.matrix[0, 1])
+        assert np.isnan(binary.matrix[1, 0])
+        # Finite positions become 0 (since abs(x) > NaN is False)
+        assert binary.matrix[0, 0] == 0.0
+
+    def test_threshold_negative_makes_all_off_diagonal_one(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(-1.0)`` produces an all-1 binary
+                matrix (since ``abs(x) > -1`` is True for every real x).
+        """
+        mat = np.array([[1.0, 0.5], [0.5, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(-1.0)
+        np.testing.assert_array_equal(binary.matrix, np.ones((2, 2)))
+
+
+class TestPairwiseCompMatrixToNetworkxNegativeThreshold:
+    """``to_networkx(threshold=-1.0)`` is accepted (only NaN/Inf are
+    rejected) and produces a graph where every off-diagonal pair is an
+    edge. Pin the contract: negative thresholds are NOT rejected.
+    """
+
+    def test_negative_threshold_creates_all_edges(self):
+        """
+        Tests:
+            (Test Case 1) ``to_networkx(threshold=-1.0)`` returns a graph
+                with all N*(N-1)/2 off-diagonal edges.
+        """
+        mat = np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        G = pcm.to_networkx(threshold=-1.0)
+        # 3 choose 2 = 3 edges expected
+        assert G.number_of_edges() == 3
+
+
+class TestPairwiseCompMatrixStackThresholdNan:
+    """``PairwiseCompMatrixStack.threshold(NaN)`` symmetric pin for the
+    stack variant. The single-matrix path is pinned by
+    ``TestPairwiseCompMatrixThresholdBoundaries`` above.
+    """
+
+    def test_stack_threshold_nan_produces_all_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(NaN)`` on a finite stack returns
+                an all-zero binary stack (shape preserved).
+        """
+        stack = np.random.rand(3, 3, 2)
+        # Symmetrize so it's a valid pairwise stack
+        for s in range(2):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        binary = pcms.threshold(np.nan, preserve_nan=False)
+        np.testing.assert_array_equal(binary.stack, np.zeros((3, 3, 2)))
+
+
+class TestPairwiseCompMatrixStackFancyEmptyIndex:
+    """``PairwiseCompMatrixStack[np.array([], dtype=int)]`` exercises
+    the fancy-index branch with an empty selector. Per the new line
+    580-584 in the source, this routes through ``np.asarray(times,
+    dtype=object)[[]]`` then back to ``list(...)`` (empty), and
+    ``self.stack[:, :, []]`` produces shape ``(N, N, 0)``. The stack
+    constructor accepts S=0, so this should succeed and yield a
+    zero-slice stack.
+    """
+
+    def test_empty_fancy_index_returns_zero_slice_stack(self):
+        """
+        Tests:
+            (Test Case 1) Indexing with an empty int array returns a
+                stack of shape (N, N, 0).
+        """
+        stack = np.random.rand(3, 3, 4)
+        for s in range(4):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(
+            stack=stack, times=[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
+        )
+        result = pcms[np.array([], dtype=int)]
+        assert isinstance(result, PairwiseCompMatrixStack)
+        assert result.stack.shape == (3, 3, 0)
+        # times list also empty
+        assert result.times is None or len(result.times) == 0
+
+
+class TestPairwiseCompMatrixStackSubsliceFloat:
+    """``PairwiseCompMatrixStack.subslice([0.0, 1.0])`` passes float
+    indices through to numpy fancy indexing. NumPy rejects non-integer
+    indices with an ``IndexError``. Pin the contract (which is
+    inherited from numpy's indexing semantics, not a SpikeLab guard).
+    """
+
+    def test_float_indices_raise_index_error(self):
+        """
+        Tests:
+            (Test Case 1) ``subslice([0.0, 1.0])`` raises ``IndexError``
+                (or ``TypeError`` on older numpy) from numpy.
+        """
+        stack = np.random.rand(3, 3, 4)
+        for s in range(4):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        with pytest.raises((IndexError, TypeError)):
+            pcms.subslice([0.0, 1.0])

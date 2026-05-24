@@ -9830,3 +9830,441 @@ class TestUtilsFindEdgeMonotonicDecreasing:
             assert idx is None or (isinstance(idx, (int, np.integer)) and idx >= 0)
         except (TypeError, ValueError):
             pytest.skip("API signature differs")
+
+
+# ============================================================================
+# Core review (2026-05-24) — pin tests for documented contracts and new
+# boundary guards surfaced by the /complete_review pass on
+# fix/review-cleanups. Each class corresponds to a specific REVIEW.md item.
+# ============================================================================
+
+
+class TestSpikeDataSubsetFractionalFloats:
+    """``SpikeData.subset`` documents (source lines 952-957) that
+    non-integer numeric units silently produce an empty result when no
+    integer index matches via Python ``==``. Pin the silent-empty
+    contract so a regression that started raising would surface.
+    """
+
+    def test_fractional_floats_return_empty(self):
+        """
+        Tests:
+            (Test Case 1) ``subset([0.5, 1.5])`` on N=3 returns N=0.
+            (Test Case 2) The returned SpikeData inherits length/start_time.
+        """
+        sd = SpikeData([[1.0], [2.0], [3.0]], length=10.0)
+        sub = sd.subset([0.5, 1.5])
+        assert sub.N == 0
+        assert sub.train == []
+        assert sub.length == 10.0
+        assert sub.start_time == sd.start_time
+
+
+class TestSpikeDataCvIsiBoundaries:
+    """Boundary tests for ``cv_isi`` / ``cv2_isi`` at exactly 2 spikes
+    (1 ISI) and at duplicate consecutive spike times (ISI=0).
+    """
+
+    def test_exactly_two_spikes_returns_nan(self):
+        """
+        Two spikes produce one ISI; ``cv_isi`` requires ``isi.size >= 2``
+        and skips the unit, returning NaN. Pin the boundary.
+
+        Tests:
+            (Test Case 1) Two-spike unit gives NaN for both metrics.
+        """
+        sd = SpikeData([np.array([5.0, 10.0])], length=20.0)
+        assert np.isnan(sd.cv_isi()[0])
+        assert np.isnan(sd.cv2_isi()[0])
+
+    def test_duplicate_spike_times_zero_isi_mean(self):
+        """
+        Three consecutive duplicate spike times yield ISI=[0, 0];
+        ``mean(isi)==0`` triggers the divide-by-zero NaN path.
+
+        Tests:
+            (Test Case 1) Triplet of identical times yields NaN cv_isi.
+        """
+        sd = SpikeData([np.array([5.0, 5.0, 5.0])], length=20.0)
+        assert np.isnan(sd.cv_isi()[0])
+
+
+class TestSpikeDataBestMatchPartialNaN:
+    """``best_match_assignment`` forwards a score matrix containing
+    NaN entries (but not all-NaN) to ``linear_sum_assignment``, which
+    rejects mixed-NaN-finite matrices with a ``ValueError``. Pin the
+    contract symmetrically with the existing all-NaN test.
+    """
+
+    def test_partial_nan_score_matrix_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) A 3x3 matrix with one NaN entry raises
+                ``ValueError`` from SciPy.
+        """
+        mat = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, np.nan, 6.0],
+                [7.0, 8.0, 9.0],
+            ]
+        )
+        with pytest.raises(ValueError, match="invalid"):
+            SpikeData.best_match_assignment(mat)
+
+
+class TestSpikeDataCompareSorterBoundaries:
+    """Single-sample / zero-delta / zero-max-lag boundary contracts for
+    ``compare_sorter``. The function accepts these degenerate parameter
+    values silently; pin the resulting shapes so a regression that
+    started raising would surface.
+    """
+
+    @staticmethod
+    def _unit_attrs(template, channel=0, neighbor_channel=1):
+        template = np.asarray(template, dtype=float)
+        return {
+            "template": template,
+            "neighbor_templates": np.vstack(
+                [np.zeros_like(template), 0.5 * template]
+            ),
+            "channel": int(channel),
+            "neighbor_channels": np.array([channel, neighbor_channel], dtype=int),
+        }
+
+    def test_delta_ms_zero_spike_times_requires_exact_match(self):
+        """
+        ``delta_ms=0`` accepts only spikes at exactly identical times.
+
+        Tests:
+            (Test Case 1) Identical trains agree.
+            (Test Case 2) Trains offset by 0.01 ms have zero agreement.
+        """
+        sd1 = SpikeData([[10.0, 20.0]], length=30.0)
+        sd2 = SpikeData([[10.0, 20.0]], length=30.0)
+        sd3 = SpikeData([[10.01, 20.01]], length=30.0)
+
+        out_match = sd1.compare_sorter(sd2, comparison_type="spike_times", delta_ms=0.0)
+        out_offset = sd1.compare_sorter(
+            sd3, comparison_type="spike_times", delta_ms=0.0
+        )
+
+        assert out_match["agreement"][0, 0] == pytest.approx(1.0)
+        assert out_offset["agreement"][0, 0] == 0.0
+
+    def test_max_lag_zero_waveforms_zero_lag_only(self):
+        """
+        ``max_lag=0`` in waveform mode runs the no-shift branch only.
+
+        Tests:
+            (Test Case 1) Identical templates yield ``similarity==1`` at
+                ``max_lag=0`` (waveforms branch returns ``similarity``).
+            (Test Case 2) The metadata dict records ``max_lag=0``.
+        """
+        template = np.array([0.0, -1.0, 0.5, 0.0])
+        attrs = [self._unit_attrs(template)]
+        sd1 = SpikeData([[1.0]], length=10.0, neuron_attributes=attrs)
+        sd2 = SpikeData([[1.0]], length=10.0, neuron_attributes=attrs)
+
+        out = sd1.compare_sorter(sd2, comparison_type="waveforms", max_lag=0)
+        assert out["similarity"][0, 0] == pytest.approx(1.0, abs=1e-9)
+        assert out["metadata"]["max_lag"] == 0
+
+
+class TestSpikeDataAlignToEventsNumpyScalar:
+    """The ``bin_size_ms <= 0`` guard at line 593 of ``spikedata.py``
+    must reject ``numpy.float64(0)`` identically to Python ``float(0)``.
+    Pin the numpy-scalar branch so a future refactor that compares with
+    ``is`` or that special-cases the type would not slip past.
+    """
+
+    def test_numpy_scalar_bin_size_ms_zero_rejected(self):
+        """
+        Tests:
+            (Test Case 1) ``bin_size_ms=np.float64(0)`` with ``kind='rate'``
+                raises ``ValueError``.
+            (Test Case 2) ``bin_size_ms=np.float64(-1.0)`` similarly raises.
+        """
+        sd = SpikeData([[10.0, 20.0, 30.0]], length=100.0)
+        events = [25.0]
+        with pytest.raises(ValueError):
+            sd.align_to_events(
+                events, pre_ms=5.0, post_ms=5.0, kind="rate", bin_size_ms=np.float64(0)
+            )
+        with pytest.raises(ValueError):
+            sd.align_to_events(
+                events,
+                pre_ms=5.0,
+                post_ms=5.0,
+                kind="rate",
+                bin_size_ms=np.float64(-1.0),
+            )
+
+
+class TestSpikeDataSubtimeNanEndAndShiftToInf:
+    """Symmetric coverage of NaN/Inf boundaries on ``subtime``. The
+    existing tests pin ``start=NaN`` and ``shift_to=NaN``; pin the
+    matching ``end=NaN`` and ``shift_to=inf`` paths.
+    """
+
+    def test_end_nan_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime(0, NaN)`` raises ``ValueError``.
+        """
+        sd = SpikeData([[10.0, 20.0]], length=50.0)
+        with pytest.raises(ValueError):
+            sd.subtime(0.0, np.nan)
+
+    def test_shift_to_inf_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime(0, 10, shift_to=inf)`` raises.
+            (Test Case 2) ``subtime(0, 10, shift_to=-inf)`` raises.
+        """
+        sd = SpikeData([[5.0]], length=50.0)
+        with pytest.raises(ValueError):
+            sd.subtime(0.0, 10.0, shift_to=np.inf)
+        with pytest.raises(ValueError):
+            sd.subtime(0.0, 10.0, shift_to=-np.inf)
+
+
+class TestSpikeDataFromIdcesTimesEmpty:
+    """``from_idces_times([], [], N=5)`` produces an N=5 SpikeData with
+    length=0 (all-empty trains). Pin the documented behaviour at source
+    lines 92-94 — the user-supplied N is preserved when idces is empty,
+    contrary to the initial review claim that it was silently zeroed.
+    """
+
+    def test_empty_idces_preserves_user_supplied_n(self):
+        """
+        Tests:
+            (Test Case 1) ``N=5`` is preserved (not reset to 0).
+            (Test Case 2) ``length`` defaults to 0 when not given.
+            (Test Case 3) All trains are empty.
+        """
+        sd = SpikeData.from_idces_times([], [], N=5)
+        assert sd.N == 5
+        assert sd.length == 0
+        assert all(len(t) == 0 for t in sd.train)
+
+
+class TestSpikeDataGetFracActiveBoundaries:
+    """``get_frac_active`` boundary tests for ``MIN_SPIKES=0`` and
+    ``backbone_threshold`` at 0 / 1. Pin the documented contract: a
+    threshold of 0 marks every unit as backbone, a threshold of 1
+    requires fully-active units (frac_per_unit==1.0).
+    """
+
+    def test_min_spikes_zero_counts_every_unit_active(self):
+        """
+        Tests:
+            (Test Case 1) ``MIN_SPIKES=0`` marks every burst-unit pair
+                active regardless of spike count.
+            (Test Case 2) ``frac_per_burst`` is 1.0 for every burst.
+        """
+        sd = SpikeData([[5.0, 10.0], [25.0]], length=50.0)
+        edges = np.array([[0.0, 20.0], [20.0, 40.0]])
+        frac_per_unit, frac_per_burst, backbone = sd.get_frac_active(
+            edges, MIN_SPIKES=0, backbone_threshold=0.5, bin_size=1.0
+        )
+        assert frac_per_burst.shape == (2,)
+        np.testing.assert_allclose(frac_per_burst, [1.0, 1.0])
+
+    def test_backbone_threshold_zero_includes_every_unit(self):
+        """
+        Tests:
+            (Test Case 1) ``backbone_threshold=0`` returns every unit
+                index in the backbone array (``frac_per_unit >= 0`` is
+                always True).
+
+        Notes:
+            - ``get_frac_active`` returns ``backbone_units`` as an
+              **array of indices** (per source line 2092), not a
+              boolean mask.
+        """
+        sd = SpikeData([[5.0, 10.0], [15.0]], length=50.0)
+        edges = np.array([[0.0, 20.0]])
+        _, _, backbone = sd.get_frac_active(
+            edges, MIN_SPIKES=1, backbone_threshold=0.0, bin_size=1.0
+        )
+        # Every unit index appears in the backbone array.
+        assert len(backbone) == sd.N
+        assert set(backbone.tolist()) == set(range(sd.N))
+
+    def test_backbone_threshold_one_excludes_partially_active(self):
+        """
+        Tests:
+            (Test Case 1) ``backbone_threshold=1`` returns only indices
+                of fully-active units (frac_per_unit == 1).
+        """
+        # Unit 0 fires in both bursts, unit 1 only in the first.
+        sd = SpikeData([[5.0, 25.0], [5.0]], length=50.0)
+        edges = np.array([[0.0, 20.0], [20.0, 40.0]])
+        _, _, backbone = sd.get_frac_active(
+            edges, MIN_SPIKES=1, backbone_threshold=1.0, bin_size=1.0
+        )
+        # Only unit 0 is active in every burst → only index 0 in backbone.
+        assert 0 in backbone
+        assert 1 not in backbone
+
+
+class TestSpikeDataSplitEpochsBoundary:
+    """``split_epochs`` boundary contracts: malformed chunks (start>=end)
+    propagate ``subtime`` errors; overlapping chunks are silently
+    accepted; ``rec_chunk_names`` length mismatches use only the first
+    N entries (no validation).
+    """
+
+    def test_chunk_start_ge_end_propagates_subtime_error(self):
+        """
+        Tests:
+            (Test Case 1) ``rec_chunks_ms=[(100, 100)]`` raises (zero-
+                duration window from ``subtime``).
+        """
+        sd = SpikeData([[10.0, 50.0, 150.0]], length=200.0)
+        sd.metadata["rec_chunks_ms"] = [(100.0, 100.0)]
+        with pytest.raises(ValueError):
+            sd.split_epochs()
+
+    def test_overlapping_chunks_silently_accepted(self):
+        """
+        Tests:
+            (Test Case 1) Overlapping chunks are NOT rejected; both
+                epochs are produced.
+            (Test Case 2) Spikes appearing in both windows appear in
+                both epoch outputs.
+
+        Notes:
+            - Pins current contract that ``split_epochs`` does not
+              validate non-overlap. A regression that started raising
+              would surface here.
+        """
+        sd = SpikeData([[10.0, 50.0, 90.0]], length=200.0)
+        sd.metadata["rec_chunks_ms"] = [(0.0, 100.0), (50.0, 150.0)]
+        epochs = sd.split_epochs()
+        assert len(epochs) == 2
+        # The spike at t=50 falls in both windows; verify both contain it.
+        assert any(np.isclose(t, 50.0) for t in epochs[0].train[0])
+        # epoch 1's spike is shifted to t=0 (50 - 50)
+        assert any(np.isclose(t, 0.0) for t in epochs[1].train[0])
+
+    def test_rec_chunk_names_length_mismatch_extras_ignored(self):
+        """
+        Tests:
+            (Test Case 1) When ``rec_chunk_names`` has more entries than
+                ``rec_chunks_ms``, the extras are silently ignored.
+
+        Notes:
+            - Pins the implicit "extra names trimmed" contract. The
+              opposite case (fewer names) is implementation-defined.
+        """
+        sd = SpikeData([[10.0]], length=100.0)
+        sd.metadata["rec_chunks_ms"] = [(0.0, 100.0)]
+        sd.metadata["rec_chunk_names"] = ["a", "b", "c"]  # extras
+        epochs = sd.split_epochs()
+        assert len(epochs) == 1
+
+
+class TestSpikeDataSetNeuronAttributeNonStringKey:
+    """``set_neuron_attribute`` added a ``TypeError`` guard at source
+    line 869-870 for non-string keys. Pin the rejection so a refactor
+    that loosened the type-check would surface.
+    """
+
+    def test_integer_key_rejected(self):
+        """
+        Tests:
+            (Test Case 1) Integer key raises ``TypeError``.
+            (Test Case 2) The message names the actual type.
+        """
+        sd = SpikeData([[1.0], [2.0]], length=10.0)
+        with pytest.raises(TypeError, match="key must be a string"):
+            sd.set_neuron_attribute(0, "val")
+
+    def test_none_key_rejected(self):
+        """
+        Tests:
+            (Test Case 1) ``None`` as key raises ``TypeError``.
+        """
+        sd = SpikeData([[1.0]], length=10.0)
+        with pytest.raises(TypeError, match="key must be a string"):
+            sd.set_neuron_attribute(None, "val")
+
+
+class TestSpikeDataFromThresholdingDirectionBranches:
+    """``from_thresholding`` has three direction branches: ``'up'``
+    (positive crossings only), ``'down'`` (negative crossings only),
+    and ``'both'`` (default). The existing tests cover ``'both'``;
+    pin the ``'up'`` and ``'down'`` branches separately.
+    """
+
+    def test_direction_up_detects_positive_crossings_only(self):
+        """
+        Tests:
+            (Test Case 1) A signal with both up- and down-crossings
+                produces only the up-crossings under ``direction='up'``.
+
+        Notes:
+            - ``threshold_sigma=1.0`` keeps the threshold below the
+              ±5 signal amplitude given the per-channel std of the
+              constructed test data (~2.9). A higher sigma would push
+              the threshold past the signal and miss every crossing.
+        """
+        # Build a 1-channel signal that crosses up at sample 5, then
+        # crosses down at sample 15.
+        data = np.zeros((1, 30))
+        data[0, 5:10] = 5.0  # up-crossing at 5, hold, end at 10
+        data[0, 15:20] = -5.0  # down-crossing at 15
+        sd_up = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            direction="up",
+            hysteresis=False,
+        )
+        sd_both = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            direction="both",
+            hysteresis=False,
+        )
+        n_up = sum(len(t) for t in sd_up.train)
+        n_both = sum(len(t) for t in sd_both.train)
+        # 'up' should produce at least one crossing and strictly fewer
+        # than 'both' (which sees both polarities).
+        assert n_up >= 1
+        assert n_up < n_both
+
+    def test_direction_down_detects_negative_crossings_only(self):
+        """
+        Tests:
+            (Test Case 1) A signal with both polarities produces only
+                the down-crossings under ``direction='down'``.
+        """
+        data = np.zeros((1, 30))
+        data[0, 5:10] = 5.0
+        data[0, 15:20] = -5.0
+        sd_down = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            direction="down",
+            hysteresis=False,
+        )
+        sd_both = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            direction="both",
+            hysteresis=False,
+        )
+        n_down = sum(len(t) for t in sd_down.train)
+        n_both = sum(len(t) for t in sd_both.train)
+        assert n_down >= 1
+        assert n_down < n_both

@@ -1933,3 +1933,116 @@ class TestRateDataGetPairwiseFrCorrCompareFuncRaises:
 
         with pytest.raises(RuntimeError, match="compare_func intentional"):
             rd.get_pairwise_fr_corr(compare_func=bad_compare, max_lag=1, n_jobs=1)
+
+
+# ============================================================================
+# Core review (2026-05-24) — RateData edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestRateDataConstructorNdimGuard:
+    """``RateData.__init__`` rejects ``times.ndim != 1`` at line 79-80.
+    Pin the guard so a regression that flattened or skipped the
+    dimensionality check would surface.
+    """
+
+    def test_2d_times_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``times`` of shape (2, 3) raises ValueError
+                naming ``1-D``.
+
+        Notes:
+            - ``data.shape[1]`` must match ``len(times)`` (= 2 for a
+              shape-(2,3) array) so the earlier column-count guard
+              passes and the ndim check fires.
+        """
+        data = np.zeros((1, 2))
+        times = np.zeros((2, 3))
+        with pytest.raises(ValueError, match="1-D"):
+            RateData(data, times)
+
+    def test_0d_times_raises_typeerror_via_len(self):
+        """
+        Tests:
+            (Test Case 1) Scalar ``times`` (ndim=0) raises ``TypeError``
+                from the upstream ``len(times)`` call at line 72.
+
+        Notes:
+            - The ndim guard at line 79 is unreachable for 0-d input
+              because the earlier ``len(times)`` call fails first.
+              Pin the ``TypeError`` as the actual current contract.
+        """
+        data = np.zeros((1, 1))
+        times = np.array(5.0)
+        with pytest.raises(TypeError):
+            RateData(data, times)
+
+
+class TestRateDataSubtimeNanEnd:
+    """Symmetric coverage of ``RateData.subtime`` with NaN bounds. The
+    existing tests cover ``start=NaN``; pin ``end=NaN`` to lock both
+    paths.
+    """
+
+    def test_end_nan_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime(0, NaN)`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=2, n_times=10, step=1.0, t0=0.0)
+        with pytest.raises(ValueError):
+            rd.subtime(0.0, np.nan)
+
+
+class TestRateDataSubtimeByIndexZeroBoundary:
+    """``subtime_by_index(0, 0)`` exercises the ``end_idx <= start_idx``
+    branch at line 282. Pin the boundary; the docstring requires
+    ``end_idx > start_idx`` for a non-empty window.
+    """
+
+    def test_subtime_by_index_zero_zero_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime_by_index(0, 0)`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=2, n_times=10, step=1.0, t0=0.0)
+        with pytest.raises(ValueError):
+            rd.subtime_by_index(0, 0)
+
+
+class TestRateDataGetManifoldErrorBranches:
+    """``get_manifold`` error paths: unknown method strings produce
+    ``ValueError`` from the trailing raise at line 508; ``n_components <= 0``
+    raises from the explicit guard at line 459-463.
+    """
+
+    def test_empty_method_string_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``method=''`` falls through PCA/UMAP branches
+                and raises the unknown-method ValueError.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="Unknown manifold method"):
+            rd.get_manifold(method="", n_components=2)
+
+    def test_unknown_method_pca_typo_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``method='ICA'`` raises with the documented
+                message.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="Unknown manifold method"):
+            rd.get_manifold(method="ICA", n_components=2)
+
+    def test_n_components_negative_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_components=-1`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="n_components"):
+            rd.get_manifold(method="PCA", n_components=-1)

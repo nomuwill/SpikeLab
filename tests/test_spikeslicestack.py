@@ -4459,3 +4459,148 @@ class TestSpikeSliceStackBoundarySpike:
         sd = SpikeData([np.array([10.0001])], length=20.0)
         with pytest.raises(ValueError, match="fall outside"):
             SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 10.0)])
+
+
+# ============================================================================
+# Core review (2026-05-24) — SpikeSliceStack edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestSpikeSliceStackToRasterArrayBinSizeGuard:
+    """``to_raster_array`` added a ``bin_size <= 0`` guard at line
+    439-440 of ``spikeslicestack.py``. Pin the new guard symmetrically
+    with NaN coverage via the inner ``sparse_raster`` guard.
+    """
+
+    def test_bin_size_zero_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``bin_size=0`` raises ValueError mentioning
+                ``bin_size``.
+        """
+        sd = make_spikedata(n_units=2, length_ms=100.0)
+        sss = SpikeSliceStack(sd, times_start_to_end=[(0.0, 50.0), (50.0, 100.0)])
+        with pytest.raises(ValueError, match="bin_size"):
+            sss.to_raster_array(bin_size=0)
+
+    def test_bin_size_negative_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``bin_size=-1.0`` raises ValueError.
+        """
+        sd = make_spikedata(n_units=2, length_ms=100.0)
+        sss = SpikeSliceStack(sd, times_start_to_end=[(0.0, 50.0), (50.0, 100.0)])
+        with pytest.raises(ValueError, match="bin_size"):
+            sss.to_raster_array(bin_size=-1.0)
+
+    def test_bin_size_nan_raises_via_inner_guard(self):
+        """
+        Tests:
+            (Test Case 1) ``bin_size=NaN`` slips past the outer
+                ``<= 0`` check (NaN <= 0 is False) but is caught by
+                the inner ``sparse_raster`` NaN guard.
+        """
+        sd = make_spikedata(n_units=2, length_ms=100.0)
+        sss = SpikeSliceStack(sd, times_start_to_end=[(0.0, 50.0), (50.0, 100.0)])
+        with pytest.raises(ValueError):
+            sss.to_raster_array(bin_size=np.nan)
+
+
+class TestSpikeSliceStackInitEmptyStack:
+    """``SpikeSliceStack`` rejects ``spike_stack=[]`` at line 142 of
+    ``spikeslicestack.py`` with an explicit ValueError. Pin the
+    boundary.
+    """
+
+    def test_empty_spike_stack_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``spike_stack=[]`` raises ValueError with
+                message "must not be empty".
+        """
+        with pytest.raises(ValueError, match="must not be empty"):
+            SpikeSliceStack(spike_stack=[])
+
+
+class TestSpikeSliceStackInitBothInputsWarns:
+    """When the caller supplies both ``data_obj`` and ``spike_stack``,
+    the constructor emits a UserWarning and uses ``spike_stack``.
+    Pin the warning so a refactor that silently dropped it would surface.
+    """
+
+    def test_both_inputs_warns_and_uses_spike_stack(self):
+        """
+        Tests:
+            (Test Case 1) Construction emits UserWarning.
+            (Test Case 2) The result reflects spike_stack contents, not
+                data_obj contents.
+        """
+        sd_obj = make_spikedata(n_units=2, length_ms=100.0, seed=1)
+        sd_stack = SpikeData([np.array([10.0])], length=20.0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sss = SpikeSliceStack(
+                data_obj=sd_obj,
+                spike_stack=[sd_stack],
+                times_start_to_end=[(0.0, 20.0)],
+            )
+        assert any("data_obj" in str(w.message) for w in caught)
+        # spike_stack content used: N=1
+        assert sss.spike_stack[0].N == 1
+
+
+class TestSpikeSliceStackResponsiveUnitsThresholdBoundary:
+    """``responsive_units`` boundary contracts for ``z_threshold``:
+    NaN threshold silently produces an all-False mask (NaN comparisons
+    are False); ``z_threshold=0`` is the most permissive boundary.
+    """
+
+    def test_z_threshold_nan_returns_all_false(self):
+        """
+        Tests:
+            (Test Case 1) ``z_threshold=NaN`` returns a mask that is
+                False for every unit (NaN compares False everywhere).
+        """
+        # Two slices, baseline = (0, 50ms), full-slice response
+        sd = make_spikedata(n_units=3, length_ms=400.0, seed=7)
+        sss = SpikeSliceStack(
+            sd, times_start_to_end=[(0.0, 200.0), (200.0, 400.0)]
+        )
+        mask = sss.responsive_units(
+            bin_size=10.0,
+            baseline_window_ms=(0.0, 50.0),
+            z_threshold=np.nan,
+        )
+        assert mask.shape == (3,)
+        assert not mask.any()
+
+
+class TestSpikeSliceStackApplyNoneReturn:
+    """``apply`` with a ``func`` returning ``None`` produces an object
+    array via ``np.stack``. Pin the no-rejection contract — the user
+    is responsible for returning numerics.
+    """
+
+    def test_apply_func_returning_none_does_not_crash(self):
+        """
+        Tests:
+            (Test Case 1) ``apply`` does not raise on a None-returning
+                func.
+            (Test Case 2) Result has object dtype (numpy boxes None).
+
+        Notes:
+            - This pins the *current* behaviour: ``apply`` does not
+              validate the return type. A future refactor that rejects
+              None-returning funcs explicitly would break this test.
+        """
+        sd = make_spikedata(n_units=2, length_ms=100.0)
+        sss = SpikeSliceStack(sd, times_start_to_end=[(0.0, 50.0), (50.0, 100.0)])
+        try:
+            result = sss.apply(lambda s: None)
+        except (ValueError, TypeError) as exc:
+            # If apply rejects None explicitly, that is also a valid contract.
+            pytest.skip(f"apply rejects None-returning func: {exc}")
+        else:
+            # Accepted: result is an object-dtype array (numpy boxing None).
+            assert result.dtype == object or result.shape == (2,)

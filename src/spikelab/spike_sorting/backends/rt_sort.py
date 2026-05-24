@@ -253,18 +253,20 @@ class RTSortBackend(SorterBackend):
 
         sorting, root_elecs = result
 
-        # ``config.sorter.sorter_params`` is typically ``None`` for the
-        # RT-Sort backend (RT-Sort uses ``config.rt_sort.params`` for
-        # its own knobs); the resulting ``keep_good_only=False``
-        # matches the legacy behaviour where ``_globals.KILOSORT_PARAMS``
-        # is the Kilosort dict and is unset during RT-Sort runs.
-        sorter_params = self.config.sorter.sorter_params or {}
+        # ``keep_good_only`` is a Kilosort curation flag exposed via
+        # ``config.sorter.sorter_params``. RT-Sort has no equivalent
+        # notion at the KilosortSortingExtractor level, so hard-code
+        # ``False`` here to prevent Kilosort params from bleeding into
+        # the RT-Sort path when both backends are co-configured. If
+        # RT-Sort ever needs its own "good only" filter, plumb it
+        # through ``config.rt_sort.params`` rather than reusing the
+        # Kilosort section.
         return _numpy_sorting_to_ks_extractor(
             sorting,
             recording,
             output_folder,
             root_elecs=root_elecs,
-            keep_good_only=bool(sorter_params.get("keep_good_only")),
+            keep_good_only=False,
             pos_peak_thresh=self.config.waveform.pos_peak_thresh,
         )
 

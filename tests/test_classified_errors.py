@@ -579,3 +579,108 @@ class TestCurationRaisesEmptyWaveformMetrics:
             assert isinstance(err, EmptyWaveformMetricsError)
             assert isinstance(err, BiologicalSortFailure)
             assert isinstance(err, SpikeSortingClassifiedError)
+
+
+class TestClassifierLogFinders:
+    """``_find_ks2_log`` / ``_find_ks4_log`` / ``_find_rt_sort_log``
+    each search a small list of candidate paths in priority order and
+    return the first that ``is_file()``.
+    """
+
+    def test_ks2_log_prefers_root_over_sorter_output(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) When both ``output/kilosort2.log`` and
+                ``output/sorter_output/kilosort2.log`` exist, the
+                root-level file is returned (first candidate wins).
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        (tmp_path / "kilosort2.log").write_text("root", encoding="utf-8")
+        (tmp_path / "sorter_output").mkdir()
+        (tmp_path / "sorter_output" / "kilosort2.log").write_text(
+            "nested", encoding="utf-8"
+        )
+        result = _find_ks2_log(tmp_path)
+        assert result == tmp_path / "kilosort2.log"
+
+    def test_ks2_log_falls_back_to_sorter_output(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) Only ``output/sorter_output/kilosort2.log``
+                exists — the search falls through to the second
+                candidate.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        (tmp_path / "sorter_output").mkdir()
+        (tmp_path / "sorter_output" / "kilosort2.log").write_text(
+            "nested", encoding="utf-8"
+        )
+        result = _find_ks2_log(tmp_path)
+        assert result == tmp_path / "sorter_output" / "kilosort2.log"
+
+    def test_ks2_log_none_when_no_candidates(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) Neither candidate path exists → returns None.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        assert _find_ks2_log(tmp_path) is None
+
+    def test_ks4_log_prefers_root_over_sorter_output(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) Root-level KS4 log wins over nested.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks4_log
+
+        (tmp_path / "kilosort4.log").write_text("root", encoding="utf-8")
+        (tmp_path / "sorter_output").mkdir()
+        (tmp_path / "sorter_output" / "kilosort4.log").write_text(
+            "nested", encoding="utf-8"
+        )
+        assert _find_ks4_log(tmp_path) == tmp_path / "kilosort4.log"
+
+    def test_ks4_log_none_when_no_candidates(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) No KS4 log → None.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks4_log
+
+        assert _find_ks4_log(tmp_path) is None
+
+    def test_rt_sort_log_returns_path_when_present(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) ``rt_sort.log`` at the root → returned.
+        """
+        from spikelab.spike_sorting._classifier import _find_rt_sort_log
+
+        (tmp_path / "rt_sort.log").write_text("ok", encoding="utf-8")
+        assert _find_rt_sort_log(tmp_path) == tmp_path / "rt_sort.log"
+
+    def test_rt_sort_log_none_when_missing(self, tmp_path: Path):
+        """
+        Tests:
+            (Test Case 1) No ``rt_sort.log`` → None.
+        """
+        from spikelab.spike_sorting._classifier import _find_rt_sort_log
+
+        assert _find_rt_sort_log(tmp_path) is None
+
+    def test_ks2_log_skips_directories(self, tmp_path: Path):
+        """
+        ``is_file()`` rejects directories — a folder named
+        ``kilosort2.log`` should not match.
+
+        Tests:
+            (Test Case 1) A directory named ``kilosort2.log`` is not
+                returned as a log file.
+        """
+        from spikelab.spike_sorting._classifier import _find_ks2_log
+
+        (tmp_path / "kilosort2.log").mkdir()
+        assert _find_ks2_log(tmp_path) is None

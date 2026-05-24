@@ -1879,3 +1879,59 @@ class TestRateDataFramesEmptyTimes:
         rd = RateData(np.zeros((1, 1)), np.asarray([0.0]))
         with pytest.raises(ValueError, match="fewer than 2 time points"):
             rd.frames(10.0)
+
+
+class TestRateDataConstructorNanTimes:
+    """``RateData(times=...)`` rejects non-finite ``times`` values
+    (NaN/inf) with a clear ValueError. Earlier versions accepted
+    them silently which downstream caused mask comparisons to drop
+    matching points. The constructor guard was added; this test
+    pins that contract.
+    """
+
+    def test_nan_times_raise_value_error(self):
+        """
+        Tests:
+            (Test Case 1) NaN in ``times`` raises ValueError
+                naming "non-finite" or "NaN".
+        """
+        data = np.ones((1, 3))
+        times = np.array([0.0, np.nan, 2.0])
+        with pytest.raises(ValueError, match="non-finite|NaN|all-finite"):
+            RateData(data, times)
+
+    def test_inf_times_raise_value_error(self):
+        """
+        Tests:
+            (Test Case 1) inf in ``times`` raises ValueError
+                naming "non-finite" or "inf".
+        """
+        data = np.ones((1, 3))
+        times = np.array([0.0, np.inf, 2.0])
+        with pytest.raises(ValueError, match="non-finite|inf|all-finite"):
+            RateData(data, times)
+
+
+class TestRateDataGetPairwiseFrCorrCompareFuncRaises:
+    """``get_pairwise_fr_corr`` with a ``compare_func`` that raises:
+    the exception propagates out of the underlying executor.
+    """
+
+    def test_compare_func_exception_propagates(self):
+        """
+        Tests:
+            (Test Case 1) A ``compare_func`` that always raises
+                ``RuntimeError`` causes ``get_pairwise_fr_corr``
+                to surface the exception.
+        """
+        data = np.ones((2, 10))
+        times = np.linspace(0.0, 9.0, 10)
+        rd = RateData(data, times)
+
+        def bad_compare(a, b, max_lag):
+            raise RuntimeError("compare_func intentional failure")
+
+        with pytest.raises(RuntimeError, match="compare_func intentional"):
+            rd.get_pairwise_fr_corr(
+                compare_func=bad_compare, max_lag=1, n_jobs=1
+            )

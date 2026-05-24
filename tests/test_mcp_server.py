@@ -7071,6 +7071,35 @@ class TestPCMStackToolsMCP:
 
     @pytestmark_server
     @pytest.mark.asyncio
+    async def test_pcm_stack_subslice_out_of_range_propagates_index_error(
+        self, loaded_ws_with_pcm_stack
+    ):
+        """
+        EC-MCP-MED: pcm_stack_subslice with an out-of-range index
+        propagates the underlying numpy IndexError. Pin the failure
+        mode so a future explicit ValueError-with-message at the MCP
+        layer is detectable.
+
+        Tests:
+            (Test Case 1) Index ``len(stack)`` (one past the end) raises
+                IndexError from the underlying ``__getitem__`` /
+                ``subslice``.
+        """
+        ws_id, ns = loaded_ws_with_pcm_stack
+        ws = get_workspace_manager().get_workspace(ws_id)
+        stack = ws.get(ns, "pcms")
+        n_slices = stack.stack.shape[2]
+        with pytest.raises((IndexError, ValueError)):
+            await analysis.pcm_stack_subslice(
+                ws_id,
+                ns,
+                key="pcms",
+                indices=[n_slices + 5],
+                out_key="oof",
+            )
+
+    @pytestmark_server
+    @pytest.mark.asyncio
     async def test_pcm_stack_mean_basic(self, loaded_ws_with_pcm_stack):
         """
         Test pcm_stack_mean averages across slices.

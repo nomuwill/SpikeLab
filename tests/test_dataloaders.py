@@ -5934,3 +5934,44 @@ class TestLoadNwbStartTimeAttribute:
 
         sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
         assert sd.start_time == 0.0
+
+
+class TestParseS3UrlMixedCase:
+    """``parse_s3_url`` should treat host buckets case-insensitively
+    (S3 bucket names are restricted to lowercase, but path-style URLs
+    with mixed-case bucket names should still parse — they're invalid
+    S3 names but the parser shouldn't crash).
+    """
+
+    def test_mixed_case_path_style_bucket(self):
+        """
+        Tests:
+            (Test Case 1) Path-style HTTPS URL with mixed-case bucket
+                parses without raising. (S3 itself would reject the
+                bucket name on a real call, but the parser is purely
+                syntactic.)
+            (Test Case 2) Bucket portion is preserved verbatim — the
+                parser does not silently lowercase.
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        bucket, key = parse_s3_url(
+            "https://s3.amazonaws.com/MyBucket/path/file.h5"
+        )
+        assert bucket == "MyBucket"
+        assert key == "path/file.h5"
+
+    def test_mixed_case_virtual_hosted_bucket(self):
+        """
+        Tests:
+            (Test Case 1) Virtual-hosted-style URL with mixed-case
+                bucket parses without raising.
+            (Test Case 2) Bucket name preserved exactly.
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        bucket, key = parse_s3_url(
+            "https://MyBucket.s3.amazonaws.com/key/file.h5"
+        )
+        assert bucket == "MyBucket"
+        assert key == "key/file.h5"

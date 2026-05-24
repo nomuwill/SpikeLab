@@ -2784,3 +2784,104 @@ class TestPairwiseCompMatrixStackThresholdPreserveNan:
         out = s.threshold(threshold=0.5)
         assert not np.isnan(out.stack).any()
         assert (out.stack == 0.0).all()
+
+
+class TestPairwiseCompMatrixToNetworkxThresholdBoundary:
+    """``PairwiseCompMatrix.to_networkx`` threshold boundary cases:
+    ``threshold=0.0`` excludes zero-weight edges (the check is
+    ``abs(weight) > threshold``); ``threshold=inf`` always excludes.
+    """
+
+    def test_threshold_zero_excludes_zero_weight_edges(self):
+        """
+        Tests:
+            (Test Case 1) ``to_networkx(threshold=0.0)`` produces a
+                graph with no edges when all off-diagonal weights
+                are exactly zero.
+        """
+        pytest.importorskip("networkx")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.zeros((3, 3))
+        pcm = PairwiseCompMatrix(matrix=m)
+        g = pcm.to_networkx(threshold=0.0)
+        assert g.number_of_edges() == 0
+
+    def test_threshold_inf_raises_value_error(self):
+        """
+        ``to_networkx`` rejects non-finite thresholds with a clear
+        ``ValueError`` (recently hardened source). Pin the contract.
+
+        Tests:
+            (Test Case 1) ``threshold=inf`` raises ValueError naming
+                "finite".
+            (Test Case 2) ``threshold=NaN`` raises the same.
+        """
+        pytest.importorskip("networkx")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.array(
+            [[0.0, 0.9, 0.5], [0.9, 0.0, 0.3], [0.5, 0.3, 0.0]]
+        )
+        pcm = PairwiseCompMatrix(matrix=m)
+        with pytest.raises(ValueError, match="finite"):
+            pcm.to_networkx(threshold=np.inf)
+        with pytest.raises(ValueError, match="finite"):
+            pcm.to_networkx(threshold=np.nan)
+
+
+class TestPairwiseCompMatrixThresholdInf:
+    """``PairwiseCompMatrix.threshold(threshold=inf)`` returns an
+    all-zero binary matrix (no entry's absolute value exceeds infinity).
+    """
+
+    def test_threshold_inf_returns_all_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(inf)`` returns a matrix of
+                all zeros, same shape as the input.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.array([[0.0, 0.9], [0.9, 0.0]])
+        pcm = PairwiseCompMatrix(matrix=m)
+        out = pcm.threshold(threshold=np.inf)
+        assert out.matrix.shape == m.shape
+        assert (out.matrix == 0.0).all()
+
+
+class TestPairwiseCompMatrixExtractPairsByGroupSingleUnit:
+    """``extract_pairs_by_group`` with a single-unit (1, 1) matrix:
+    ``np.triu_indices(1, k=1)`` returns empty arrays, so the result
+    has no off-diagonal pairs to extract.
+    """
+
+    def test_single_unit_returns_empty_pairs(self):
+        """
+        Tests:
+            (Test Case 1) 1x1 PairwiseCompMatrix produces an empty
+                result (no off-diagonal pairs exist).
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        pcm = PairwiseCompMatrix(matrix=np.array([[0.0]]))
+        try:
+            result = pcm.extract_pairs_by_group(
+                unit_labels=np.array(["A"])
+            )
+            # Whatever shape it returns, the body should be empty.
+            if isinstance(result, dict):
+                empty = (
+                    len(result) == 0
+                    or all(
+                        (hasattr(v, "__len__") and len(v) == 0)
+                        for v in result.values()
+                    )
+                )
+                assert empty
+            else:
+                # tuple of arrays / DataFrame — pin that it's empty.
+                arr = np.asarray(result, dtype=object)
+                assert arr.size == 0 or arr.shape[0] == 0
+        except (ValueError, IndexError):
+            pass  # Acceptable: 1-unit input rejected upstream

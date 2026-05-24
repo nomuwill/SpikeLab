@@ -607,3 +607,204 @@ class TestStream2ConfigDefaults:
         cfg = ExecutionConfig()
         assert cfg.tee_log_policy == "delete_on_success"
         assert cfg.generate_sorting_report is True
+
+
+# ---------------------------------------------------------------------------
+# _walk_diff — recursive diff between two parallel dicts
+# ---------------------------------------------------------------------------
+
+
+class TestWalkDiff:
+    """``_walk_diff`` recurses two parallel dicts and records leaf divergences.
+
+    Output triples have the form ``(dotted_path, default_value, actual_value)``
+    and are appended to the caller-provided ``out`` list (append semantics, not
+    replace).
+    """
+
+    def test_identical_dicts_produce_no_diffs(self):
+        """
+        Two identical nested dicts yield an empty diff list.
+
+        Tests:
+            (Test Case 1) Identical scalars at the top level produce
+                no entries.
+            (Test Case 2) Identical nested structures also produce
+                no entries.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"a": 1, "b": {"x": 10, "y": 20}}
+        actual = {"a": 1, "b": {"x": 10, "y": 20}}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == []
+
+    def test_top_level_scalar_diff(self):
+        """
+        A single top-level scalar difference records one entry.
+
+        Tests:
+            (Test Case 1) Output has exactly one entry.
+            (Test Case 2) Entry path is the bare key name (no leading
+                dot because prefix starts empty).
+            (Test Case 3) Default and actual values are captured.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"snr_min": 5.0}
+        actual = {"snr_min": 7.5}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert len(out) == 1
+        assert out[0] == ("snr_min", 5.0, 7.5)
+
+    def test_nested_diff_uses_dotted_path(self):
+        """
+        Nested differences are emitted with dotted-path keys.
+
+        Tests:
+            (Test Case 1) A diff inside ``curation.snr_min`` is
+                emitted with that exact dotted path.
+            (Test Case 2) Untouched sibling keys do not appear.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"curation": {"snr_min": 5.0, "fr_min": 0.1}}
+        actual = {"curation": {"snr_min": 7.5, "fr_min": 0.1}}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("curation.snr_min", 5.0, 7.5)]
+
+    def test_key_only_in_actual_uses_none_for_default(self):
+        """
+        A key present only in ``actual`` records default=None.
+
+        Tests:
+            (Test Case 1) The extra key produces a diff with the
+                default slot set to None.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"a": 1}
+        actual = {"a": 1, "b": 99}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("b", None, 99)]
+
+    def test_key_only_in_default_uses_none_for_actual(self):
+        """
+        A key present only in ``default`` records actual=None.
+
+        Tests:
+            (Test Case 1) The missing-in-actual key produces a diff
+                with the actual slot set to None.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"a": 1, "b": 99}
+        actual = {"a": 1}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("b", 99, None)]
+
+    def test_type_mismatch_dict_vs_scalar_treated_as_leaf(self):
+        """
+        When one side is a dict and the other is not, the pair is
+        compared as a leaf (no recursion).
+
+        Tests:
+            (Test Case 1) ``default={"x": 1}`` vs ``actual=5``
+                produces a single leaf-level diff with both values.
+            (Test Case 2) The output does not contain any
+                ``prefix.x``-style sub-entries.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"section": {"x": 1}}
+        actual = {"section": 5}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("section", {"x": 1}, 5)]
+
+    def test_lists_compared_as_leaves_not_recursed(self):
+        """
+        Lists are compared with ``!=``, not walked element-wise.
+
+        Tests:
+            (Test Case 1) Two unequal lists produce a single
+                top-level diff entry containing the entire lists,
+                not per-element entries.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"channels": [1, 2, 3]}
+        actual = {"channels": [1, 2, 4]}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("channels", [1, 2, 3], [1, 2, 4])]
+
+    def test_multiple_diffs_collected(self):
+        """
+        Multiple independent differences are all recorded.
+
+        Tests:
+            (Test Case 1) Three independent diffs across different
+                branches all appear in the output.
+            (Test Case 2) Path strings are compared as a set since
+                ``actual.keys() | default.keys()`` iteration order is
+                not guaranteed.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {
+            "a": 1,
+            "b": {"x": 10, "y": 20},
+            "c": "old",
+        }
+        actual = {
+            "a": 2,
+            "b": {"x": 10, "y": 99},
+            "c": "new",
+        }
+        out: list = []
+        _walk_diff("", default, actual, out)
+        paths = {entry[0] for entry in out}
+        assert paths == {"a", "b.y", "c"}
+        by_path = {entry[0]: entry for entry in out}
+        assert by_path["a"] == ("a", 1, 2)
+        assert by_path["b.y"] == ("b.y", 20, 99)
+        assert by_path["c"] == ("c", "old", "new")
+
+    def test_two_empty_dicts_produce_no_diff(self):
+        """
+        Empty dicts on both sides recurse with no keys and emit
+        nothing.
+
+        Tests:
+            (Test Case 1) Output is empty.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        out: list = []
+        _walk_diff("", {}, {}, out)
+        assert out == []
+
+    def test_appends_to_existing_list_does_not_replace(self):
+        """
+        The ``out`` list is appended to, not replaced.
+
+        Tests:
+            (Test Case 1) Pre-existing entries in ``out`` remain
+                after the call.
+            (Test Case 2) New entries from this call are appended
+                after them.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        sentinel = ("preexisting", "old", "new")
+        out: list = [sentinel]
+        _walk_diff("", {"a": 1}, {"a": 2}, out)
+        assert out[0] is sentinel
+        assert out[-1] == ("a", 1, 2)
+        assert len(out) == 2

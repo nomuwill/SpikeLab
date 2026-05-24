@@ -1242,6 +1242,44 @@ class TestFilterPairsByIsiViolations:
         assert rates[1] == pytest.approx(0.0)
         assert rates[2] > 0.0
 
+    def test_max_violation_rate_zero_filters_all_with_any_violations(self):
+        """
+        ``max_violation_rate=0`` is the strictest possible threshold —
+        only units with exactly zero violations survive. Pin this
+        boundary so a future relaxation of the comparator (e.g. using
+        ``<`` instead of ``<=``) is detectable.
+
+        Tests:
+            (Test Case 1) A unit with even a single violation is
+                filtered out under ``max_violation_rate=0``.
+            (Test Case 2) A pair of two perfectly-clean units passes
+                even with ``max_violation_rate=0`` (the check is
+                ``<=`` so zero passes zero).
+        """
+        # Unit 0 has one violation pair (10.0, 11.0 - 1ms apart).
+        # Unit 1 / 2 are clean (10ms spacing).
+        sd = SpikeData(
+            [
+                np.array([10.0, 11.0, 25.0, 50.0]),  # 1 violation
+                np.arange(10.0, 100.0, 10.0),
+                np.arange(15.0, 100.0, 10.0),
+            ],
+            length=200.0,
+        )
+        pairs = {(0, 1), (1, 2), (0, 2)}
+        filtered, rates = _filter_pairs_by_isi_violations(
+            sd, pairs, max_violation_rate=0.0, threshold_ms=1.5
+        )
+        # Unit 0 has a non-zero violation rate → all pairs containing
+        # it are filtered.
+        assert rates[0] > 0.0
+        assert (0, 1) not in filtered
+        assert (0, 2) not in filtered
+        # Both clean units pass exactly at zero.
+        assert rates[1] == 0.0
+        assert rates[2] == 0.0
+        assert (1, 2) in filtered
+
 
 # ---------------------------------------------------------------------------
 # _compute_pairwise_similarity
@@ -1827,3 +1865,72 @@ class TestChoosePrimaryUnit:
         )
         assert _choose_primary_unit(sd, 0, 1) == (0, 1)
         assert _choose_primary_unit(sd, 1, 0) == (1, 0)
+
+
+class TestEstimateNoiseLevelsBoundary:
+    """``_estimate_noise_levels`` chunk-size / num-chunks boundaries.
+
+    The function samples ``num_chunks`` windows of ``chunk_size``
+    samples and computes MAD per channel. The
+    ``max_start = n_samples - chunk_size`` guard handles the
+    "recording shorter than one chunk" branch by using all data.
+    """
+
+    def test_chunk_size_equals_recording_uses_all_data(self):
+        """
+        Tests:
+            (Test Case 1) When ``chunk_size == n_samples`` the
+                ``max_start = 0`` branch fires and the function uses
+                all of raw_data exactly once (no random sampling).
+            (Test Case 2) Returned noise is per-channel (shape (C,)).
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        # Constant signal → MAD is 0.
+        raw = np.zeros((4, 100))
+        noise = _estimate_noise_levels(
+            raw, num_chunks=10, chunk_size=100, seed=0
+        )
+        assert noise.shape == (4,)
+        assert (noise == 0.0).all()
+
+    def test_chunk_size_larger_than_recording_uses_all_data(self):
+        """
+        Tests:
+            (Test Case 1) ``chunk_size > n_samples`` triggers the
+                ``max_start <= 0`` short-circuit — function uses all
+                data without sampling.
+            (Test Case 2) Returned noise shape is correct.
+            (Test Case 3) Deterministic on a constant signal.
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        raw = np.zeros((3, 50))  # smaller than chunk_size=200
+        noise = _estimate_noise_levels(
+            raw, num_chunks=5, chunk_size=200, seed=0
+        )
+        assert noise.shape == (3,)
+        assert (noise == 0.0).all()
+
+    def test_num_chunks_larger_than_possible_starts(self):
+        """
+        ``num_chunks`` larger than ``n_samples - chunk_size`` is
+        allowed — ``rng.integers(0, max_start, size=num_chunks)``
+        samples with replacement so duplicates can occur. Pin that
+        the function does not crash.
+
+        Tests:
+            (Test Case 1) ``num_chunks=20, chunk_size=50, n_samples=60``
+                produces ``max_start=10`` and samples 20 starts (with
+                replacement) without raising.
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        rng = np.random.default_rng(0)
+        raw = rng.normal(0, 1, (2, 60))
+        noise = _estimate_noise_levels(
+            raw, num_chunks=20, chunk_size=50, seed=0
+        )
+        assert noise.shape == (2,)
+        assert np.all(np.isfinite(noise))
+        assert (noise > 0).all()

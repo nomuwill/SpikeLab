@@ -2024,7 +2024,10 @@ class TestBasicAnalysisCoverage:
             (Test Case 1) Stored item is ndarray.
         """
         ws_id, ns = loaded_ws
-        result = await analysis.get_pop_rate(ws_id, ns, "pop_rate")
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would trip the source 6*sigma <= length
+        # guard. Pass a smaller kernel that fits the recording.
+        result = await analysis.get_pop_rate(ws_id, ns, "pop_rate", gauss_sigma=5)
         assert result["key"] == "pop_rate"
         assert result["info"]["type"] == "ndarray"
 
@@ -4871,7 +4874,11 @@ class TestGetPopRate:
         ws = wm.get_workspace(ws_id)
         sd_empty = SpikeData([[], [], []], length=50.0)
         ws.store("empty_poprate", "spikedata", sd_empty)
-        result = await analysis.get_pop_rate(ws_id, "empty_poprate", "pop_rate_empty")
+        # length=50 ms — default gauss_sigma=100 trips the new
+        # 6*sigma <= length source guard. Pass a smaller kernel.
+        result = await analysis.get_pop_rate(
+            ws_id, "empty_poprate", "pop_rate_empty", gauss_sigma=5
+        )
         pop_rate = ws.get("empty_poprate", "pop_rate_empty")
         np.testing.assert_array_equal(pop_rate, 0.0)
 
@@ -4912,6 +4919,10 @@ class TestGetBurstsMCP:
             (Test Case 1) Unreachable threshold produces 0 bursts.
         """
         ws_id, ns = loaded_ws
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would now trip the source 6*sigma <=
+        # length guard. Pass smaller kernel sizes that fit the
+        # recording.
         result = await analysis.get_bursts(
             ws_id,
             ns,
@@ -4921,6 +4932,8 @@ class TestGetBurstsMCP:
             thr_burst=1000.0,
             min_burst_diff=10,
             burst_edge_mult_thresh=0.5,
+            gauss_sigma=5,
+            acc_gauss_sigma=5,
         )
         assert result["n_bursts"] == 0
 
@@ -4934,6 +4947,10 @@ class TestGetBurstsMCP:
             (Test Case 1) Empty thr_values produces shape (0, N_dist).
         """
         ws_id, ns = loaded_ws
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would now trip the source 6*sigma <=
+        # length guard. Pass smaller kernel sizes that fit the
+        # recording.
         result = await analysis.burst_sensitivity(
             ws_id,
             ns,
@@ -4941,6 +4958,8 @@ class TestGetBurstsMCP:
             thr_values=[],
             dist_values=[10],
             burst_edge_mult_thresh=0.5,
+            gauss_sigma=5,
+            acc_gauss_sigma=5,
         )
         sens = get_workspace_manager().get_workspace(ws_id).get(ns, "sens_empty")
         assert sens.shape[0] == 0
@@ -7901,9 +7920,7 @@ class TestListNeuronsNumpyArrayAttr:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_json_dumps_via_dispatcher_handles_numpy_arrays(
-        self, loaded_ws
-    ):
+    async def test_json_dumps_via_dispatcher_handles_numpy_arrays(self, loaded_ws):
         """
         Tests:
             (Test Case 1) Routing the result through the MCP dispatcher
@@ -7940,9 +7957,9 @@ class TestListNeuronsNumpyArrayAttr:
         # Tolerant lookup: payload shape depends on list_neurons' return
         # format, but somewhere it should contain the array values.
         flat = json.dumps(payload)
-        assert "1.0" in flat and "2.0" in flat and "3.0" in flat, (
-            f"template values not found in payload: {flat[:500]}"
-        )
+        assert (
+            "1.0" in flat and "2.0" in flat and "3.0" in flat
+        ), f"template values not found in payload: {flat[:500]}"
 
 
 class TestComputeResampledIsiSigmaMsZero:
@@ -8204,6 +8221,7 @@ class TestSetNeuronAttributeEmptyIndices:
 # ============================================================================
 
 
+@pytestmark_server
 class TestSanitizeForJsonNdarrayInlining:
     """``_sanitize_for_json`` inlines small numpy arrays as nested
     Python lists. NaN / Inf values inside the array are still
@@ -8244,6 +8262,7 @@ class TestSanitizeForJsonNdarrayInlining:
         assert out == []
 
 
+@pytestmark_server
 class TestSanitizeForJsonOversizeRaises:
     """``_sanitize_for_json`` raises ``ValueError`` on numpy arrays
     larger than ``MAX_INLINE_ARRAY_SIZE`` (10,000 by default). The
@@ -8301,9 +8320,7 @@ class TestMergeWorkspaceNonexistentPath:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_nonexistent_path_propagates_error(
-        self, loaded_ws, tmp_path
-    ):
+    async def test_nonexistent_path_propagates_error(self, loaded_ws, tmp_path):
         """
         Tests:
             (Test Case 1) ``merge_workspace(ws_id, path=<missing>)``
@@ -8334,9 +8351,7 @@ class TestConcatenateUnitsOutNamespace:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_default_overwrites_namespace_a(
-        self, loaded_ws, sample_spikedata
-    ):
+    async def test_default_overwrites_namespace_a(self, loaded_ws, sample_spikedata):
         """
         Tests:
             (Test Case 1) ``out_namespace=None`` (default) writes the
@@ -8443,9 +8458,7 @@ class TestPcmStackThresholdOutKeySentinels:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_out_key_none_overwrites_input_key(
-        self, loaded_ws_with_stack
-    ):
+    async def test_out_key_none_overwrites_input_key(self, loaded_ws_with_stack):
         """
         Tests:
             (Test Case 1) ``out_key=None`` falls through to "use input
@@ -8464,9 +8477,7 @@ class TestPcmStackThresholdOutKeySentinels:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_out_key_empty_string_is_treated_as_none(
-        self, loaded_ws_with_stack
-    ):
+    async def test_out_key_empty_string_is_treated_as_none(self, loaded_ws_with_stack):
         """
         Tests:
             (Test Case 1) ``out_key=""`` — same as ``None``: writes
@@ -8484,9 +8495,7 @@ class TestPcmStackThresholdOutKeySentinels:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_out_key_explicit_keeps_source_intact(
-        self, loaded_ws_with_stack
-    ):
+    async def test_out_key_explicit_keeps_source_intact(self, loaded_ws_with_stack):
         """
         Tests:
             (Test Case 1) Explicit ``out_key="pcms_binary"`` writes the
@@ -8525,6 +8534,7 @@ class TestPcmStackThresholdOutKeySentinels:
 # ============================================================================
 
 
+@pytestmark_server
 class TestSanitizeForJsonNumpyScalarCoercion:
     """``_sanitize_for_json`` routes any ``np.generic`` instance through
     ``.item()`` to convert to a native Python type before delegating to
@@ -8691,6 +8701,7 @@ class TestConcatenateUnitsToolSchema:
         assert set(required) == {"workspace_id", "namespace_a", "namespace_b"}
 
 
+@pytestmark_server
 class TestSanitizeForJsonZeroDArrayAndCapAdjustable:
     """``_sanitize_for_json`` 0-D array handling + ``MAX_INLINE_ARRAY_SIZE``
     monkey-patchability — two boundary contracts the existing inlining

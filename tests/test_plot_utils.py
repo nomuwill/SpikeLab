@@ -313,7 +313,10 @@ class TestPlotRecording:
             (Test Case 1) Figure has 2 panels (raster + pop_rate).
         """
         sd = _make_sd()
-        pop = sd.get_pop_rate()
+        # _make_sd builds a 400 ms recording — default gauss_sigma=100
+        # ms trips the new 6*sigma <= length guard. Use a smaller
+        # smoothing kernel that fits the raster.
+        pop = sd.get_pop_rate(gauss_sigma=30)
         fig = plot_recording(sd, show_raster=True, pop_rate=pop, show=False)
         # 2 panels × 2 columns = 4 axes
         assert len(fig.axes) == 4

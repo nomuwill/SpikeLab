@@ -73,18 +73,39 @@ def _get_noise_levels(
         noise_levels (np.ndarray): Per-channel spike-band noise, shape ``(channels,)``.
     """
     length = recording.get_num_samples()
-    rng = np.random.RandomState(seed=seed)
-    starts = rng.randint(0, length - chunk_size, size=num_chunks)
-    chunks = []
-    for s in starts:
-        chunks.append(
-            recording.get_traces(
-                start_frame=s,
-                end_frame=s + chunk_size,
-                return_scaled=return_scaled,
-            )
+    if length == 0:
+        raise ValueError("Cannot estimate noise levels on an empty recording")
+    if length <= chunk_size:
+        # Recording is shorter than the random-chunk size. Fall back to a
+        # single full-trace MAD estimate. Without this guard,
+        # ``rng.randint(0, length - chunk_size, ...)`` raises a cryptic
+        # ``ValueError: low >= high``. The pipeline's
+        # ``canary_min_recording_s`` gate (default 120 s) covers the main
+        # entry point, but ad-hoc callers can bypass it.
+        warnings.warn(
+            f"Recording is shorter than chunk_size ({length} <= "
+            f"{chunk_size} samples); falling back to a single full-trace "
+            "noise estimate instead of random chunk sampling. Noise "
+            "estimate quality may be reduced.",
+            UserWarning,
+            stacklevel=2,
         )
-    data = np.concatenate(chunks, axis=0)
+        data = recording.get_traces(
+            start_frame=0, end_frame=length, return_scaled=return_scaled
+        )
+    else:
+        rng = np.random.RandomState(seed=seed)
+        starts = rng.randint(0, length - chunk_size, size=num_chunks)
+        chunks = []
+        for s in starts:
+            chunks.append(
+                recording.get_traces(
+                    start_frame=s,
+                    end_frame=s + chunk_size,
+                    return_scaled=return_scaled,
+                )
+            )
+        data = np.concatenate(chunks, axis=0)
     med = np.median(data, axis=0, keepdims=True)
     return np.median(np.abs(data - med), axis=0) / 0.6745
 
@@ -778,7 +799,13 @@ def _process_recording_body(
             curation_first_folder,
             curation_second_folder,
             results_path,
-        ) = get_paths(rec_path, inter_path, results_path, exe)
+        ) = get_paths(
+            rec_path,
+            inter_path,
+            results_path,
+            exe,
+            sorter_name=config.sorter.sorter_name,
+        )
 
         # Load Recording
         try:

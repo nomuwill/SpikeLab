@@ -248,7 +248,13 @@ def load_maxwell_native(
 
     # Scale uint16 -> microvolts.  The MaxWell convention is
     # ``volts = raw * lsb``, so µV = raw * (lsb * 1e6).
-    traces_uv = raw_u16.astype(dtype, copy=False)
+    # ``copy=True`` is required: with ``copy=False`` and a caller that
+    # passed ``dtype`` equal to ``raw_u16.dtype`` (e.g. ``"uint16"``),
+    # ``astype`` would return ``raw_u16`` itself and the in-place
+    # ``*=`` below would mutate the caller's buffer. In the common
+    # ``dtype="float32"`` path the astype is already a copy anyway, so
+    # peak RAM is unchanged.
+    traces_uv = raw_u16.astype(dtype, copy=True)
     traces_uv *= np.asarray(lsb_volts * 1e6, dtype=dtype)
     # (channels, samples) -> (samples, channels) for SpikeInterface
     traces_si = np.ascontiguousarray(traces_uv.T)

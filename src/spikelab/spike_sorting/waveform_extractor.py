@@ -13,7 +13,12 @@ import numpy as np
 from tqdm import tqdm
 
 from .config import SortingPipelineConfig, WaveformConfig
-from .sorting_utils import Stopwatch, create_folder, print_stage
+from .sorting_utils import (
+    Stopwatch,
+    _check_unit_id_density,
+    create_folder,
+    print_stage,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -382,6 +387,7 @@ class WaveformExtractor:
 
         # Pre-allocate template_cache so templates can be streamed in
         # per unit as we go (same layout as compute_templates()).
+        _check_unit_id_density(unit_ids, self.nsamples, num_chans, dtype=self.dtype)
         templates_shape = (max(unit_ids) + 1, self.nsamples, num_chans)
         for mode in ("average", "std"):
             self.template_cache[mode] = np.zeros(templates_shape, dtype=self.dtype)
@@ -906,6 +912,7 @@ class WaveformExtractor:
 
         num_chans = self.recording.get_num_channels()
 
+        _check_unit_id_density(unit_ids, self.nsamples, num_chans, dtype=self.dtype)
         for mode in modes:
             # With max(unit_ids)+1 instead of len(unit_ids), the template of unit_id can be retrieved by template[unit_id]
             # Instead of first converting unit_id to an index
@@ -1248,7 +1255,15 @@ class Utils:
 
     @staticmethod
     def read_python(path):
-        """Parses python scripts in a dictionary
+        """Parses a Phy/Kilosort ``params.py`` file into a dictionary.
+
+        Only top-level assignments of literal values (numbers, strings,
+        tuples, lists, dicts, sets, bools, ``None``) are accepted, plus
+        the legacy ``range(...)`` form expanded to a list. Any other
+        construct (function calls, imports, attribute access, etc.)
+        raises ``ValueError``. This is a hardened replacement for the
+        previous ``exec``-based parser, which would execute arbitrary
+        code embedded in ``params.py``.
 
         Parameters
         ----------
@@ -1261,16 +1276,50 @@ class Utils:
             dictionary containing parsed file
 
         """
-        import re
+        import ast
 
         path = Path(path).absolute()
         if not path.is_file():
             raise FileNotFoundError(f"Kilosort2 parameter file not found: {path}")
         with path.open("r") as f:
             contents = f.read()
-        contents = re.sub(r"range\(([\d,]*)\)", r"list(range(\1))", contents)
+
+        tree = ast.parse(contents, filename=str(path))
         metadata = {}
-        exec(contents, {}, metadata)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                raise ValueError(
+                    f"{path}: only single-target literal assignments are "
+                    f"allowed in params.py, got {ast.dump(node)}"
+                )
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                raise ValueError(
+                    f"{path}: assignment target must be a simple name, "
+                    f"got {ast.dump(target)}"
+                )
+            value_node = node.value
+            # Legacy compat: accept ``range(a, b, ...)`` with literal
+            # int args and materialize as a list, matching the prior
+            # ``re.sub(range -> list(range))`` behaviour.
+            if (
+                isinstance(value_node, ast.Call)
+                and isinstance(value_node.func, ast.Name)
+                and value_node.func.id == "range"
+                and all(isinstance(a, ast.Constant) for a in value_node.args)
+            ):
+                args = [a.value for a in value_node.args]
+                value = list(range(*args))
+            else:
+                try:
+                    value = ast.literal_eval(value_node)
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: value for {target.id!r} must be a literal "
+                        f"(or range() with literal int args), got "
+                        f"{ast.dump(value_node)}"
+                    ) from e
+            metadata[target.id] = value
         metadata = {k.lower(): v for (k, v) in metadata.items()}
         return metadata
 

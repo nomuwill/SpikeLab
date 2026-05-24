@@ -116,8 +116,21 @@ def main() -> None:
         )
 
         # --- Save and upload curated SpikeData pickles ---
-        for i, sd in enumerate(spikedata_results):
-            rec_name = Path(recording_files[min(i, len(recording_files) - 1)]).stem
+        # ``sort_recording`` must return exactly one SpikeData per
+        # recording. The previous ``min(i, len(recording_files) - 1)``
+        # saturation silently clobbered earlier pickles to the same
+        # S3 key on length-too-long, and silently dropped trailing
+        # recordings on length-too-short — both modes still reported
+        # success. Fail loudly instead, then iterate by zip so the
+        # mapping is structurally enforced.
+        if len(spikedata_results) != len(recording_files):
+            raise RuntimeError(
+                f"sort_recording returned {len(spikedata_results)} "
+                f"SpikeData but bundle contains {len(recording_files)} "
+                "recordings; cannot map results to recording names."
+            )
+        for sd, rec_path in zip(spikedata_results, recording_files):
+            rec_name = Path(rec_path).stem
             pkl_name = f"{rec_name}_curated.pkl"
             pkl_path = str(results_dir / pkl_name)
             with open(pkl_path, "wb") as f:

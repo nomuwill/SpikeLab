@@ -25,6 +25,7 @@ from typing import Any, Optional
 import numpy as np
 
 from ..config import SortingPipelineConfig, WaveformConfig
+from ..sorting_utils import _check_unit_id_density
 from .base import SorterBackend
 
 
@@ -106,6 +107,9 @@ def _numpy_sorting_to_ks_extractor(
     # marker on the correct channel for each unit.  The actual waveform
     # templates are recomputed from raw data during extraction.
     n_template_samples = 82  # KS2 default template length
+    _check_unit_id_density(
+        unit_ids, n_template_samples, n_channels, dtype=np.float32
+    )
     max_uid = max(unit_ids) + 1 if len(unit_ids) else 0
     templates = np.zeros(
         (max_uid, n_template_samples, n_channels),

@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import numpy as np
-import pandas as pd
 
 from .waveform_extractor import Utils
 
@@ -19,6 +18,16 @@ class KilosortSortingExtractor:
         Path to the output Phy folder (containing the params.py which stores data about the raw recording)
     exclude_cluster_groups: list or str (optional)
         Cluster groups to exclude (e.g. "noise" or ["noise", "mua"])
+    compact: bool (default False)
+        If True, remap the surviving Phy cluster IDs to a dense
+        ``0..N-1`` range. The original cluster IDs are preserved on
+        ``self.original_unit_ids``. ``spike_clusters`` values are
+        remapped accordingly, and spikes belonging to filtered-out
+        clusters are dropped. Use this when Phy curation has left a
+        sparse cluster_id space (e.g. ``[0, 1, 47, 50000]``) that
+        would otherwise blow up downstream template caches sized by
+        ``max(unit_ids) + 1``. When False (the default), Phy cluster
+        IDs flow through unchanged.
     """
 
     def __init__(
@@ -27,7 +36,16 @@ class KilosortSortingExtractor:
         exclude_cluster_groups=None,
         keep_good_only=False,
         pos_peak_thresh=2.0,
+        compact: bool = False,
     ):
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                "pandas is required for KilosortSortingExtractor. "
+                "Install with: pip install pandas"
+            ) from e
+
         # Folder containing the numpy results of Kilosort
         phy_folder = Path(folder_path)
         self.folder = phy_folder.absolute()
@@ -111,11 +129,31 @@ class KilosortSortingExtractor:
             cluster_info = cluster_info.query("KSLabel == 'good'")
 
         all_unit_ids = cluster_info["cluster_id"].values
-        self.unit_ids = []
-        # Exclude units with 0 spikes
-        for unit_id in all_unit_ids:
-            if unit_id in unit_ids_with_spike:
-                self.unit_ids.append(int(unit_id))
+        surviving_original_ids = [
+            int(uid) for uid in all_unit_ids if uid in unit_ids_with_spike
+        ]
+        self._compacted = bool(compact)
+        if self._compacted:
+            self.original_unit_ids = list(surviving_original_ids)
+            self.unit_ids = list(range(len(surviving_original_ids)))
+            if surviving_original_ids:
+                orig_to_dense = {
+                    orig: i for i, orig in enumerate(surviving_original_ids)
+                }
+                keep_mask = np.isin(self.spike_clusters, surviving_original_ids)
+                self.spike_times = self.spike_times[keep_mask]
+                kept_clusters = self.spike_clusters[keep_mask]
+                self.spike_clusters = np.fromiter(
+                    (orig_to_dense[int(c)] for c in kept_clusters),
+                    dtype=self.spike_clusters.dtype,
+                    count=len(kept_clusters),
+                )
+            else:
+                self.spike_times = self.spike_times[:0]
+                self.spike_clusters = self.spike_clusters[:0]
+        else:
+            self.unit_ids = list(surviving_original_ids)
+            self.original_unit_ids = list(surviving_original_ids)
 
     @staticmethod
     def get_num_segments():
@@ -145,8 +183,22 @@ class KilosortSortingExtractor:
         return np.asarray(spike_times.copy()).ravel()
 
     def get_templates_all(self):
-        # Returns Kilosort2's outputted templates as mmap np.array
-        return np.load(str(self.folder / "templates.npy"), mmap_mode="r")
+        """Return templates aligned to ``self.unit_ids``.
+
+        Uncompacted (default): returns the raw on-disk
+        ``templates.npy`` as an mmap array indexed by Phy template/
+        cluster id (callers do ``templates[unit_id]``).
+
+        Compacted: fancy-indexes by ``self.original_unit_ids`` so that
+        row ``i`` is the template for ``self.unit_ids[i]``. Callers
+        keep doing ``templates[unit_id]`` and get the right row.
+        """
+        raw = np.load(str(self.folder / "templates.npy"), mmap_mode="r")
+        if not self._compacted:
+            return raw
+        if not self.original_unit_ids:
+            return raw[:0]
+        return raw[self.original_unit_ids]
 
     def get_channel_map(self):
         # Returns Kilosort2's channel map as mmap np.array

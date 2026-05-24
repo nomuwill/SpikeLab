@@ -11,7 +11,48 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union
+
+import numpy as np
+
+
+def _check_unit_id_density(
+    unit_ids: Sequence[int],
+    n_samples: int,
+    n_channels: int,
+    dtype: Any = np.float32,
+) -> None:
+    """Guard against OOM from allocating ``(max(unit_ids)+1, T, C)`` caches.
+
+    Callers that index template/waveform caches by raw ``unit_id``
+    (rather than by a dense ``0..N-1`` index) size the cache by
+    ``max(unit_ids) + 1``. Heavy Phy curation can leave a sparse
+    cluster_id space (e.g. ``[0, 1, 47, 50000]``) for which that
+    allocation would consume tens of GB for a handful of surviving
+    units. Raise a clear ``MemoryError`` before the allocation rather
+    than crashing the process.
+
+    Triggers when ``max(unit_ids) > 100 * len(unit_ids)``. Threshold is
+    deliberately loose so benign sparseness from light Phy curation
+    (e.g. dropping a few clusters) does not false-positive.
+    """
+    if not len(unit_ids):
+        return
+    max_uid = int(max(unit_ids))
+    n_units = len(unit_ids)
+    if max_uid <= 100 * n_units:
+        return
+    bytes_per_elem = np.dtype(dtype).itemsize
+    gb = ((max_uid + 1) * n_samples * n_channels * bytes_per_elem) / (1024**3)
+    raise MemoryError(
+        f"Unit IDs are pathologically sparse (max={max_uid}, "
+        f"n_units={n_units}); allocating a ({max_uid + 1}, {n_samples}, "
+        f"{n_channels}) {np.dtype(dtype).name} array would consume "
+        f"~{gb:.1f} GB. This typically results from Phy curation that "
+        f"drops most clusters but keeps high-numbered ones. Pass "
+        f"compact=True to KilosortSortingExtractor (or compact your "
+        f"unit IDs upstream) to use a dense unit_id space."
+    )
 
 
 def get_system_ram_bytes() -> Optional[int]:
@@ -225,7 +266,11 @@ def delete_folder(folder: Union[str, Path]) -> None:
 
 
 def get_paths(
-    rec_path: Any, inter_path: Any, results_path: Any, execution_config: Any = None
+    rec_path: Any,
+    inter_path: Any,
+    results_path: Any,
+    execution_config: Any = None,
+    sorter_name: Optional[str] = None,
 ) -> Tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     """Resolve and prepare all directory paths for one recording run.
 
@@ -241,6 +286,14 @@ def get_paths(
         execution_config (ExecutionConfig or None): When provided, its
             ``recompute_*`` flags control which intermediate folders
             are deleted before running.
+        sorter_name (str or None): Name of the configured sorter.
+            Controls the sorter output folder name
+            (``{sorter_name}_results``). When ``None``, falls back to
+            the legacy ``"kilosort2_results"`` and emits a
+            ``DeprecationWarning`` so callers update; passing the
+            configured ``config.sorter.sorter_name`` keeps caches
+            from different sorters from silently colliding in a
+            shared ``kilosort2_results/`` folder.
 
     Returns:
         tuple: ``(rec_path, inter_path, recording_dat_path,
@@ -262,7 +315,16 @@ def get_paths(
     inter_path = Path(inter_path)
 
     recording_dat_path = inter_path / (rec_name + "_scaled_filtered.dat")
-    output_folder = inter_path / "kilosort2_results"
+    if sorter_name is None:
+        warnings.warn(
+            "get_paths called without sorter_name; defaulting to "
+            "'kilosort2_results'. Pass sorter_name=config.sorter.sorter_name "
+            "to avoid cross-sorter cache collisions.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        sorter_name = "kilosort2"
+    output_folder = inter_path / f"{sorter_name}_results"
 
     waveforms_root_folder = inter_path / "waveforms"
     curation_folder = inter_path / "curation"

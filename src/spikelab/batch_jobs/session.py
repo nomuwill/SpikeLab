@@ -124,6 +124,24 @@ class RunSession:
         updated_container = job_spec.container.model_copy(update={"env": merged})
         return job_spec.model_copy(update={"container": updated_container})
 
+    def _s3_env_overlay(self) -> Dict[str, str]:
+        """Return profile-derived S3 env vars for pod injection.
+
+        The pod-side ``S3StorageClient`` reads ``S3_ENDPOINT_URL`` and
+        ``AWS_DEFAULT_REGION`` from environment variables. Without this
+        overlay, an NRP / non-AWS S3 cluster (endpoint_url configured
+        only on the host) would have the pod silently fall back to
+        boto3's default AWS endpoint and the input-bundle download
+        would fail with a confusing ``NoSuchBucket`` despite the host
+        successfully uploading to the correct endpoint.
+        """
+        overlay: Dict[str, str] = {}
+        if self.profile.endpoint_url:
+            overlay["S3_ENDPOINT_URL"] = self.profile.endpoint_url
+        if self.profile.region_name:
+            overlay["AWS_DEFAULT_REGION"] = self.profile.region_name
+        return overlay
+
     # ------------------------------------------------------------------
     # Submission: workspace job
     # ------------------------------------------------------------------
@@ -187,14 +205,13 @@ class RunSession:
                 local_zip=bundle_zip, run_id=run_id
             )
 
-            enriched_spec = self._inject_env(
-                job_spec,
-                {
-                    "INPUT_URI": uploaded_input_uri,
-                    "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
-                    "SCRIPT_NAME": script_path.name,
-                },
-            )
+            workspace_env = {
+                "INPUT_URI": uploaded_input_uri,
+                "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
+                "SCRIPT_NAME": script_path.name,
+            }
+            workspace_env.update(self._s3_env_overlay())
+            enriched_spec = self._inject_env(job_spec, workspace_env)
             # Set container command to the workspace entrypoint
             enriched_spec = enriched_spec.model_copy(
                 update={
@@ -280,13 +297,12 @@ class RunSession:
                 local_zip=bundle_zip, run_id=run_id
             )
 
-            enriched_spec = self._inject_env(
-                job_spec,
-                {
-                    "INPUT_URI": uploaded_input_uri,
-                    "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
-                },
-            )
+            sorting_env = {
+                "INPUT_URI": uploaded_input_uri,
+                "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
+            }
+            sorting_env.update(self._s3_env_overlay())
+            enriched_spec = self._inject_env(job_spec, sorting_env)
             enriched_spec = enriched_spec.model_copy(
                 update={
                     "container": enriched_spec.container.model_copy(

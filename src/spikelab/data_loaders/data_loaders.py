@@ -640,7 +640,7 @@ def load_spikedata_from_nwb(
             return _build_spikedata(
                 trains,
                 length_ms=length_ms,
-                start_time=start_time_ms or 0.0,
+                start_time=start_time_ms if start_time_ms is not None else 0.0,
                 metadata=meta,
                 neuron_attributes=neuron_attributes,
             )
@@ -790,7 +790,7 @@ def load_spikedata_from_nwb(
     return _build_spikedata(
         trains,
         length_ms=length_ms,
-        start_time=start_time_ms or 0.0,
+        start_time=start_time_ms if start_time_ms is not None else 0.0,
         metadata=meta,
         neuron_attributes=neuron_attributes,
     )

@@ -490,8 +490,17 @@ class RunSession:
         downloaded = []
         local_dir_resolved = local_dir.resolve()
         for key in keys:
-            # Derive relative path from prefix
+            # Derive relative path from prefix. ``parse_s3_url`` strips
+            # the trailing ``/`` from the prefix, so for a configured
+            # prefix like ``s3://bucket/pfx/out/run-1/`` and a listed
+            # key ``pfx/out/run-1/file.pkl`` the naive strip leaves
+            # ``/file.pkl``. On Windows ``Path(local_dir) / "/file.pkl"``
+            # is interpreted as drive-root, which the traversal guard
+            # below would then refuse for ordinary downloads. Strip
+            # leading slashes/backslashes so ``relative`` is always a
+            # plain relative path.
             relative = key[len(prefix_key) :] if key.startswith(prefix_key) else key
+            relative = relative.lstrip("/\\")
             # Path-traversal guard: S3 listing keys flow into the local
             # filesystem destination via ``local_dir / relative``. A
             # malicious or buggy upstream that uploaded an object with

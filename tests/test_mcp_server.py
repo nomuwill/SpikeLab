@@ -9041,6 +9041,63 @@ class TestSanitizeForJsonRecursionAndContainers:
         assert out is True
         assert isinstance(out, bool)
 
+    @pytestmark_server
+    def test_nesting_below_depth_cap_succeeds(self):
+        """
+        Tests:
+            (Test Case 1) A dict nested exactly to the depth cap is
+                sanitised without raising (boundary case).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        # Build a nested dict at exactly MAX_SANITIZE_DEPTH levels.
+        depth = srv_mod.MAX_SANITIZE_DEPTH
+        obj: dict = {"leaf": 1.0}
+        for _ in range(depth - 1):
+            obj = {"x": obj}
+
+        result = srv_mod._sanitize_for_json(obj)
+        # Walk down and verify the leaf survived round-trip.
+        for _ in range(depth - 1):
+            result = result["x"]
+        assert result == {"leaf": 1.0}
+
+    @pytestmark_server
+    def test_nesting_above_depth_cap_raises(self):
+        """
+        Tests:
+            (Test Case 1) A dict nested one level beyond
+                MAX_SANITIZE_DEPTH raises ValueError mentioning the
+                depth cap (rather than blowing the Python recursion
+                limit with a RecursionError).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        depth = srv_mod.MAX_SANITIZE_DEPTH + 5
+        obj: dict = {"leaf": 1.0}
+        for _ in range(depth):
+            obj = {"x": obj}
+
+        with pytest.raises(ValueError, match="MAX_SANITIZE_DEPTH"):
+            srv_mod._sanitize_for_json(obj)
+
+    @pytestmark_server
+    def test_deep_list_nesting_above_cap_raises(self):
+        """
+        Tests:
+            (Test Case 1) The depth guard fires on deeply nested lists,
+                not only nested dicts (lists also recurse).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        depth = srv_mod.MAX_SANITIZE_DEPTH + 5
+        obj: list = [1.0]
+        for _ in range(depth):
+            obj = [obj]
+
+        with pytest.raises(ValueError, match="MAX_SANITIZE_DEPTH"):
+            srv_mod._sanitize_for_json(obj)
+
 
 class TestComputeWaveformMetricsHappyPath:
     """``compute_waveform_metrics`` happy path: the four summary fields

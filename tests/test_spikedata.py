@@ -1740,7 +1740,7 @@ class TestSpikeDataRates:
         # First 10 bins should be empty (offset region)
         assert r_offset[0, :10].sum() == 0
         # Spike pattern in offset region matches original
-        assert np.array_equal(r_offset[0, 10:], r0[0, :])
+        np.testing.assert_array_equal(r_offset[0, 10:], r0[0, :])
 
     def test_raster_time_offset_passthrough(self):
         """
@@ -1822,7 +1822,7 @@ class TestSpikeDataRates:
         truth = np.random.rand(N)
         spikes = SpikeData.from_idces_times(np.zeros(N, int), truth.cumsum())
         ii = spikes.interspike_intervals()
-        assert np.allclose(ii[0], truth[1:])
+        np.testing.assert_allclose(ii[0], truth[1:])
 
     def test_binning_doesnt_lose_spikes(self):
         """
@@ -1916,8 +1916,8 @@ class TestSpikeDataRates:
         t1, t2 = rd1.times, rd2.times
         rate1, rate2 = rd1.inst_Frate_data[0], rd2.inst_Frate_data[0]
         assert len(t1) == len(t2)
-        assert np.allclose(t1, t2)
-        assert np.allclose(rate1, rate2)
+        np.testing.assert_allclose(t1, t2)
+        np.testing.assert_allclose(rate1, rate2)
 
     def test_sliding_rate_empty_spikes(self):
         """
@@ -2270,9 +2270,9 @@ class TestSpikeDataRates:
         assert rnd.shape == raster.shape
         uniq = np.unique(rnd)
         assert set(uniq.tolist()).issubset({0.0, 1.0})
-        assert np.allclose(rnd.sum(axis=1), row_sum)
-        assert np.allclose(rnd.sum(axis=0), col_sum)
-        assert np.isclose(rnd.sum(), total)
+        np.testing.assert_allclose(rnd.sum(axis=1), row_sum)
+        np.testing.assert_allclose(rnd.sum(axis=0), col_sum)
+        np.testing.assert_allclose(rnd.sum(), total)
 
     def test_get_pop_rate_square_only_matches_convolution(self):
         """
@@ -2311,7 +2311,7 @@ class TestSpikeDataRates:
             np.sum(t_spk_mat, axis=1), np.ones(SQUARE_WIDTH) / SQUARE_WIDTH, mode="same"
         )
 
-        assert np.allclose(pop, truth)
+        np.testing.assert_allclose(pop, truth)
 
     def test_get_pop_rate_gaussian_only_impulse(self):
         """
@@ -2334,8 +2334,8 @@ class TestSpikeDataRates:
             square_width=SQUARE_WIDTH, gauss_sigma=GAUSS_SIGMA, raster_bin_size_ms=1.0
         )
 
-        assert np.isclose(pop.sum(), 1.0, rtol=1e-3, atol=1e-3)
-        assert np.isclose(pop[50 - 1], pop[50 + 1])
+        np.testing.assert_allclose(pop.sum(), 1.0, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(pop[50 - 1], pop[50 + 1])
 
     def test_get_pop_rate_no_smoothing_returns_summed_raster(self):
         """
@@ -3850,9 +3850,9 @@ class TestSpikeDataBursts:
         expected_frac_per_burst = np.array([2 / 3, 0.0])
         expected_backbone_units = np.array([])
 
-        assert np.allclose(frac_per_unit, expected_frac_per_unit)
-        assert np.allclose(frac_per_burst, expected_frac_per_burst)
-        assert np.array_equal(backbone_units, expected_backbone_units)
+        np.testing.assert_allclose(frac_per_unit, expected_frac_per_unit)
+        np.testing.assert_allclose(frac_per_burst, expected_frac_per_burst)
+        np.testing.assert_array_equal(backbone_units, expected_backbone_units)
 
         # Test with different parameters
         min_spikes_high = 3
@@ -3864,15 +3864,15 @@ class TestSpikeDataBursts:
         expected_high_burst = np.array([0.0, 0.0])
         expected_high_backbone = np.array([])
 
-        assert np.allclose(frac_per_unit_high, expected_high_unit)
-        assert np.allclose(frac_per_burst_high, expected_high_burst)
-        assert np.array_equal(backbone_high, expected_high_backbone)
+        np.testing.assert_allclose(frac_per_unit_high, expected_high_unit)
+        np.testing.assert_allclose(frac_per_burst_high, expected_high_burst)
+        np.testing.assert_array_equal(backbone_high, expected_high_backbone)
 
         # Test with lower backbone threshold
         low_threshold = 0.4
         _, _, backbone_low = sd.get_frac_active(edges, min_spikes, low_threshold)
         expected_low_backbone = np.array([0, 1])
-        assert np.array_equal(backbone_low, expected_low_backbone)
+        np.testing.assert_array_equal(backbone_low, expected_low_backbone)
 
     def test_get_bursts_no_bursts_detected(self):
         """
@@ -3977,9 +3977,9 @@ class TestSpikeDataBursts:
         frac = sd.get_frac_spikes_in_burst(edges)
 
         assert frac.shape == (4,)
-        assert np.isclose(frac[0], 3 / 4)  # t=2,5,8 in burst; t=15 outside
-        assert np.isclose(frac[1], 1.0)  # both spikes in burst
-        assert np.isclose(frac[2], 0.0)  # both spikes outside
+        np.testing.assert_allclose(frac[0], 3 / 4)  # t=2,5,8 in burst; t=15 outside
+        np.testing.assert_allclose(frac[1], 1.0)  # both spikes in burst
+        np.testing.assert_allclose(frac[2], 0.0)  # both spikes outside
         assert np.isnan(frac[3])  # silent unit
 
     def test_get_frac_spikes_in_burst_empty_edges(self):
@@ -4012,7 +4012,7 @@ class TestSpikeDataBursts:
 
         # t=2→bin1 (in burst1), t=7→bin6 (outside), t=12→bin11 (in burst2),
         # t=17→bin16 (outside) → 2/4
-        assert np.isclose(frac[0], 0.5)
+        np.testing.assert_allclose(frac[0], 0.5)
 
     def test_get_bursts_pop_rms_override_zero(self):
         """
@@ -4379,14 +4379,14 @@ class TestSpikeDataWaveforms:
         )  # shape (2, 2, 2)
         avg = compute_avg_waveform(waveforms, channel_indices=[0, 1], dtype=np.float32)
         expected = np.array([[2.0, 3.0], [12.0, 14.0]], dtype=float)
-        assert np.allclose(avg, expected)
+        np.testing.assert_allclose(avg, expected)
 
         # Test Case 2: empty spikes dimension
         empty = np.zeros((2, 30, 0), dtype=np.int16)
         avg_empty = compute_avg_waveform(empty, channel_indices=[5, 7], dtype=np.int16)
         assert avg_empty.shape == (2, 30)
         assert avg_empty.dtype == np.int16
-        assert np.array_equal(avg_empty, np.zeros((2, 30), dtype=np.int16))
+        np.testing.assert_array_equal(avg_empty, np.zeros((2, 30), dtype=np.int16))
 
     def test_get_valid_spike_times(self):
         """
@@ -4408,7 +4408,7 @@ class TestSpikeDataWaveforms:
             ms_after=ms_after,
             n_time_samples=n_time_samples,
         )
-        assert np.array_equal(valid, np.array([1.0, 5.0]))
+        np.testing.assert_array_equal(valid, np.array([1.0, 5.0]))
 
         valid_empty = get_valid_spike_times(
             spike_times_ms=np.array([], dtype=float),
@@ -4436,8 +4436,8 @@ class TestSpikeDataWaveforms:
         assert set(ch_map.keys()) == {10, 12}
         assert ch_map[10].shape == (4, 3)
         assert ch_map[12].shape == (4, 3)
-        assert np.allclose(ch_map[10], 1.0)
-        assert np.allclose(ch_map[12], 2.0)
+        np.testing.assert_allclose(ch_map[10], 1.0)
+        np.testing.assert_allclose(ch_map[12], 2.0)
 
         with pytest.raises(ValueError):
             waveforms_by_channel(np.zeros((2, 4), dtype=float), channel_indices=[0, 1])
@@ -4470,8 +4470,8 @@ class TestSpikeDataWaveforms:
             ms_after=ms_after,
         )
         assert wf.shape == (n_channels_total, 30, 2)
-        assert np.array_equal(wf[:, :, 0], raw_data[:, 40:70])
-        assert np.array_equal(wf[:, :, 1], raw_data[:, 60:90])
+        np.testing.assert_array_equal(wf[:, :, 0], raw_data[:, 40:70])
+        np.testing.assert_array_equal(wf[:, :, 1], raw_data[:, 60:90])
 
         channel_indices = [3, 1]
         wf_sub = extract_waveforms(
@@ -4483,7 +4483,7 @@ class TestSpikeDataWaveforms:
             channel_indices=channel_indices,
         )
         assert wf_sub.shape == (2, 30, 1)
-        assert np.array_equal(wf_sub[:, :, 0], raw_data[channel_indices, 40:70])
+        np.testing.assert_array_equal(wf_sub[:, :, 0], raw_data[channel_indices, 40:70])
 
         # Out-of-bounds spikes should be skipped
         wf_skip = extract_waveforms(
@@ -4495,7 +4495,7 @@ class TestSpikeDataWaveforms:
             channel_indices=[0],
         )
         assert wf_skip.shape == (1, 30, 1)
-        assert np.array_equal(wf_skip[0, :, 0], raw_data[0, 0:30])
+        np.testing.assert_array_equal(wf_skip[0, :, 0], raw_data[0, 0:30])
 
         wf_empty = extract_waveforms(
             raw_data.astype(np.int16),
@@ -4554,20 +4554,24 @@ class TestSpikeDataWaveforms:
         # Mapping should pick channel 2 only
         assert meta["channels"] == [2]
         # Only valid spikes should remain in meta
-        assert np.array_equal(meta["spike_times_ms"], np.array([1.0, 5.0]))
+        np.testing.assert_array_equal(meta["spike_times_ms"], np.array([1.0, 5.0]))
         # Waveforms should match those valid spikes
         assert waveforms.shape == (1, 30, 2)
-        assert np.array_equal(waveforms[0, :, 0], raw_data[2, 0:30])  # 1ms -> [0:30]
-        assert np.array_equal(waveforms[0, :, 1], raw_data[2, 40:70])  # 5ms -> [40:70]
+        np.testing.assert_array_equal(
+            waveforms[0, :, 0], raw_data[2, 0:30]
+        )  # 1ms -> [0:30]
+        np.testing.assert_array_equal(
+            waveforms[0, :, 1], raw_data[2, 40:70]
+        )  # 5ms -> [40:70]
 
         # avg_waveform should be mean across spikes
         avg_expected = waveforms.mean(axis=2)
-        assert np.array_equal(meta["avg_waveform"], avg_expected)
+        np.testing.assert_array_equal(meta["avg_waveform"], avg_expected)
 
         # Per-channel view should match waveforms slices
         assert "channel_waveforms" in meta
         assert 2 in meta["channel_waveforms"]
-        assert np.array_equal(meta["channel_waveforms"][2], waveforms[0, :, :])
+        np.testing.assert_array_equal(meta["channel_waveforms"][2], waveforms[0, :, :])
 
         # return_avg_waveform=False -> None
         _, meta_no_avg = extract_unit_waveforms(
@@ -4599,7 +4603,7 @@ class TestSpikeDataWaveforms:
         )
         assert meta_exp["channels"] == [3, 1]
         assert waveforms_exp.shape == (2, 30, 1)
-        assert np.array_equal(waveforms_exp[:, :, 0], raw_data[[3, 1], 40:70])
+        np.testing.assert_array_equal(waveforms_exp[:, :, 0], raw_data[[3, 1], 40:70])
 
     def test_get_waveform_traces(self):
         """
@@ -4714,10 +4718,10 @@ class TestSpikeDataWaveforms:
         assert sd_store.neuron_attributes[0].get("waveforms") is not None
         assert sd_store.neuron_attributes[0].get("traces_meta") is not None
         assert sd_store.neuron_attributes[0]["traces_meta"]["channels"] == [1]
-        assert np.isclose(
+        np.testing.assert_allclose(
             sd_store.neuron_attributes[0]["traces_meta"]["fs_kHz"], fs_kHz
         )
-        assert np.allclose(
+        np.testing.assert_allclose(
             sd_store.neuron_attributes[0]["avg_waveform"],
             meta_stored["avg_waveforms"][0],
         )
@@ -4769,7 +4773,7 @@ class TestSpikeDataWaveforms:
         assert peak_amps.shape == (1, 2)
 
         mean_across_spikes = waveforms.mean(axis=2)
-        assert np.allclose(mean_across_spikes, avg_wf)
+        np.testing.assert_allclose(mean_across_spikes, avg_wf)
 
         # Subset selection: list of unit indices returns list of waveforms + shared meta
         subset_waveforms, subset_meta = sd.get_waveform_traces(

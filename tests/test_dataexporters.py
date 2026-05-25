@@ -111,7 +111,7 @@ class TestHDF5Exporters:
             spike_times_unit="s",
         )
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_export_hdf5_group_roundtrip_samples(self, tmp_path):
         """
@@ -150,7 +150,7 @@ class TestHDF5Exporters:
             return samp / 1000.0 * 1e3
 
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(q(a), b)
+            np.testing.assert_allclose(q(a), b)
 
     def test_export_hdf5_paired_roundtrip_ms(self, tmp_path):
         """
@@ -180,7 +180,7 @@ class TestHDF5Exporters:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_export_hdf5_raster(self, tmp_path):
         """
@@ -201,7 +201,7 @@ class TestHDF5Exporters:
         )
         with h5py.File(path, "r") as f:  # type: ignore
             raster = np.asarray(f["raster"])
-        assert np.array_equal(raster, sd.raster(5.0))
+        np.testing.assert_array_equal(raster, sd.raster(5.0))
 
     def test_export_hdf5_with_raw(self, tmp_path):
         """
@@ -216,7 +216,7 @@ class TestHDF5Exporters:
         - Validates that continuous raw data (like voltage traces) can be exported alongside spike times.
         """
         sd = make_sd()
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(2).standard_normal((2, 10))
         sd = SpikeData(sd.train, length=sd.length, raw_data=raw, raw_time=np.arange(10))
         path = str(tmp_path / "test.h5")
 
@@ -229,7 +229,7 @@ class TestHDF5Exporters:
             raw_time_unit="s",
         )
         with h5py.File(path, "r") as f:  # type: ignore
-            assert np.allclose(np.asarray(f["raw_time"]), sd.raw_time / 1e3)
+            np.testing.assert_allclose(np.asarray(f["raw_time"]), sd.raw_time / 1e3)
 
     def test_export_hdf5_all_empty_trains_ragged(self, tmp_path):
         """
@@ -416,7 +416,7 @@ class TestHDF5Exporters:
             length_ms=100.0,
         )
         assert loaded.length == pytest.approx(100.0)
-        assert np.allclose(loaded.train[0], [50.0])
+        np.testing.assert_allclose(loaded.train[0], [50.0])
 
     def test_nonzero_start_time_roundtrip_paired(self, tmp_path):
         """
@@ -534,7 +534,7 @@ class TestHDF5Exporters:
             (Test Case 1) fs_Hz=None with raw_time_unit='samples' raises ValueError.
             (Test Case 2) fs_Hz=0 with raw_time_unit='samples' raises ValueError.
         """
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(3).standard_normal((2, 10))
         sd = SpikeData(
             [np.array([5.0])], length=20.0, raw_data=raw, raw_time=np.arange(10.0)
         )
@@ -569,7 +569,7 @@ class TestHDF5Exporters:
         Tests:
             (Test Case 1) raw_time_unit='invalid' raises ValueError.
         """
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(4).standard_normal((2, 10))
         sd = SpikeData(
             [np.array([5.0])], length=20.0, raw_data=raw, raw_time=np.arange(10.0)
         )
@@ -641,7 +641,7 @@ class TestNWBExporters:
         sd.to_nwb(path)
         sd2 = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_nwb_electrode_roundtrip(self, tmp_path):
         """
@@ -907,7 +907,7 @@ class TestKiloSortExporters:
             return samp / 1000.0 * 1e3
 
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(q(a), b)
+            np.testing.assert_allclose(q(a), b)
 
     def test_export_kilosort_custom_cluster_ids(self, tmp_path):
         """
@@ -1200,7 +1200,7 @@ class TestPickleExporters:
         exporters.export_to_pickle(sd, path)
         sd2 = loaders.load_spikedata_from_pickle(path)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
         assert sd.metadata == sd2.metadata
 
     def test_export_pickle_protocol(self, tmp_path):
@@ -1216,7 +1216,7 @@ class TestPickleExporters:
         exporters.export_to_pickle(sd, path, protocol=2)
         sd2 = loaders.load_spikedata_from_pickle(path)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     @patch("spikelab.data_loaders.s3_utils.upload_to_s3")
     def test_export_pickle_s3_upload(self, mock_upload):

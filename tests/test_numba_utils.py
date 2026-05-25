@@ -145,7 +145,9 @@ class TestNumbaSttcKernels:
             length = 1000.0
             np_val = _sttc_ta(spikes, delt, length)
             nb_val = _nb_sttc_ta(spikes, delt, length)
-            assert np.isclose(np_val, nb_val), f"np={np_val}, nb={nb_val}"
+            np.testing.assert_allclose(
+                np_val, nb_val, err_msg=f"np={np_val}, nb={nb_val}"
+            )
 
     def test_sttc_na_matches_numpy(self):
         """
@@ -178,7 +180,7 @@ class TestNumbaSttcKernels:
 
         np_val = get_sttc(tA, tB, delt, length, start_time=0.0)
         nb_val = _nb_sttc_pair(tA, tB, delt, length)
-        assert np.isclose(np_val, nb_val, atol=1e-12)
+        np.testing.assert_allclose(np_val, nb_val, atol=1e-12)
 
     def test_sttc_pair_empty_train(self):
         """
@@ -204,7 +206,7 @@ class TestNumbaSttcKernels:
         """
         spikes = np.array([10.0, 50.0, 100.0, 200.0])
         val = _nb_sttc_pair(spikes, spikes, 20.0, 300.0)
-        assert np.isclose(val, 1.0)
+        np.testing.assert_allclose(val, 1.0)
 
     def test_sttc_pair_symmetric(self):
         """
@@ -218,7 +220,7 @@ class TestNumbaSttcKernels:
         tB = np.sort(rng.uniform(0, 500, size=50))
         ab = _nb_sttc_pair(tA, tB, 10.0, 500.0)
         ba = _nb_sttc_pair(tB, tA, 10.0, 500.0)
-        assert np.isclose(ab, ba)
+        np.testing.assert_allclose(ab, ba)
 
 
 class TestNumbaSttcAllPairs:
@@ -246,9 +248,12 @@ class TestNumbaSttcAllPairs:
                     sd.length,
                     start_time=sd.start_time,
                 )
-                assert np.isclose(
-                    result[k], ref, atol=1e-10
-                ), f"pair ({i},{j}): numba={result[k]}, numpy={ref}"
+                np.testing.assert_allclose(
+                    result[k],
+                    ref,
+                    atol=1e-10,
+                    err_msg=f"pair ({i},{j}): numba={result[k]}, numpy={ref}",
+                )
                 k += 1
 
     def test_output_shape(self):
@@ -308,8 +313,8 @@ class TestNumbaLatenciesPair:
 
         nb_mean, nb_std, nb_count = _nb_latencies_pair(tI, tJ, 0.0, False)
         assert nb_count == len(tI)
-        assert np.isclose(nb_mean, ref_mean, atol=1e-10)
-        assert np.isclose(nb_std, ref_std, atol=1e-10)
+        np.testing.assert_allclose(nb_mean, ref_mean, atol=1e-10)
+        np.testing.assert_allclose(nb_std, ref_std, atol=1e-10)
 
     def test_with_window(self):
         """
@@ -322,7 +327,7 @@ class TestNumbaLatenciesPair:
         tJ = np.array([105.0, 900.0])  # 500→900 = 400ms, outside window
         mean, std, count = _nb_latencies_pair(tI, tJ, 50.0, True)
         assert count == 1  # only the 100→105 pair
-        assert np.isclose(mean, 5.0)
+        np.testing.assert_allclose(mean, 5.0)
 
     def test_empty_trains(self):
         """
@@ -535,8 +540,8 @@ class TestNumbaIntegrationSttc:
                     sd.length,
                     start_time=sd.start_time,
                 )
-                assert np.isclose(result.matrix[i, j], ref, atol=1e-10)
-                assert np.isclose(result.matrix[j, i], ref, atol=1e-10)
+                np.testing.assert_allclose(result.matrix[i, j], ref, atol=1e-10)
+                np.testing.assert_allclose(result.matrix[j, i], ref, atol=1e-10)
 
     def test_tilings_diagonal_is_one(self):
         """
@@ -624,7 +629,9 @@ class TestNumbaIntegrationStpr:
             (Test Case 2) All non-silent neurons produce finite values.
         """
         sd = _make_sd(n_units=4, length=500.0, spikes_per_unit=30)
-        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=5)
+        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(
+            window_ms=10, cut_outer=5
+        )
         assert stPR.shape == (4, 21)
         assert len(lags) == 21
         assert np.all(np.isfinite(stPR))
@@ -637,7 +644,9 @@ class TestNumbaIntegrationStpr:
             (Test Case 1) c0 matches stPR[:, window_ms] after filtering.
         """
         sd = _make_sd(n_units=4, length=500.0, spikes_per_unit=30)
-        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=5)
+        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(
+            window_ms=10, cut_outer=5
+        )
         # c0 is extracted from the filtered curve at the center index
         assert len(c0) == 4
         assert len(cmax) == 4

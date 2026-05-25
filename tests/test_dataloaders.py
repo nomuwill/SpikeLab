@@ -123,7 +123,7 @@ class TestHDF5Loaders:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         loaded_idces, loaded_times = sd.idces_times()
-        assert np.allclose(loaded_times, times_ms)
+        np.testing.assert_allclose(loaded_times, times_ms)
 
     def test_hdf5_group_per_unit_seconds(self, tmp_path):
         """
@@ -144,8 +144,8 @@ class TestHDF5Loaders:
             path, group_per_unit="units", group_time_unit="s"
         )
         # Expect ms
-        assert np.allclose(sd.train[0], np.array([100.0, 200.0]))
-        assert np.allclose(sd.train[1], np.array([50.0]))
+        np.testing.assert_allclose(sd.train[0], np.array([100.0, 200.0]))
+        np.testing.assert_allclose(sd.train[1], np.array([50.0]))
 
     def test_hdf5_group_per_unit_empty_units(self, tmp_path):
         """
@@ -223,8 +223,8 @@ class TestHDF5Loaders:
             spike_times_index_dataset="spike_times_index",
             spike_times_unit="s",
         )
-        assert np.allclose(sd.train[0], [100.0, 200.0])
-        assert np.allclose(sd.train[1], [500.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[1], [500.0])
 
     def test_hdf5_idces_times_samples_with_fs(self, tmp_path):
         """
@@ -251,8 +251,8 @@ class TestHDF5Loaders:
             times_unit="samples",
             fs_Hz=1000.0,
         )
-        assert np.allclose(sd.train[0], [100.0, 300.0])
-        assert np.allclose(sd.train[1], [200.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 300.0])
+        np.testing.assert_allclose(sd.train[1], [200.0])
 
     def test_hdf5_raw_attachment_seconds_and_samples(self, tmp_path):
         """
@@ -284,7 +284,7 @@ class TestHDF5Loaders:
             raw_time_unit="s",
         )
         assert sd_s.raw_data.shape == (2, 5)
-        assert np.allclose(sd_s.raw_time, np.arange(5) * 1.0)
+        np.testing.assert_allclose(sd_s.raw_time, np.arange(5) * 1.0)
 
         # samples path
         sd_p = loaders.load_spikedata_from_hdf5(
@@ -296,7 +296,7 @@ class TestHDF5Loaders:
             raw_time_unit="samples",
             fs_Hz=1000.0,
         )
-        assert np.allclose(sd_p.raw_time, np.arange(5) * 1.0)
+        np.testing.assert_allclose(sd_p.raw_time, np.arange(5) * 1.0)
 
     def test_hdf5_no_style_raises(self, tmp_path):
         """
@@ -420,7 +420,7 @@ class TestHDF5Loaders:
         )
         # Explicit length_ms should override the inferred value (200 ms)
         assert sd.length == pytest.approx(5000.0)
-        assert np.allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
 
     def test_ec_dl_02_explicit_metadata_parameter(self, tmp_path):
         """
@@ -495,8 +495,8 @@ class TestNWBLoader:
             g.create_dataset("spike_times_index", data=np.array([2, 3]))
 
         sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
-        assert np.allclose(sd.train[0], [100.0, 200.0])
-        assert np.allclose(sd.train[1], [500.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[1], [500.0])
 
     def test_nwb_missing_units_raises(self, tmp_path):
         """
@@ -530,8 +530,8 @@ class TestNWBLoader:
             g.create_dataset("xx_spike_times_index", data=np.array([1, 2]))
 
         sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
-        assert np.allclose(sd.train[0], [200.0])
-        assert np.allclose(sd.train[1], [700.0])
+        np.testing.assert_allclose(sd.train[0], [200.0])
+        np.testing.assert_allclose(sd.train[1], [700.0])
 
     def test_nwb_empty_units_group(self, tmp_path):
         """
@@ -621,7 +621,7 @@ class TestKiloSortAndSpikeInterface:
         all_trains_ms = [np.array([10.0, 20.0]), np.array([15.0])]
         # order by cluster id ascending
         for train, truth in zip(sd.train, all_trains_ms):
-            assert np.allclose(train, truth)
+            np.testing.assert_allclose(train, truth)
 
     def test_spikeinterface_mock(self):
         """
@@ -649,8 +649,8 @@ class TestKiloSortAndSpikeInterface:
         sorting = MockSorting()
         sd = loaders.load_spikedata_from_spikeinterface(sorting)
         # samples -> ms at 2kHz => 0.5 ms increments
-        assert np.allclose(sd.train[0], [10.0, 20.0])
-        assert np.allclose(sd.train[1], [2.5])
+        np.testing.assert_allclose(sd.train[0], [10.0, 20.0])
+        np.testing.assert_allclose(sd.train[1], [2.5])
 
     def test_spikeinterface_base_recording_thresholding(self):
         """
@@ -722,7 +722,7 @@ class TestKiloSortAndSpikeInterface:
         )
         # Only unit 2, times in ms equal to samples at 1kHz
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [0.0, 10.0])
+        np.testing.assert_allclose(sd.train[0], [0.0, 10.0])
 
     def test_spikeinterface_invalid_object_raises(self):
         """
@@ -1056,7 +1056,7 @@ class TestPickleLoaders:
         sd2 = loaders.load_spikedata_from_pickle(path)
         assert isinstance(sd2, SpikeData)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
         # Verify metadata is preserved
         assert sd.metadata == sd2.metadata
 
@@ -1084,14 +1084,17 @@ class TestPickleLoaders:
         # Mock ensure_local_file to return our temp path (as if S3 was already downloaded)
         mock_ensure.return_value = (path, False)
 
-        # Load via S3 URL; ensure_local_file is mocked so no real S3 call
-        sd2 = loaders.load_spikedata_from_pickle("s3://bucket/key.pkl")
+        # Load via S3 URL; ensure_local_file is mocked so no real S3 call.
+        # Pass allow_remote=True to opt in to the S3 fetch path.
+        sd2 = loaders.load_spikedata_from_pickle(
+            "s3://bucket/key.pkl", allow_remote=True
+        )
 
         # Verify ensure_local_file was called with S3 URL (and optional cred kwargs)
         mock_ensure.assert_called_once()
         assert mock_ensure.call_args[0][0] == "s3://bucket/key.pkl"
         # Verify loaded data matches
-        assert np.allclose(sd2.train[0], sd.train[0])
+        np.testing.assert_allclose(sd2.train[0], sd.train[0])
 
     def test_pickle_non_spikedata_raises_valueerror(self, tmp_path):
         """
@@ -1136,7 +1139,7 @@ class TestPickleLoaders:
         mock_ensure.return_value = (path, True)
 
         # Load; loader should remove temp file in finally block
-        loaders.load_spikedata_from_pickle("s3://bucket/key.pkl")
+        loaders.load_spikedata_from_pickle("s3://bucket/key.pkl", allow_remote=True)
 
         # Verify temp file was removed
         assert not os.path.exists(path)
@@ -1186,7 +1189,9 @@ class TestPickleLoaders:
         mock_ensure.return_value = (path, True)
 
         with pytest.raises(Exception):
-            loaders.load_spikedata_from_pickle("s3://bucket/garbage.pkl")
+            loaders.load_spikedata_from_pickle(
+                "s3://bucket/garbage.pkl", allow_remote=True
+            )
 
         # finally block ran → temp file removed even though pickle.load
         # raised.
@@ -1428,7 +1433,7 @@ class TestIBLLoader:
         # Source times are in seconds; loaded times must be x 1000
         source_times_s = spikes["times"][spikes["clusters"] == good_ids[0]]
         expected_ms = source_times_s * 1000.0
-        assert np.allclose(np.sort(sd.train[0]), np.sort(expected_ms))
+        np.testing.assert_allclose(np.sort(sd.train[0]), np.sort(expected_ms))
 
     def test_trial_timing_arrays_in_ms(self):
         """
@@ -1443,10 +1448,10 @@ class TestIBLLoader:
         sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
         expected_stim_on_ms = trials_df["stimOn_times"].to_numpy() * 1000.0
-        assert np.allclose(sd.metadata["stim_on_times"], expected_stim_on_ms)
+        np.testing.assert_allclose(sd.metadata["stim_on_times"], expected_stim_on_ms)
 
         expected_start_ms = trials_df["intervals_0"].to_numpy() * 1000.0
-        assert np.allclose(sd.metadata["trial_start_times"], expected_start_ms)
+        np.testing.assert_allclose(sd.metadata["trial_start_times"], expected_start_ms)
 
     def test_behavioral_arrays_not_converted(self):
         """
@@ -1460,8 +1465,10 @@ class TestIBLLoader:
         mock_one_api, mock_brainwidemap, trials_df, _, _ = self._build_mocks(pid, eid)
         sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
-        assert np.allclose(sd.metadata["choice"], trials_df["choice"].to_numpy())
-        assert np.allclose(
+        np.testing.assert_allclose(
+            sd.metadata["choice"], trials_df["choice"].to_numpy()
+        )
+        np.testing.assert_allclose(
             sd.metadata["feedback_type"], trials_df["feedbackType"].to_numpy()
         )
 
@@ -1518,13 +1525,14 @@ class TestIBLLoader:
         assert isinstance(sd, SpikeData)
         assert sd.N == 3
 
-    def test_no_spikes_produces_empty_trains(self):
+    def test_no_spikes_produces_empty_trains_with_explicit_length(self):
         """
-        Test that units get empty spike trains when all spike collections are unavailable.
+        With all spike collections unavailable and an explicit ``length_ms``
+        supplied, the loader returns a SpikeData with empty trains.
 
         Tests:
             (Test Case 1) Each unit's spike train is an empty array.
-            (Test Case 2) session length falls back to 10000 ms.
+            (Test Case 2) ``sd.length`` matches the explicit ``length_ms``.
         """
         eid, pid = "test-eid", "test-pid"
         all_collections = {
@@ -1535,11 +1543,32 @@ class TestIBLLoader:
         mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
             pid, eid, fail_collections=all_collections
         )
-        sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
+        sd = self._load(eid, pid, mock_one_api, mock_brainwidemap, length_ms=5_000.0)
 
         for train in sd.train:
             assert len(train) == 0
-        assert sd.length == pytest.approx(10_000.0)
+        assert sd.length == pytest.approx(5_000.0)
+
+    def test_no_spikes_without_length_raises(self):
+        """
+        When all spike collections fail AND no explicit ``length_ms`` is
+        passed, the loader raises ValueError rather than fabricating a
+        default duration.
+
+        Tests:
+            (Test Case 1) ValueError is raised naming the probe.
+        """
+        eid, pid = "test-eid", "test-pid"
+        all_collections = {
+            "alf/probe00/pykilosort",
+            "alf/probe01/pykilosort",
+            "alf",
+        }
+        mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
+            pid, eid, fail_collections=all_collections
+        )
+        with pytest.raises(ValueError, match="length_ms"):
+            self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
     def test_missing_one_api_raises_import_error(self):
         """
@@ -1639,7 +1668,7 @@ class TestIBLLoader:
         ):
             with _warnings.catch_warnings(record=True) as w:
                 _warnings.simplefilter("always")
-                sd = loaders.load_spikedata_from_ibl(eid, pid)
+                sd = loaders.load_spikedata_from_ibl(eid, pid, length_ms=5_000.0)
 
         assert isinstance(sd, SpikeData)
         assert sd.N == 2
@@ -1658,13 +1687,13 @@ class TestIBLLoader:
 
     def test_ec_dl_09_no_good_units(self):
         """
-        EC-DL-09: Verify behavior when the bwm_units DataFrame has no good
-        units (label==1) for the requested probe. The loader should return
-        a SpikeData with N=0 and use the default length of 10000 ms.
+        Verify behavior when the bwm_units DataFrame has no good units
+        (label==1) for the requested probe. With an explicit ``length_ms``
+        the loader returns SpikeData with N=0 at the requested duration.
 
         Tests:
             (Test Case 1) sd.N == 0.
-            (Test Case 2) sd.length defaults to 10000.0 ms.
+            (Test Case 2) sd.length equals the requested length_ms.
         """
         import pandas as pd
 
@@ -1740,10 +1769,10 @@ class TestIBLLoader:
                 "brainwidemap": mock_brainwidemap,
             },
         ):
-            sd = loaders.load_spikedata_from_ibl(eid, pid)
+            sd = loaders.load_spikedata_from_ibl(eid, pid, length_ms=5_000.0)
 
         assert sd.N == 0
-        assert sd.length == pytest.approx(10_000.0)
+        assert sd.length == pytest.approx(5_000.0)
 
 
 @skip_no_pandas
@@ -2548,7 +2577,7 @@ class TestHDF5Loader:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [5.0])
+        np.testing.assert_allclose(sd.train[0], [5.0])
 
     def test_nan_spike_times_in_hdf5(self, tmp_path):
         """
@@ -2798,7 +2827,7 @@ class TestTrainsFromFlatIndex:
             np.array([5.0]), np.array([1]), unit="ms", fs_Hz=None
         )
         assert len(trains) == 1
-        assert np.allclose(trains[0], [5.0])
+        np.testing.assert_allclose(trains[0], [5.0])
 
     def test_end_indices_exceeding_flat_times_length(self):
         """
@@ -2808,7 +2837,7 @@ class TestTrainsFromFlatIndex:
             (Test Case 1) ValueError is raised because end_indices[-1]
                 exceeds flat_times length.
         """
-        with pytest.raises(ValueError, match="exceeds flat_times length"):
+        with pytest.raises(ValueError, match="exceeds flat array length"):
             loaders._trains_from_flat_index(
                 np.array([1.0, 2.0, 3.0]), np.array([10]), unit="ms", fs_Hz=None
             )
@@ -3078,7 +3107,7 @@ class TestKiloSort:
 
         sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [10.0, 20.0, 30.0])
+        np.testing.assert_allclose(sd.train[0], [10.0, 20.0, 30.0])
         assert sd.metadata["cluster_ids"] == [0]
 
     def test_kilosort_time_unit_seconds(self, tmp_path):
@@ -3095,7 +3124,7 @@ class TestKiloSort:
 
         sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0, time_unit="s")
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0, 300.0])
 
     def test_kilosort_include_noise(self, tmp_path):
         """

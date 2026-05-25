@@ -69,7 +69,7 @@ class TestRateDataConstructor:
         rd = RateData(data, times)
         assert rd.N == 2
         assert rd.inst_Frate_data.shape == (2, 4)
-        assert np.array_equal(rd.times, times)
+        np.testing.assert_array_equal(rd.times, times)
 
         # Non-2D array raises ValueError.
         with pytest.raises(ValueError):

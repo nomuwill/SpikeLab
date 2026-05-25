@@ -2372,10 +2372,11 @@ class TestRunSessionRetrieve:
         with open(pkl_path, "wb") as f:
             pickle.dump(sd, f)
 
-        # Mock list_output_files to return one pickle. The listed key is the
-        # bare filename (no prefix path) so it strips cleanly regardless of
-        # how parse_s3_url normalises trailing slashes.
-        storage.list_output_files.return_value = ["rec1_curated.pkl"]
+        # Mock list_output_files to return a fully-prefixed S3 key. After
+        # the prefix is stripped the leading "/" left by parse_s3_url's
+        # trailing-slash normalisation is also stripped so the path
+        # resolves under local_dir on every OS.
+        storage.list_output_files.return_value = ["pfx/outputs/run-1/rec1_curated.pkl"]
         storage.output_prefix_for_run.return_value = "s3://bucket/pfx/outputs/run-1/"
 
         # Mock download_file to copy the pickle
@@ -2403,6 +2404,73 @@ class TestRunSessionRetrieve:
         sd_loaded = result_ws.get("rec1_curated", "spikedata")
         assert sd_loaded is not None
         assert sd_loaded.N == 2
+
+    def test_retrieve_sorting_strips_leading_slash_from_relative_path(self, tmp_path):
+        """
+        retrieve_result strips the leading slash left by parse_s3_url's
+        trailing-slash normalisation so listed keys that share the
+        configured output prefix resolve under local_dir on every OS
+        (not at drive root on Windows).
+
+        Tests:
+            (Test Case 1) A listed key fully prefixed with the output
+                prefix is downloaded under local_dir, not at drive root.
+            (Test Case 2) The downloaded SpikeData is loaded into the
+                workspace under the filename stem.
+        """
+        import pickle
+
+        import numpy as np
+
+        from spikelab.spikedata.spikedata import SpikeData
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        session, storage = self._make_session()
+
+        sd = SpikeData([np.array([1.0, 2.0])], length=10.0)
+        pkl_path = tmp_path / "rec1_curated.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(sd, f)
+
+        # Fully prefixed listing key — common in real S3 listings — must
+        # not produce a drive-root path when concatenated with local_dir.
+        storage.list_output_files.return_value = [
+            "pfx/outputs/run-1/rec1_curated.pkl"
+        ]
+        storage.output_prefix_for_run.return_value = "s3://bucket/pfx/outputs/run-1/"
+
+        observed_local_paths: list[str] = []
+
+        def fake_download(*, s3_uri, local_path):
+            import shutil
+
+            observed_local_paths.append(local_path)
+            shutil.copy2(str(pkl_path), local_path)
+            return local_path
+
+        storage.download_file.side_effect = fake_download
+
+        submit_result = SubmitResult(
+            job_name="sort-job",
+            manifest_yaml="",
+            run_id="run-1",
+            uploaded_input_uri="s3://bucket/pfx/inputs/run-1/bundle.zip",
+            output_prefix="s3://bucket/pfx/outputs/run-1/",
+            logs_prefix="s3://bucket/pfx/logs/run-1/",
+            job_type="sorting",
+        )
+
+        out_dir = tmp_path / "out"
+        result_ws = session.retrieve_result(submit_result, str(out_dir))
+        assert isinstance(result_ws, AnalysisWorkspace)
+
+        # Every download_file call resolves under out_dir, never drive root.
+        for lp in observed_local_paths:
+            assert Path(lp).resolve().is_relative_to(out_dir.resolve())
+
+        sd_loaded = result_ws.get("rec1_curated", "spikedata")
+        assert sd_loaded is not None
+        assert sd_loaded.N == 1
 
     def test_retrieve_prepared_raises(self, tmp_path):
         """
@@ -3998,7 +4066,7 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
         local_dir = tmp_path / "local"
         local_dir.mkdir()
 
-        storage.list_output_files.return_value = ["bad.pkl"]
+        storage.list_output_files.return_value = ["pfx/out/run-1/bad.pkl"]
         storage.output_prefix_for_run.return_value = "s3://b/pfx/out/run-1/"
 
         def fake_download(*, s3_uri, local_path):
@@ -4054,7 +4122,7 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
         local_dir = tmp_path / "local"
         local_dir.mkdir()
 
-        storage.list_output_files.return_value = ["metadata.json"]
+        storage.list_output_files.return_value = ["pfx/out/run-1/metadata.json"]
         storage.output_prefix_for_run.return_value = "s3://b/pfx/out/run-1/"
 
         def fake_download(*, s3_uri, local_path):

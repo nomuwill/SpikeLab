@@ -2554,8 +2554,8 @@ class TestPlotScatterGroups:
             group_colors=["red", "blue"],
         )
         # Each PathCollection's facecolor should match
-        assert np.allclose(sc[0].get_facecolor()[0][:3], [1, 0, 0])  # red
-        assert np.allclose(sc[1].get_facecolor()[0][:3], [0, 0, 1])  # blue
+        np.testing.assert_allclose(sc[0].get_facecolor()[0][:3], [1, 0, 0])  # red
+        np.testing.assert_allclose(sc[1].get_facecolor()[0][:3], [0, 0, 1])  # blue
 
     def test_groups_ignores_colorbar(self):
         """
@@ -4824,7 +4824,7 @@ class TestPlotPredictionProbabilityHeatmap:
         )
         baseline_cols = np.where(np.isin(result["groups"], [0, 1]))[0]
         baseline_mean = np.nanmean(result["heatmap"][:, baseline_cols], axis=1)
-        assert np.allclose(baseline_mean, 0.0, atol=1e-9)
+        np.testing.assert_allclose(baseline_mean, 0.0, atol=1e-9)
 
     def test_companion_bar_plot(self):
         """

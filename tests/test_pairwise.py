@@ -390,7 +390,7 @@ class TestPairwiseCompMatrixStackInit:
 
         # Mean calculation
         mean_pcm = stack.mean()
-        assert np.allclose(mean_pcm.matrix, np.mean(stack_data, axis=2))
+        np.testing.assert_allclose(mean_pcm.matrix, np.mean(stack_data, axis=2))
 
         # Mean with NaNs
         stack_data_nan = stack_data.copy()
@@ -464,18 +464,18 @@ class TestPairwiseCompMatrixStackSlicing:
         sub_stack = stack[0:3]
         assert isinstance(sub_stack, PairwiseCompMatrixStack)
         assert len(sub_stack) == 3
-        assert np.array_equal(sub_stack.stack, stack_data[:, :, 0:3])
+        np.testing.assert_array_equal(sub_stack.stack, stack_data[:, :, 0:3])
 
         # Slicing with step
         step_stack = stack[::2]
         assert len(step_stack) == 5  # 0, 2, 4, 6, 8
-        assert np.array_equal(step_stack.stack, stack_data[:, :, ::2])
+        np.testing.assert_array_equal(step_stack.stack, stack_data[:, :, ::2])
 
         # Iteration
         matrices = list(stack)
         assert len(matrices) == 10
         assert isinstance(matrices[0], PairwiseCompMatrix)
-        assert np.array_equal(matrices[0].matrix, stack_data[:, :, 0])
+        np.testing.assert_array_equal(matrices[0].matrix, stack_data[:, :, 0])
 
     def test_getitem_negative_index(self):
         """Negative indexing returns the last slice as a PairwiseCompMatrix.
@@ -562,10 +562,10 @@ class TestPairwiseCompMatrixStackSubslice:
         # Select specific slices
         sub = stack.subslice([0, 2, 5, 9])
         assert len(sub) == 4
-        assert np.array_equal(sub.stack[:, :, 0], stack_data[:, :, 0])
-        assert np.array_equal(sub.stack[:, :, 1], stack_data[:, :, 2])
-        assert np.array_equal(sub.stack[:, :, 2], stack_data[:, :, 5])
-        assert np.array_equal(sub.stack[:, :, 3], stack_data[:, :, 9])
+        np.testing.assert_array_equal(sub.stack[:, :, 0], stack_data[:, :, 0])
+        np.testing.assert_array_equal(sub.stack[:, :, 1], stack_data[:, :, 2])
+        np.testing.assert_array_equal(sub.stack[:, :, 2], stack_data[:, :, 5])
+        np.testing.assert_array_equal(sub.stack[:, :, 3], stack_data[:, :, 9])
 
         # Times should also be subsliced
         assert sub.times == [(0, 100), (200, 300), (500, 600), (900, 1000)]

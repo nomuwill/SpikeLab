@@ -4673,7 +4673,7 @@ class TestResampledIsiUniformGridPositive:
         # are within np.allclose tolerance.
         diffs = np.diff(times)
         assert not np.all(diffs == diffs[0])  # there IS float drift
-        assert np.allclose(diffs, diffs[0])  # but allclose accepts it
+        np.testing.assert_allclose(diffs, diffs[0])  # but allclose accepts it
 
         result = _resampled_isi(spikes, times, sigma_ms=2.0)
         assert result.shape == times.shape

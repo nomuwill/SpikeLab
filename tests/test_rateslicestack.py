@@ -1397,9 +1397,16 @@ class TestSubslice:
 
         Tests:
             (Test Case 1) Output S dimension equals the number of input indices
-                (including duplicates).
-            (Test Case 2) Duplicate slices contain identical data.
-            (Test Case 3) times list has repeated entries for duplicated slices.
+                (with duplicates removed; first occurrence wins).
+            (Test Case 2) The retained slice contains the expected data.
+            (Test Case 3) times list has no repeated entries.
+
+        Notes:
+            - Tier G changed ``subslice`` to preserve caller order and
+              deduplicate. The previous behaviour (sort + keep
+              duplicates) silently produced different output than the
+              caller passed in. The new contract is symmetric with
+              ``subset(..., preserve_order=True)``.
         """
         mat = np.random.default_rng(0).random((3, 10, 5))
         times = [(i * 10.0, (i + 1) * 10.0) for i in range(5)]
@@ -1407,17 +1414,12 @@ class TestSubslice:
 
         sub = rss.subslice([1, 1, 3])
 
-        # 3 entries because duplicates are not removed
-        assert sub.event_stack.shape == (3, 10, 3)
-        # First two slices should be identical (both are slice 1)
-        np.testing.assert_array_equal(
-            sub.event_stack[:, :, 0], sub.event_stack[:, :, 1]
-        )
+        # 2 entries — duplicates deduplicated (first-occurrence wins).
+        assert sub.event_stack.shape == (3, 10, 2)
         np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, 1])
-        np.testing.assert_array_equal(sub.event_stack[:, :, 2], mat[:, :, 3])
-        # times has the duplicate entry
-        assert sub.times[0] == sub.times[1] == times[1]
-        assert sub.times[2] == times[3]
+        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, 3])
+        assert sub.times[0] == times[1]
+        assert sub.times[1] == times[3]
 
 
 class TestOrderUnitsNanSentinel:
@@ -2420,22 +2422,28 @@ class TestRateSliceStackCoreReview:
 
     def test_subslice_mixed_positive_negative_indices(self):
         """
-        Mixed positive/negative indices: sorted() sorts unresolved indices,
-        so -1 sorts before 2, resulting in order [-1, 2] = [4, 2].
+        Mixed positive/negative indices preserve caller order and resolve
+        negatives against the current S dimension.
+
+        Tier G changed ``subslice`` to preserve caller order (and
+        deduplicate), so ``[2, -1]`` against ``S=5`` keeps the input
+        sequence: first slice is index 2, second is index 4 (the
+        normalised form of -1). The previous ``sorted([-1, 2])``
+        ordering put -1 first.
 
         Tests:
             (Test Case 1) subslice([2, -1]) selects 2 slices.
-            (Test Case 2) sorted([-1, 2]) = [-1, 2], so first slice is index -1
-                (last) and second is index 2.
+            (Test Case 2) Slice 0 is the caller's first index (2);
+                slice 1 is the resolved -1 (index 4).
         """
         mat = np.random.default_rng(0).random((2, 10, 5))
         times = [(i * 10.0, (i + 1) * 10.0) for i in range(5)]
         rss = RateSliceStack(event_matrix=mat, times_start_to_end=times)
         sub = rss.subslice([2, -1])
         assert sub.event_stack.shape == (2, 10, 2)
-        # sorted([-1, 2]) = [-1, 2]; -1 maps to slice 4
-        np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, -1])
-        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, 2])
+        # Caller order preserved: [2, -1] → [slice 2, slice 4].
+        np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, 2])
+        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, -1])
 
     def test_get_unit_timing_identical_peak_times(self):
         """

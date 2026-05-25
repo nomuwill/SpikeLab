@@ -152,6 +152,15 @@ class RateData:
             # positional correspondence to unit indices.
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in self.train "
+                    "order. Drop preserve_order=True or use index-based "
+                    "subset() to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
             wanted = set(units)
             selected = [

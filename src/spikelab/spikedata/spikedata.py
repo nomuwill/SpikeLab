@@ -1001,6 +1001,23 @@ class SpikeData:
         if by is not None:
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                # ``by`` resolves to whichever units carry the matching
+                # attribute, in self.train order — caller-supplied
+                # order cannot be honoured because there's no
+                # positional correspondence between the attribute-value
+                # list and unit indices. Surface the no-op to the
+                # caller so the silent ineffectiveness is visible.
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in self.train "
+                    "order (attribute values have no positional "
+                    "correspondence to unit indices). Drop "
+                    "preserve_order=True or use index-based subset() "
+                    "to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
             wanted = set(units)
             matched = [
@@ -1008,10 +1025,6 @@ class SpikeData:
                 for i in range(self.N)
                 if _get_attr(self.neuron_attributes[i], by, _missing) in wanted
             ]
-            # ``by`` resolves to whichever units carry the matching
-            # attribute, in self.train order — caller-supplied order
-            # cannot be honoured because there's no positional
-            # correspondence between the value list and unit indices.
             selected = matched
         else:
             # Match historical semantics: only integer-typed entries
@@ -1049,12 +1062,19 @@ class SpikeData:
 
         # raw_data/raw_time are not propagated to subsets — they remain
         # on the original SpikeData object and can be accessed there.
+        # ``neuron_attributes`` is passed through as-is (consistent with
+        # ``RateData.subset``); an empty list survives as ``[]`` rather
+        # than being silently collapsed to ``None`` via the prior
+        # ``or None`` shortcut. ``[]`` is the more honest answer when
+        # the input had attrs that all got filtered out — downstream
+        # ``isinstance(neuron_attributes, list)`` checks now behave
+        # symmetrically across data classes.
         return SpikeData(
             train,
             length=self.length,
             start_time=self.start_time,
             N=len(train),
-            neuron_attributes=neuron_attributes or None,
+            neuron_attributes=neuron_attributes,
             metadata=self.metadata,
         )
 

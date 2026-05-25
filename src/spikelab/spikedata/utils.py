@@ -1609,8 +1609,19 @@ def _validate_time_start_to_end(
             ``ValueError``. If None (default), no range check is performed.
 
     Returns:
-        valid_time_tuples (list): Sorted list of valid ``(start, end)``
-            tuples. Negative-start windows are preserved.
+        valid_time_tuples (list): The input tuples in ascending-by-start
+            order. Negative-start windows are preserved.
+
+    Notes:
+        - The returned list is **always sorted by start time**, even
+          if the input was not. Callers that pair this list with an
+          externally-supplied parallel array (e.g.
+          ``SpikeSliceStack(spike_stack=..., times_start_to_end=...)``)
+          must therefore re-sort the parallel array using the same
+          key, or pass ``times_start_to_end`` already-sorted. A
+          ``UserWarning`` is emitted at the call site when the sort
+          actually changed the order, so this re-ordering is not
+          silent.
     """
     if not isinstance(times_start_to_end, list):
         raise TypeError("times must be a list of tuples")
@@ -1626,7 +1637,27 @@ def _validate_time_start_to_end(
     valid_time_tuples = []
     zero_duration_offenders = []
     negative_start_offenders = []
-    times_start_to_end = sorted(times_start_to_end)
+    sorted_times = sorted(times_start_to_end)
+    if (
+        len(times_start_to_end) > 1
+        and list(times_start_to_end) != sorted_times
+    ):
+        # The sort decouples the returned slice order from the
+        # caller's input order. That's fine if no parallel array is
+        # bound to the input positions, but it silently breaks
+        # callers like ``SpikeSliceStack(spike_stack=..., times_start_to_end=...)``
+        # who relied on positional alignment. Warn so the rewrite is
+        # visible.
+        warnings.warn(
+            "times_start_to_end was not sorted ascending by start time "
+            "and has been reordered. Any parallel array indexed by the "
+            "same positions (e.g. ``spike_stack`` in SpikeSliceStack) "
+            "will now be misaligned. Pre-sort the input to silence "
+            "this warning.",
+            UserWarning,
+            stacklevel=3,
+        )
+    times_start_to_end = sorted_times
     for i, time_window in enumerate(times_start_to_end):
         if not isinstance(time_window, tuple):
             raise TypeError(f"Element {i} of times is not a tuple: {time_window}")

@@ -23,8 +23,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,s3,spike-sorting,batch-jobs]"
           pip install scikit-learn networkx pandas matplotlib tqdm
+          pip install pytest-forked
 
       - name: Run tests
-        run: pytest -q
+        # `console_output_style=classic` prints each test name on its
+        # own line so a native-level abort (SIGABRT / heap corruption)
+        # identifies the offending test before the process dies.
+        # `--forked` runs each test in a subprocess: a SIGABRT or
+        # heap-corruption-induced crash kills only that worker, so
+        # CI sees ALL crashing tests (not just the first) and the
+        # rest of the suite can still pass / fail individually.
+        run: pytest -v --tb=short -p no:cacheprovider --forked -o console_output_style=classic
 
 

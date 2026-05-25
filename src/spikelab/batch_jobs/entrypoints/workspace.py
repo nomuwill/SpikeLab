@@ -56,21 +56,33 @@ def _find_workspace_h5(extract_dir: Path) -> Path:
     import h5py
 
     candidates: List[Path] = []
+    skipped: List[str] = []
     for h5_path in extract_dir.rglob("*.h5"):
         try:
             with h5py.File(h5_path, "r") as f:
                 if "__workspace_id__" in f.attrs:
                     candidates.append(h5_path)
-        except OSError:
-            # Not a valid HDF5 file (e.g. truncated, wrong format) —
-            # skip; clearly not a workspace.
+        except OSError as exc:
+            # Likely a non-HDF5 file (or a truncated one) that just
+            # happens to end in ``.h5``. Record the path + reason so
+            # the "no workspace found" branch below can tell the
+            # operator which files were skipped — without this, a
+            # genuinely broken HDF5 file looked exactly like "no
+            # workspace in the bundle" with no diagnostic.
+            skipped.append(f"{h5_path}: {exc}")
             continue
     if not candidates:
-        raise FileNotFoundError(
+        msg = (
             "No SpikeLab workspace .h5 found in input bundle. "
             "Expected a file with the __workspace_id__ attribute "
             "(written by AnalysisWorkspace.save)."
         )
+        if skipped:
+            msg += (
+                " The following .h5 files were unreadable and could "
+                "not be inspected:\n  - " + "\n  - ".join(skipped)
+            )
+        raise FileNotFoundError(msg)
     if len(candidates) > 1:
         raise RuntimeError(
             f"Multiple workspace .h5 candidates in bundle: "
@@ -110,8 +122,15 @@ def main() -> None:
         storage.download_file(s3_uri=input_uri, local_path=bundle_zip)
 
         extract_dir = work / "input"
+        # Validate zip members against the target directory before
+        # extracting. Without this, a malicious bundle (compromised S3,
+        # hostile workspace job) could write files outside extract_dir
+        # via ``../`` segments — full RCE inside the container on
+        # Python <3.12 which does not validate ZipInfo paths.
+        from spikelab.batch_jobs.artifact_packager import _safe_extractall
+
         with zipfile.ZipFile(bundle_zip, "r") as zf:
-            zf.extractall(extract_dir)
+            _safe_extractall(zf, extract_dir)
 
         # Find the workspace .h5 by its content signature (the
         # __workspace_id__ attribute), not by filename — bundles can
@@ -121,11 +140,22 @@ def main() -> None:
         workspace_h5 = _find_workspace_h5(extract_dir)
         workspace_base = str(workspace_h5.with_suffix(""))
 
-        # Find the analysis script
+        # Find the analysis script. Reject ambiguity: ``rglob`` order
+        # is not stable, so multiple files with the same name could
+        # let an attacker-supplied script at a deeper path be picked
+        # over the legitimate top-level one. Force the caller to
+        # rename or restructure the bundle if more than one match.
         script_candidates = list(extract_dir.rglob(script_name))
         if not script_candidates:
             raise FileNotFoundError(
                 f"Analysis script {script_name!r} not found in input bundle"
+            )
+        if len(script_candidates) > 1:
+            raise RuntimeError(
+                f"Multiple files named {script_name!r} in input bundle: "
+                f"{[str(p) for p in script_candidates]}. Bundle layout is "
+                "ambiguous; rename one of the files or place the script "
+                "at a unique location."
             )
         script_path = str(script_candidates[0])
 

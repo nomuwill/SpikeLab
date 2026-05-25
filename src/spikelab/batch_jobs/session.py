@@ -87,7 +87,18 @@ class RunSession:
         uploaded_input_uri: str,
         job_type: str,
     ) -> SubmitResult:
-        """Render manifest, apply to cluster, return result."""
+        """Render manifest, apply to cluster, return result.
+
+        Two manifests are rendered: a real one (with credentials
+        intact) that is written to a tempfile and applied to the
+        cluster, and a redacted one (with sensitive env values
+        masked) returned in ``SubmitResult.manifest_yaml``. The
+        latter is surfaced to logs and audit trails — without the
+        redaction, a caller who put credentials directly into
+        ``container.env`` would leak them into log/audit storage.
+        """
+        from .credentials import redact_sensitive_map
+
         job_name = self._build_job_name(job_spec.name_prefix)
         manifest_text = self.render_manifest(
             job_name=job_name, job_spec=job_spec, run_id=run_id
@@ -106,9 +117,22 @@ class RunSession:
         finally:
             os.unlink(manifest_path)
 
+        # Render a second manifest with sensitive env values redacted
+        # for the SubmitResult surface. The redaction policy lives in
+        # ``redact_sensitive_map`` (word-boundary SECRET / TOKEN /
+        # PASSWORD), so any env var the caller wires up through that
+        # naming convention is automatically scrubbed here without a
+        # separate allow-list.
+        redacted_env = redact_sensitive_map(dict(job_spec.container.env))
+        redacted_container = job_spec.container.model_copy(update={"env": redacted_env})
+        redacted_spec = job_spec.model_copy(update={"container": redacted_container})
+        redacted_manifest = self.render_manifest(
+            job_name=job_name, job_spec=redacted_spec, run_id=run_id
+        )
+
         return SubmitResult(
             job_name=job_name,
-            manifest_yaml=manifest_text,
+            manifest_yaml=redacted_manifest,
             run_id=run_id,
             uploaded_input_uri=uploaded_input_uri,
             output_prefix=self.storage.output_prefix_for_run(run_id),
@@ -123,6 +147,24 @@ class RunSession:
         merged.update(env)
         updated_container = job_spec.container.model_copy(update={"env": merged})
         return job_spec.model_copy(update={"container": updated_container})
+
+    def _s3_env_overlay(self) -> Dict[str, str]:
+        """Return profile-derived S3 env vars for pod injection.
+
+        The pod-side ``S3StorageClient`` reads ``S3_ENDPOINT_URL`` and
+        ``AWS_DEFAULT_REGION`` from environment variables. Without this
+        overlay, an NRP / non-AWS S3 cluster (endpoint_url configured
+        only on the host) would have the pod silently fall back to
+        boto3's default AWS endpoint and the input-bundle download
+        would fail with a confusing ``NoSuchBucket`` despite the host
+        successfully uploading to the correct endpoint.
+        """
+        overlay: Dict[str, str] = {}
+        if self.profile.endpoint_url:
+            overlay["S3_ENDPOINT_URL"] = self.profile.endpoint_url
+        if self.profile.region_name:
+            overlay["AWS_DEFAULT_REGION"] = self.profile.region_name
+        return overlay
 
     # ------------------------------------------------------------------
     # Submission: workspace job
@@ -187,14 +229,13 @@ class RunSession:
                 local_zip=bundle_zip, run_id=run_id
             )
 
-            enriched_spec = self._inject_env(
-                job_spec,
-                {
-                    "INPUT_URI": uploaded_input_uri,
-                    "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
-                    "SCRIPT_NAME": script_path.name,
-                },
-            )
+            workspace_env = {
+                "INPUT_URI": uploaded_input_uri,
+                "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
+                "SCRIPT_NAME": script_path.name,
+            }
+            workspace_env.update(self._s3_env_overlay())
+            enriched_spec = self._inject_env(job_spec, workspace_env)
             # Set container command to the workspace entrypoint
             enriched_spec = enriched_spec.model_copy(
                 update={
@@ -280,13 +321,12 @@ class RunSession:
                 local_zip=bundle_zip, run_id=run_id
             )
 
-            enriched_spec = self._inject_env(
-                job_spec,
-                {
-                    "INPUT_URI": uploaded_input_uri,
-                    "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
-                },
-            )
+            sorting_env = {
+                "INPUT_URI": uploaded_input_uri,
+                "OUTPUT_PREFIX": self.storage.output_prefix_for_run(run_id),
+            }
+            sorting_env.update(self._s3_env_overlay())
+            enriched_spec = self._inject_env(job_spec, sorting_env)
             enriched_spec = enriched_spec.model_copy(
                 update={
                     "container": enriched_spec.container.model_copy(
@@ -319,9 +359,43 @@ class RunSession:
         run_id: Optional[str] = None,
         allow_policy_risk: bool = False,
     ) -> SubmitResult:
-        """Submit a job without generating bundle artifacts."""
+        """Submit a job without generating bundle artifacts.
+
+        Parameters:
+            job_spec (JobSpec): K8s job spec.
+            run_id (str | None): Optional explicit run identifier. Must
+                be a single path component — no ``/``, ``\\``, or
+                ``..`` segments. Defaults to a random UUID hex when None.
+            allow_policy_risk (bool): Bypass policy preflight BLOCK
+                findings.
+
+        Returns:
+            result (SubmitResult): The submitted job descriptor.
+
+        Notes:
+            - Unlike ``submit_workspace_job`` / ``submit_sorting_job``,
+              this path skips ``package_analysis_bundle`` (which has its
+              own traversal guard on run_id). The same traversal check
+              is applied here so an operator-supplied run_id like
+              ``"../escape"`` cannot escape the storage prefix.
+        """
         self._preflight(job_spec, allow_policy_risk)
         current_run_id = run_id or uuid4().hex
+        # Mirror the path-traversal guard from package_analysis_bundle so
+        # an operator-supplied run_id cannot escape the storage prefix
+        # downstream. The bundle path is gated by the packager; this
+        # path bypasses the packager entirely.
+        if (
+            not current_run_id
+            or "/" in current_run_id
+            or "\\" in current_run_id
+            or ".." in current_run_id.split("/")
+        ):
+            raise ValueError(
+                f"run_id={current_run_id!r} contains path-traversal segments "
+                "or separators; run_id must be a single path component (no "
+                "'/', '\\\\', or '..')."
+            )
         return self._submit(
             job_spec=job_spec,
             run_id=current_run_id,
@@ -355,8 +429,6 @@ class RunSession:
             - Call ``wait_for_completion`` before calling this method to
               ensure the job has finished.
         """
-        from ..workspace.workspace import AnalysisWorkspace
-
         local = Path(local_dir)
         local.mkdir(parents=True, exist_ok=True)
 
@@ -416,8 +488,17 @@ class RunSession:
         downloaded = []
         local_dir_resolved = local_dir.resolve()
         for key in keys:
-            # Derive relative path from prefix
+            # Derive relative path from prefix. ``parse_s3_url`` strips
+            # the trailing ``/`` from the prefix, so for a configured
+            # prefix like ``s3://bucket/pfx/out/run-1/`` and a listed
+            # key ``pfx/out/run-1/file.pkl`` the naive strip leaves
+            # ``/file.pkl``. On Windows ``Path(local_dir) / "/file.pkl"``
+            # is interpreted as drive-root, which the traversal guard
+            # below would then refuse for ordinary downloads. Strip
+            # leading slashes/backslashes so ``relative`` is always a
+            # plain relative path.
             relative = key[len(prefix_key) :] if key.startswith(prefix_key) else key
+            relative = relative.lstrip("/\\")
             # Path-traversal guard: S3 listing keys flow into the local
             # filesystem destination via ``local_dir / relative``. A
             # malicious or buggy upstream that uploaded an object with
@@ -438,19 +519,22 @@ class RunSession:
             self.storage.download_file(s3_uri=s3_uri, local_path=str(local_path))
             downloaded.append((relative, str(local_path)))
 
-        # Build workspace from downloaded SpikeData pickles
+        # Build workspace from downloaded SpikeData pickles. Accumulate
+        # per-file failures so the caller sees the full set in one
+        # RuntimeError at the end. Previously each error was logged as
+        # a UserWarning and skipped silently — the workspace was
+        # returned as if successful even when half the pickles were
+        # corrupt, and the caller had no programmatic way to detect
+        # the partial-failure state.
         ws = AnalysisWorkspace(name=f"sorting-{result.run_id[:8]}")
+        failures: List[str] = []
 
         for relative, local_path in downloaded:
             if local_path.endswith(".pkl"):
                 try:
                     sd = load_spikedata_from_pickle(local_path)
                 except (pickle.UnpicklingError, EOFError, OSError, ValueError) as e:
-                    warnings.warn(
-                        f"Skipping corrupt pickle {relative!r}: "
-                        f"{type(e).__name__}: {e}",
-                        UserWarning,
-                    )
+                    failures.append(f"{relative}: {type(e).__name__}: {e}")
                     continue
                 namespace = Path(relative).stem
                 ws.store(namespace, "spikedata", sd)
@@ -460,14 +544,18 @@ class RunSession:
                     with open(local_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                 except (json.JSONDecodeError, OSError) as e:
-                    warnings.warn(
-                        f"Skipping unreadable JSON {relative!r}: "
-                        f"{type(e).__name__}: {e}",
-                        UserWarning,
-                    )
+                    failures.append(f"{relative}: {type(e).__name__}: {e}")
                     continue
                 namespace = Path(relative).stem
                 ws.store(namespace, "sorting_metadata", meta)
+
+        if failures:
+            joined = "\n  - " + "\n  - ".join(failures)
+            raise RuntimeError(
+                f"Failed to ingest {len(failures)} sorting output file(s) for "
+                f"run_id={result.run_id!r}; the workspace would have been "
+                f"silently incomplete:{joined}"
+            )
 
         return ws
 
@@ -508,9 +596,22 @@ class RunSession:
             base_path (str): Path without extension.
         """
         if isinstance(workspace, str):
-            # Assume it's a base path; verify .h5 exists
-            if not Path(f"{workspace}.h5").exists():
-                raise FileNotFoundError(f"Workspace file not found: {workspace}.h5")
+            # Assume it's a base path; verify both ``.h5`` and ``.json``
+            # exist — ``AnalysisWorkspace.save`` writes both, so a
+            # missing ``.json`` indicates either a corrupt save or a
+            # caller passing only the HDF5 file's stem (the surrounding
+            # bundle code adds both to the input_paths list).
+            h5_path = Path(f"{workspace}.h5")
+            json_path = Path(f"{workspace}.json")
+            if not h5_path.exists():
+                raise FileNotFoundError(f"Workspace file not found: {h5_path}")
+            if not json_path.exists():
+                raise FileNotFoundError(
+                    f"Workspace index file not found: {json_path}. "
+                    "AnalysisWorkspace.save writes both .h5 and .json — "
+                    "the .json is missing, suggesting a corrupt or "
+                    "partial save."
+                )
             return workspace
 
         # It's an AnalysisWorkspace object

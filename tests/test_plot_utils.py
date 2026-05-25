@@ -313,7 +313,10 @@ class TestPlotRecording:
             (Test Case 1) Figure has 2 panels (raster + pop_rate).
         """
         sd = _make_sd()
-        pop = sd.get_pop_rate()
+        # _make_sd builds a 400 ms recording — default gauss_sigma=100
+        # ms trips the new 6*sigma <= length guard. Use a smaller
+        # smoothing kernel that fits the raster.
+        pop = sd.get_pop_rate(gauss_sigma=30)
         fig = plot_recording(sd, show_raster=True, pop_rate=pop, show=False)
         # 2 panels × 2 columns = 4 axes
         assert len(fig.axes) == 4
@@ -2551,8 +2554,8 @@ class TestPlotScatterGroups:
             group_colors=["red", "blue"],
         )
         # Each PathCollection's facecolor should match
-        assert np.allclose(sc[0].get_facecolor()[0][:3], [1, 0, 0])  # red
-        assert np.allclose(sc[1].get_facecolor()[0][:3], [0, 0, 1])  # blue
+        np.testing.assert_allclose(sc[0].get_facecolor()[0][:3], [1, 0, 0])  # red
+        np.testing.assert_allclose(sc[1].get_facecolor()[0][:3], [0, 0, 1])  # blue
 
     def test_groups_ignores_colorbar(self):
         """
@@ -4821,7 +4824,7 @@ class TestPlotPredictionProbabilityHeatmap:
         )
         baseline_cols = np.where(np.isin(result["groups"], [0, 1]))[0]
         baseline_mean = np.nanmean(result["heatmap"][:, baseline_cols], axis=1)
-        assert np.allclose(baseline_mean, 0.0, atol=1e-9)
+        np.testing.assert_allclose(baseline_mean, 0.0, atol=1e-9)
 
     def test_companion_bar_plot(self):
         """

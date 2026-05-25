@@ -40,7 +40,20 @@ def _build_reference_trace(traces, n_reference_channels):
 
     Returns:
         reference (np.ndarray): Signed ``(samples,)`` array.
+
+    Raises:
+        ValueError: If ``traces`` is not 2-D or has zero channels.
+            Previously ``traces.shape == (0, T)`` silently returned
+            ``np.zeros((T,))`` (asymmetric with ``(0, 0)`` which
+            raised from the underlying ``np.max`` reduction). Both
+            empty-channel shapes now raise consistently.
     """
+    if traces.ndim != 2 or traces.shape[0] == 0:
+        raise ValueError(
+            f"_build_reference_trace requires traces with at least one "
+            f"channel (shape (n_channels, n_samples) with n_channels >= 1), "
+            f"got shape {traces.shape}."
+        )
     chan_amps = np.max(np.abs(traces), axis=1)
     k = max(1, min(int(n_reference_channels), traces.shape[0]))
     top_k_idx = np.argpartition(chan_amps, -k)[-k:]

@@ -306,7 +306,9 @@ class TestStreamingWaveformExtractor:
         recentered = np.load(sorting.folder / "spike_times.npy")
         original = np.load(sorting.folder / "spike_times_kilosort.npy")
 
-        assert np.array_equal(np.sort(original), np.sort(original)), "monotonicity"
+        np.testing.assert_array_equal(
+            np.sort(original), original, err_msg="monotonicity"
+        )
         assert original.shape == recentered.shape
 
         diffs = recentered.astype(int) - original.astype(int)
@@ -494,3 +496,561 @@ class TestStreamingWaveformExtractor:
 
         assert called["streaming"] == 1
         assert called["chunked"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Batch A — parallel pre-allocation (open_memmap) + per-unit flush()
+#
+# Pins the contracts introduced by:
+#   * dda9b16 — ``run_extract_waveforms`` replaces the
+#     ``np.zeros(..) → np.save(..)`` pre-alloc pattern with
+#     ``np.lib.format.open_memmap`` so the per-unit waveform file is
+#     created via ``ftruncate`` instead of materialising a giant zero
+#     array in RAM.
+#   * 99ded3a — after each unit's per-spike write loop the worker
+#     calls ``wfs.flush()`` so the OS does not buffer dirty pages
+#     indefinitely (durability + IOStallWatchdog visibility).
+# ---------------------------------------------------------------------------
+
+
+@skip_no_spikeinterface
+class TestParallelPreallocationAndFlush:
+    """Memmap pre-allocation + flush invariants for ``run_extract_waveforms``."""
+
+    def _build_we(self, tmp_path: Path, n_units: int = 2, n_spikes_per_unit: int = 6):
+        """Lightweight synthetic dataset + ``WaveformExtractor`` for the
+        parallel path. Returns ``(we, sorting, rec, ks_folder, root)``."""
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        cfg = _build_config(streaming=False, save_files=True)
+        rec, sorting, _, _, ks_folder = _build_dataset(
+            tmp_path, n_units=n_units, n_spikes_per_unit=n_spikes_per_unit
+        )
+        root_folder = tmp_path / "wf_root"
+        we = WaveformExtractor.create_initial(
+            recording_path=ks_folder / "recording.dat",
+            recording=rec,
+            sorting=sorting,
+            root_folder=root_folder,
+            initial_folder=root_folder / "initial",
+            config=cfg,
+        )
+        return we, sorting, rec, ks_folder, root_folder
+
+    def test_preallocation_uses_open_memmap_not_zeros(self, tmp_path, monkeypatch):
+        """``run_extract_waveforms`` pre-allocates per-unit files via
+        ``np.lib.format.open_memmap`` — never via ``np.zeros + np.save``.
+
+        Spies on both APIs to assert:
+
+        - ``np.lib.format.open_memmap`` is called once per unit.
+        - ``np.zeros`` is never called with a shape that looks like the
+          big per-unit waveform buffer
+          ``(n_spikes, nsamples, num_channels)`` — the regression we
+          would see if the old in-RAM pattern returned. Small per-spike
+          buffers (e.g. the ``sampled_index`` struct used by
+          :meth:`sample_spikes`) are exempted by gating on total size.
+        """
+        we, sorting, rec, ks_folder, _ = self._build_we(tmp_path)
+        num_chans = rec.get_num_channels()
+
+        import numpy as _np
+        from spikelab.spike_sorting import waveform_extractor as _wfx
+
+        real_open = _np.lib.format.open_memmap
+        # Count only the parent-process pre-allocation opens (``mode='w+'``
+        # with an explicit shape). Worker-side ``np.load(..., mmap_mode='r+')``
+        # also routes through ``open_memmap`` but with ``mode='r+'``, so we
+        # filter on ``mode``.
+        open_calls = {"count": 0, "shapes": []}
+
+        def _spy_open(path, *args, **kwargs):
+            mode = kwargs.get("mode")
+            if mode is None and len(args) >= 1:
+                mode = args[0]
+            shape = kwargs.get("shape")
+            if shape is None and len(args) >= 3:
+                shape = args[2]
+            if mode == "w+":
+                open_calls["count"] += 1
+                open_calls["shapes"].append(shape)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(_np.lib.format, "open_memmap", _spy_open)
+
+        # ``np.zeros`` is used elsewhere in the extractor (e.g.
+        # ``sample_spikes`` builds a small struct array, the templates
+        # cache, etc.). Gate the raise on the "big per-unit buffer"
+        # signature so we only catch the regression we care about.
+        real_zeros = _np.zeros
+        big_threshold = we.nsamples * num_chans * 8  # ≥ one (nsamples, nchans) slab
+
+        def _zeros_guard(shape, *args, **kwargs):
+            try:
+                shp_tuple = (
+                    tuple(shape) if hasattr(shape, "__iter__") else (int(shape),)
+                )
+            except TypeError:
+                shp_tuple = (int(shape),)
+            # Big 3-D per-unit waveform buffer: (n_spikes, nsamples, nchans)
+            if len(shp_tuple) == 3 and shp_tuple[1:] == (we.nsamples, num_chans):
+                raise AssertionError(
+                    f"np.zeros called with per-unit waveform shape {shp_tuple} — "
+                    "expected open_memmap-based pre-allocation."
+                )
+            # Anything else (small structs, scalars, templates cache):
+            # delegate to the real implementation.
+            return real_zeros(shape, *args, **kwargs)
+
+        monkeypatch.setattr(_wfx.np, "zeros", _zeros_guard)
+        # The extractor imports numpy as ``np`` at module scope; that's
+        # the binding the open_memmap pre-alloc path uses.
+
+        we.run_extract_waveforms(n_jobs=1)
+
+        n_units = len(sorting.unit_ids)
+        assert open_calls["count"] == n_units, (
+            f"Expected open_memmap called once per unit ({n_units}); "
+            f"saw {open_calls['count']} calls."
+        )
+        for shp in open_calls["shapes"]:
+            assert shp is not None and len(shp) == 3
+            assert shp[1] == we.nsamples
+            assert shp[2] == num_chans
+
+    def test_preallocated_file_is_valid_npy(self, tmp_path):
+        """Each per-unit ``waveforms_<uid>.npy`` is a valid .npy header
+        and loads with the expected ``(n_spikes, nsamples, num_chans)``
+        shape + dtype. Positions never written by a worker read back as
+        zero (sparse-file semantics of ``open_memmap(mode='w+')``).
+        """
+        we, sorting, rec, _, root_folder = self._build_we(tmp_path)
+        num_chans = rec.get_num_channels()
+
+        we.run_extract_waveforms(n_jobs=1)
+
+        for uid in sorting.unit_ids:
+            wf_path = root_folder / "waveforms" / f"waveforms_{uid}.npy"
+            assert wf_path.is_file(), f"Unit {uid}: expected {wf_path}"
+            # Without mmap so we actually parse the .npy header.
+            wfs = np.load(wf_path)
+            assert wfs.ndim == 3
+            assert wfs.shape[1] == we.nsamples
+            assert wfs.shape[2] == num_chans
+            assert wfs.dtype == np.dtype(we.dtype)
+            # Sparse-file zeros are valid data — just assert finite.
+            assert np.all(np.isfinite(wfs))
+
+    def test_wfs_flush_called_per_unit(self, tmp_path, monkeypatch):
+        """The worker calls ``wfs.flush()`` at least once per unit
+        with spikes in a chunk. Pins the durability/visibility contract
+        from commit 99ded3a: without the flush, dirty pages can sit in
+        the OS page cache indefinitely, and the IOStallWatchdog's
+        byte-counter delta can decide the worker is stalled when it's
+        actually batching writes.
+
+        The flush call sits inside
+        ``_waveform_extractor_chunk`` between unit writes, so we
+        spy on the result of ``np.load(..., mmap_mode='r+')`` rather
+        than on ``open_memmap`` (which is called by the parent process
+        before any worker spins up).
+        """
+        we, sorting, _, _, _ = self._build_we(tmp_path)
+
+        from spikelab.spike_sorting import waveform_extractor as _wfx
+
+        real_load = _wfx.np.load
+        flushed_files: dict = {}
+
+        def _wrapping_load(path, *args, **kwargs):
+            arr = real_load(path, *args, **kwargs)
+            if str(path).endswith(".npy") and "waveforms_" in str(path):
+                real_flush = arr.flush
+
+                def _spy_flush(*a, **k):
+                    flushed_files[str(path)] = flushed_files.get(str(path), 0) + 1
+                    return real_flush(*a, **k)
+
+                # Patch only this instance's flush.
+                try:
+                    arr.flush = _spy_flush  # type: ignore[assignment]
+                except (AttributeError, TypeError):
+                    pass
+            return arr
+
+        monkeypatch.setattr(_wfx.np, "load", _wrapping_load)
+
+        we.run_extract_waveforms(n_jobs=1)
+
+        # At least one per-unit waveform file got flushed. (With
+        # ``n_jobs=1`` the worker loads each unit's memmap inside the
+        # chunk loop, so we expect one flush per unit-with-spikes.)
+        assert flushed_files, (
+            "Expected at least one wfs.flush() call inside the worker; "
+            f"saw none. flushed_files={flushed_files}"
+        )
+        # Every unit with spikes should have had its memmap flushed
+        # at least once (durability contract).
+        for uid in sorting.unit_ids:
+            unit_keys = [k for k in flushed_files if f"waveforms_{uid}.npy" in k]
+            assert unit_keys, f"Unit {uid}: no flush() recorded"
+
+    def test_zero_spike_unit_produces_valid_empty_npy(self, tmp_path):
+        """A unit with zero spikes in the dataset still pre-allocates a
+        valid .npy with shape ``(0, nsamples, num_chans)``. Loader and
+        extractor do not crash.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        rec, sorting, _, _, ks_folder = _build_dataset(
+            tmp_path, n_units=2, n_spikes_per_unit=5
+        )
+
+        # Inject an empty unit by appending a cluster ID with no spikes
+        # in spike_clusters.npy. KilosortSortingExtractor scans
+        # ``set(spike_clusters)`` for ``unit_ids``, so we need to give
+        # it at least one spike but place it inside the trim margin so
+        # ``select_random_spikes_uniformly`` filters it out.
+        st = np.load(ks_folder / "spike_times.npy")
+        sc = np.load(ks_folder / "spike_clusters.npy")
+        empty_uid = int(sc.max()) + 1
+        # Place a single spike right at sample 0 — well inside the
+        # nbefore guard band, so sample_spikes will drop it.
+        st_e = np.array([0], dtype=st.dtype)
+        sc_e = np.array([empty_uid], dtype=sc.dtype)
+        order = np.argsort(np.concatenate([st, st_e]))
+        np.save(ks_folder / "spike_times.npy", np.concatenate([st, st_e])[order])
+        np.save(ks_folder / "spike_clusters.npy", np.concatenate([sc, sc_e])[order])
+
+        sorting = KilosortSortingExtractor(ks_folder)
+
+        cfg = _build_config(streaming=False, save_files=True)
+        root_folder = tmp_path / "wf_root"
+        we = WaveformExtractor.create_initial(
+            recording_path=ks_folder / "recording.dat",
+            recording=rec,
+            sorting=sorting,
+            root_folder=root_folder,
+            initial_folder=root_folder / "initial",
+            config=cfg,
+        )
+
+        we.run_extract_waveforms(n_jobs=1)
+
+        wf_path = root_folder / "waveforms" / f"waveforms_{empty_uid}.npy"
+        assert (
+            wf_path.is_file()
+        ), f"Expected an empty-but-valid .npy for unit {empty_uid} at {wf_path}"
+        wfs = np.load(wf_path)
+        assert wfs.shape == (0, we.nsamples, rec.get_num_channels()), (
+            f"Empty unit {empty_uid}: shape {wfs.shape} != "
+            f"(0, {we.nsamples}, {rec.get_num_channels()})"
+        )
+
+    def test_reextraction_truncates_and_rewrites(self, tmp_path):
+        """Re-running ``run_extract_waveforms`` with a smaller spike
+        count truncates the existing per-unit file (``mode='w+'``
+        semantics). Without that, the stale tail of the larger file
+        would silently linger on disk.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        # ---- Run 1: 8 spikes / unit ----
+        cfg = _build_config(streaming=False, save_files=True)
+        rec, sorting, _, _, ks_folder = _build_dataset(
+            tmp_path, n_units=2, n_spikes_per_unit=8
+        )
+        root_folder = tmp_path / "wf_root"
+        we1 = WaveformExtractor.create_initial(
+            recording_path=ks_folder / "recording.dat",
+            recording=rec,
+            sorting=sorting,
+            root_folder=root_folder,
+            initial_folder=root_folder / "initial",
+            config=cfg,
+        )
+        we1.run_extract_waveforms(n_jobs=1)
+
+        first_shapes = {}
+        first_sizes = {}
+        for uid in sorting.unit_ids:
+            p = root_folder / "waveforms" / f"waveforms_{uid}.npy"
+            first_shapes[uid] = np.load(p).shape
+            first_sizes[uid] = p.stat().st_size
+
+        # ---- Run 2: 3 spikes / unit, *same* root_folder ----
+        tmp_path2 = tmp_path / "run2"
+        tmp_path2.mkdir()
+        rec2, sorting2, _, _, ks_folder2 = _build_dataset(
+            tmp_path2, n_units=2, n_spikes_per_unit=3
+        )
+        # Need a fresh initial_folder location too, because
+        # ``create_initial`` re-builds ``unit_ids.npy`` etc. there.
+        # Reuse the same root_folder so the second run overwrites
+        # the per-unit .npy files.
+        we2 = WaveformExtractor.create_initial(
+            recording_path=ks_folder2 / "recording.dat",
+            recording=rec2,
+            sorting=sorting2,
+            root_folder=root_folder,
+            initial_folder=root_folder / "initial",
+            config=cfg,
+        )
+        we2.run_extract_waveforms(n_jobs=1)
+
+        for uid in sorting2.unit_ids:
+            p = root_folder / "waveforms" / f"waveforms_{uid}.npy"
+            second_shape = np.load(p).shape
+            second_size = p.stat().st_size
+            # Second run had fewer spikes → file shrank.
+            assert second_shape[0] < first_shapes[uid][0], (
+                f"Unit {uid}: re-extraction did not reduce spike count "
+                f"(first {first_shapes[uid]}, second {second_shape})"
+            )
+            assert second_size < first_sizes[uid], (
+                f"Unit {uid}: file size did not shrink (first "
+                f"{first_sizes[uid]}, second {second_size}) — looks like "
+                "mode='w+' is not truncating."
+            )
+            # And the new size is consistent with the new shape (no
+            # stale-tail bytes hanging around).
+            assert second_shape[1:] == (we2.nsamples, rec2.get_num_channels())
+
+    def test_disjoint_writes_across_workers_no_corruption(self, tmp_path):
+        """Per-unit memmap is written disjointly: every position the
+        worker fills should match the result of a deterministic serial
+        run.
+
+        Implementation: run extraction twice on the same synthetic
+        dataset with the same RNG seed (controlled via the
+        ``_build_dataset`` fixture, which seeds inline) and assert
+        byte-equality of the resulting .npy files. Forces ``n_jobs=1``
+        in both runs — multi-process tests on Windows + pytest + numpy
+        memmap are flaky in CI — but the equality contract being
+        exercised is the same: identical inputs must produce identical
+        per-unit memmap contents.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        # ---- Run A ----
+        cfg = _build_config(streaming=False, save_files=True)
+        (tmp_path / "A").mkdir()
+        recA, sortingA, _, _, ks_folderA = _build_dataset(
+            tmp_path / "A", n_units=3, n_spikes_per_unit=12
+        )
+        rootA = tmp_path / "A_root"
+        weA = WaveformExtractor.create_initial(
+            recording_path=ks_folderA / "recording.dat",
+            recording=recA,
+            sorting=sortingA,
+            root_folder=rootA,
+            initial_folder=rootA / "initial",
+            config=cfg,
+        )
+        weA.run_extract_waveforms(n_jobs=1)
+
+        # ---- Run B (rebuilt from scratch with the same seed) ----
+        (tmp_path / "B").mkdir()
+        recB, sortingB, _, _, ks_folderB = _build_dataset(
+            tmp_path / "B", n_units=3, n_spikes_per_unit=12
+        )
+        rootB = tmp_path / "B_root"
+        weB = WaveformExtractor.create_initial(
+            recording_path=ks_folderB / "recording.dat",
+            recording=recB,
+            sorting=sortingB,
+            root_folder=rootB,
+            initial_folder=rootB / "initial",
+            config=cfg,
+        )
+        weB.run_extract_waveforms(n_jobs=1)
+
+        # Same units, same waveforms — no dropped writes, no
+        # cross-unit corruption.
+        assert list(sortingA.unit_ids) == list(sortingB.unit_ids)
+        for uid in sortingA.unit_ids:
+            arrA = np.load(rootA / "waveforms" / f"waveforms_{uid}.npy")
+            arrB = np.load(rootB / "waveforms" / f"waveforms_{uid}.npy")
+            assert arrA.shape == arrB.shape, (
+                f"Unit {uid}: shapes diverged between runs "
+                f"({arrA.shape} vs {arrB.shape})"
+            )
+            np.testing.assert_array_equal(
+                arrA,
+                arrB,
+                err_msg=(
+                    f"Unit {uid}: per-spike waveforms diverged between "
+                    "identical runs — looks like a dropped/corrupted "
+                    "write."
+                ),
+            )
+
+
+# ============================================================================
+# WaveformExtractor.__init__ JSON-fallback warning paths. The constructor
+# reads three keys from extraction_parameters.json (pos_peak_thresh,
+# max_waveforms_per_unit, save_waveform_files) and falls back to
+# WaveformConfig defaults when any are absent. A recent source change
+# added a _logger.warning per missing key so operators reloading
+# pre-Phase-2.4 extractors see that defaults were substituted; this
+# class pins the warning contract by hand-building extraction_parameters.json
+# fixtures that omit one or more keys.
+# ============================================================================
+
+
+@skip_no_spikeinterface
+class TestWaveformExtractorInitMissingJsonKeysWarn:
+    """``WaveformExtractor.__init__`` emits one ``_logger.warning``
+    per missing JSON key from the set ``{pos_peak_thresh,
+    max_waveforms_per_unit, save_waveform_files}``. Pre-fix the
+    fallback was silent; the warning surfaces a defaults-substitution
+    that would otherwise look identical to a fresh extractor written
+    with the same defaults.
+    """
+
+    def _minimal_recording(self):
+        """Recording mock whose `has_scaleable_traces` is True so the
+        constructor takes the µV-scaling branch (no `dtype` needed).
+        """
+        import unittest.mock as _mock
+
+        rec = _mock.MagicMock()
+        rec.has_scaleable_traces.return_value = True
+        return rec
+
+    def _minimal_params(self, **overrides):
+        """JSON parameters with only the required keys; pass overrides
+        to add the optional keys per test.
+        """
+        params = {
+            "sampling_frequency": 20000.0,
+            "ms_before": 2.0,
+            "ms_after": 2.0,
+            "peak_ind": 40,
+            "dtype": "float32",
+        }
+        params.update(overrides)
+        return params
+
+    def _write_params_and_construct(self, tmp_path, params, caplog):
+        """Write hand-built ``extraction_parameters.json`` and build a
+        ``WaveformExtractor`` against it, capturing warnings from the
+        relevant module logger.
+        """
+        import json
+        import logging
+        import unittest.mock as _mock
+
+        from spikelab.spike_sorting.waveform_extractor import WaveformExtractor
+
+        root = tmp_path / "wf_root_warn"
+        root.mkdir()
+        (root / "extraction_parameters.json").write_text(json.dumps(params))
+        initial = root / "initial"
+
+        rec = self._minimal_recording()
+        sorting = _mock.MagicMock()
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="spikelab.spike_sorting.waveform_extractor",
+        ):
+            we = WaveformExtractor(rec, sorting, root, initial)
+
+        wf_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.waveform_extractor"
+            and r.levelno >= logging.WARNING
+        ]
+        return we, wf_records
+
+    def test_all_three_keys_missing_emits_three_warnings(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON lacks all three fallback keys → exactly
+                three WARNING records on the waveform_extractor logger.
+            (Test Case 2) Each warning's message names a different key
+                from ``{pos_peak_thresh, max_waveforms_per_unit,
+                save_waveform_files}``.
+            (Test Case 3) Each warning includes the root folder so
+                the operator can identify the source.
+            (Test Case 4) Attributes still resolve to ``WaveformConfig``
+                defaults despite the JSON omission.
+        """
+        from spikelab.spike_sorting.config import WaveformConfig
+
+        params = self._minimal_params()  # none of the three optional keys
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert len(records) == 3
+        keys_in_messages = set()
+        defaults = WaveformConfig()
+        for rec in records:
+            msg = rec.getMessage()
+            for key in (
+                "pos_peak_thresh",
+                "max_waveforms_per_unit",
+                "save_waveform_files",
+            ):
+                if key in msg:
+                    keys_in_messages.add(key)
+            # Each warning includes the root folder path.
+            assert "wf_root_warn" in msg
+        assert keys_in_messages == {
+            "pos_peak_thresh",
+            "max_waveforms_per_unit",
+            "save_waveform_files",
+        }
+
+        # Attributes resolved to WaveformConfig defaults.
+        assert we.pos_peak_thresh == defaults.pos_peak_thresh
+        assert we.max_waveforms_per_unit == defaults.max_waveforms_per_unit
+        assert we.save_waveform_files == defaults.save_waveform_files
+
+    def test_one_key_missing_emits_one_warning(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON has ``pos_peak_thresh`` and
+                ``max_waveforms_per_unit`` but omits
+                ``save_waveform_files`` → exactly one WARNING.
+            (Test Case 2) The warning names ``save_waveform_files``.
+            (Test Case 3) The two present keys round-trip from the
+                JSON (no warning, no default substitution).
+        """
+        params = self._minimal_params(
+            pos_peak_thresh=3.0,
+            max_waveforms_per_unit=200,
+            # save_waveform_files deliberately omitted
+        )
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "save_waveform_files" in msg
+        # And the present keys flow through.
+        assert we.pos_peak_thresh == 3.0
+        assert we.max_waveforms_per_unit == 200
+
+    def test_all_keys_present_emits_no_warning(self, tmp_path, caplog):
+        """
+        Tests:
+            (Test Case 1) JSON with all three optional keys present
+                emits ZERO warnings on the waveform_extractor logger.
+            (Test Case 2) Attributes reflect the supplied values
+                (not defaults).
+        """
+        params = self._minimal_params(
+            pos_peak_thresh=2.5,
+            max_waveforms_per_unit=400,
+            save_waveform_files=False,
+        )
+        we, records = self._write_params_and_construct(tmp_path, params, caplog)
+
+        assert records == []
+        assert we.pos_peak_thresh == 2.5
+        assert we.max_waveforms_per_unit == 400
+        assert we.save_waveform_files is False

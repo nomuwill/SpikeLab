@@ -1207,6 +1207,79 @@ class TestFilterPairsByIsiViolations:
             )
             assert (0, 1) not in filtered
 
+    def test_max_violation_rate_zero_filters_any_violations(self):
+        """
+        ``max_violation_rate=0`` requires both units to have zero ISI
+        violations. Any unit with a single violation excludes its pair.
+
+        Pins the inclusive ``<=`` boundary: a unit with rate exactly 0
+        passes (``0 <= 0`` is True); any positive rate fails.
+
+        Tests:
+            (Test Case 1) A pair where both units are perfectly clean
+                (zero violations) is retained at threshold 0.
+            (Test Case 2) A pair where one unit has even a single
+                violation is excluded at threshold 0.
+        """
+        # Unit 0: 10 ms ISI -- zero violations of the 1.5 ms threshold.
+        # Unit 1: 10 ms ISI -- zero violations.
+        # Unit 2: one tight pair (1 ms ISI) plus mostly 10 ms ISIs --
+        # nonzero violation rate.
+        clean_a = np.arange(10.0, 500.0, 10.0)
+        clean_b = np.arange(15.0, 500.0, 10.0)
+        dirty = np.concatenate([[10.0, 11.0], np.arange(50.0, 500.0, 10.0)])
+        sd = SpikeData([clean_a, clean_b, dirty], length=500.0)
+
+        filtered, rates = _filter_pairs_by_isi_violations(
+            sd, {(0, 1), (0, 2)}, max_violation_rate=0.0, threshold_ms=1.5
+        )
+
+        # Both clean units pass at threshold 0.
+        assert (0, 1) in filtered
+        # Unit 2 has a positive violation rate → pair excluded.
+        assert (0, 2) not in filtered
+        assert rates[0] == pytest.approx(0.0)
+        assert rates[1] == pytest.approx(0.0)
+        assert rates[2] > 0.0
+
+    def test_max_violation_rate_zero_filters_all_with_any_violations(self):
+        """
+        ``max_violation_rate=0`` is the strictest possible threshold —
+        only units with exactly zero violations survive. Pin this
+        boundary so a future relaxation of the comparator (e.g. using
+        ``<`` instead of ``<=``) is detectable.
+
+        Tests:
+            (Test Case 1) A unit with even a single violation is
+                filtered out under ``max_violation_rate=0``.
+            (Test Case 2) A pair of two perfectly-clean units passes
+                even with ``max_violation_rate=0`` (the check is
+                ``<=`` so zero passes zero).
+        """
+        # Unit 0 has one violation pair (10.0, 11.0 - 1ms apart).
+        # Unit 1 / 2 are clean (10ms spacing).
+        sd = SpikeData(
+            [
+                np.array([10.0, 11.0, 25.0, 50.0]),  # 1 violation
+                np.arange(10.0, 100.0, 10.0),
+                np.arange(15.0, 100.0, 10.0),
+            ],
+            length=200.0,
+        )
+        pairs = {(0, 1), (1, 2), (0, 2)}
+        filtered, rates = _filter_pairs_by_isi_violations(
+            sd, pairs, max_violation_rate=0.0, threshold_ms=1.5
+        )
+        # Unit 0 has a non-zero violation rate → all pairs containing
+        # it are filtered.
+        assert rates[0] > 0.0
+        assert (0, 1) not in filtered
+        assert (0, 2) not in filtered
+        # Both clean units pass exactly at zero.
+        assert rates[1] == 0.0
+        assert rates[2] == 0.0
+        assert (1, 2) in filtered
+
 
 # ---------------------------------------------------------------------------
 # _compute_pairwise_similarity
@@ -1792,3 +1865,145 @@ class TestChoosePrimaryUnit:
         )
         assert _choose_primary_unit(sd, 0, 1) == (0, 1)
         assert _choose_primary_unit(sd, 1, 0) == (1, 0)
+
+
+class TestEstimateNoiseLevelsBoundary:
+    """``_estimate_noise_levels`` chunk-size / num-chunks boundaries.
+
+    The function samples ``num_chunks`` windows of ``chunk_size``
+    samples and computes MAD per channel. The
+    ``max_start = n_samples - chunk_size`` guard handles the
+    "recording shorter than one chunk" branch by using all data.
+    """
+
+    def test_chunk_size_equals_recording_uses_all_data(self):
+        """
+        Tests:
+            (Test Case 1) When ``chunk_size == n_samples`` the
+                ``max_start = 0`` branch fires and the function uses
+                all of raw_data exactly once (no random sampling).
+            (Test Case 2) Returned noise is per-channel (shape (C,)).
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        # Constant signal → MAD is 0.
+        raw = np.zeros((4, 100))
+        noise = _estimate_noise_levels(raw, num_chunks=10, chunk_size=100, seed=0)
+        assert noise.shape == (4,)
+        assert (noise == 0.0).all()
+
+    def test_chunk_size_larger_than_recording_uses_all_data(self):
+        """
+        Tests:
+            (Test Case 1) ``chunk_size > n_samples`` triggers the
+                ``max_start <= 0`` short-circuit — function uses all
+                data without sampling.
+            (Test Case 2) Returned noise shape is correct.
+            (Test Case 3) Deterministic on a constant signal.
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        raw = np.zeros((3, 50))  # smaller than chunk_size=200
+        noise = _estimate_noise_levels(raw, num_chunks=5, chunk_size=200, seed=0)
+        assert noise.shape == (3,)
+        assert (noise == 0.0).all()
+
+    def test_num_chunks_larger_than_possible_starts(self):
+        """
+        ``num_chunks`` larger than ``n_samples - chunk_size`` is
+        allowed — ``rng.integers(0, max_start, size=num_chunks)``
+        samples with replacement so duplicates can occur. Pin that
+        the function does not crash.
+
+        Tests:
+            (Test Case 1) ``num_chunks=20, chunk_size=50, n_samples=60``
+                produces ``max_start=10`` and samples 20 starts (with
+                replacement) without raising.
+        """
+        from spikelab.spikedata.curation import _estimate_noise_levels
+
+        rng = np.random.default_rng(0)
+        raw = rng.normal(0, 1, (2, 60))
+        noise = _estimate_noise_levels(raw, num_chunks=20, chunk_size=50, seed=0)
+        assert noise.shape == (2,)
+        assert np.all(np.isfinite(noise))
+        assert (noise > 0).all()
+
+
+# ============================================================================
+# Test Coverage Scan (2026-05-25) — internal helpers.
+# ============================================================================
+
+
+class TestBuild1dArrayForChannels:
+    """``_build_1d_array_for_channels`` builds a per-unit waveform
+    vector laid out on an explicit channel list, padding zeros for
+    channels not in the unit's ``traces_meta``.
+    """
+
+    def test_channels_present_copied_in(self):
+        """
+        Tests:
+            (Test Case 1) Unit with avg_waveform on channels [0, 1] and
+                requested layout [0, 1] produces a flattened array
+                matching the source waveform.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        avg_wf = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # shape (2, 3)
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[
+                {"avg_waveform": avg_wf, "traces_meta": {"channels": [0, 1]}}
+            ],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1], template_len=3
+        )
+        # Flattened: row 0 first (channel 0), then row 1 (channel 1).
+        np.testing.assert_array_equal(result, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    def test_missing_channel_zero_padded(self):
+        """
+        Tests:
+            (Test Case 1) Requesting channel 2 when unit's traces_meta
+                lists [0, 1] yields zeros at channel 2's slot.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        avg_wf = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[
+                {"avg_waveform": avg_wf, "traces_meta": {"channels": [0, 1]}}
+            ],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1, 2], template_len=3
+        )
+        # Last 3 entries (channel 2 slot) should be zero.
+        np.testing.assert_array_equal(result[-3:], [0.0, 0.0, 0.0])
+        # First two slots match the source.
+        np.testing.assert_array_equal(result[:3], [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(result[3:6], [4.0, 5.0, 6.0])
+
+    def test_no_avg_waveform_returns_zeros(self):
+        """
+        Tests:
+            (Test Case 1) Unit without ``avg_waveform`` attribute
+                returns an all-zero array of the expected length.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[{"traces_meta": {"channels": [0, 1]}}],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1], template_len=3
+        )
+        assert result.shape == (6,)
+        assert np.all(result == 0.0)

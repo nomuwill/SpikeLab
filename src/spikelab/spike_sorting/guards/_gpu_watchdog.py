@@ -173,7 +173,10 @@ def _resolve_device_index(device: Optional[str]) -> int:
     Accepts ``"cuda"``, ``"cuda:0"``, ``"cuda:1"``, integer-like
     strings, and ``None`` (interpreted as device 0). Falls back to 0
     on parse failure rather than raising — the watchdog is
-    best-effort.
+    best-effort — but emits a warning so the silent fallback is
+    visible in logs. A user who meant ``cuda:1`` and typo'd
+    ``cuda;1`` would otherwise have their GPU watchdog quietly
+    watching the wrong device.
 
     Parameters:
         device (str or None): Torch-style device identifier.
@@ -190,9 +193,18 @@ def _resolve_device_index(device: Optional[str]) -> int:
         try:
             return max(0, int(s.split(":", 1)[1]))
         except ValueError:
+            _logger.warning(
+                "GPU watchdog: could not parse device index from %r; "
+                "falling back to device 0.",
+                device,
+            )
             return 0
     if s.isdigit():
         return int(s)
+    _logger.warning(
+        "GPU watchdog: unrecognised device string %r; " "falling back to device 0.",
+        device,
+    )
     return 0
 
 
@@ -680,6 +692,20 @@ class GpuMemoryWatchdog:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "GpuMemoryWatchdog":
+        # Reject double-``__enter__``. ``self._token`` is a single
+        # attribute; a second ``__enter__`` without an intervening
+        # ``__exit__`` overwrites the first token reference and
+        # leaks the original active-watchdog publication. Symmetric
+        # with the guard added to HostMemoryWatchdog and
+        # IOStallWatchdog so all three watchdogs fail loudly on
+        # reentry rather than silently corrupting ContextVar state.
+        if self._token is not None:
+            raise RuntimeError(
+                "GpuMemoryWatchdog is not reentrant: __enter__ was "
+                "called while the watchdog is still active. Exit the "
+                "existing context manager before entering a new one."
+            )
+
         # Capture the active per-recording log path on the main
         # thread; the daemon polling thread cannot read the
         # ContextVar reliably.

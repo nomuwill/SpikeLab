@@ -11,7 +11,48 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union
+
+import numpy as np
+
+
+def _check_unit_id_density(
+    unit_ids: Sequence[int],
+    n_samples: int,
+    n_channels: int,
+    dtype: Any = np.float32,
+) -> None:
+    """Guard against OOM from allocating ``(max(unit_ids)+1, T, C)`` caches.
+
+    Callers that index template/waveform caches by raw ``unit_id``
+    (rather than by a dense ``0..N-1`` index) size the cache by
+    ``max(unit_ids) + 1``. Heavy Phy curation can leave a sparse
+    cluster_id space (e.g. ``[0, 1, 47, 50000]``) for which that
+    allocation would consume tens of GB for a handful of surviving
+    units. Raise a clear ``MemoryError`` before the allocation rather
+    than crashing the process.
+
+    Triggers when ``max(unit_ids) > 100 * len(unit_ids)``. Threshold is
+    deliberately loose so benign sparseness from light Phy curation
+    (e.g. dropping a few clusters) does not false-positive.
+    """
+    if not len(unit_ids):
+        return
+    max_uid = int(max(unit_ids))
+    n_units = len(unit_ids)
+    if max_uid <= 100 * n_units:
+        return
+    bytes_per_elem = np.dtype(dtype).itemsize
+    gb = ((max_uid + 1) * n_samples * n_channels * bytes_per_elem) / (1024**3)
+    raise MemoryError(
+        f"Unit IDs are pathologically sparse (max={max_uid}, "
+        f"n_units={n_units}); allocating a ({max_uid + 1}, {n_samples}, "
+        f"{n_channels}) {np.dtype(dtype).name} array would consume "
+        f"~{gb:.1f} GB. This typically results from Phy curation that "
+        f"drops most clusters but keeps high-numbered ones. Pass "
+        f"compact=True to KilosortSortingExtractor (or compact your "
+        f"unit IDs upstream) to use a dense unit_id space."
+    )
 
 
 def get_system_ram_bytes() -> Optional[int]:
@@ -63,6 +104,19 @@ def get_system_ram_bytes() -> Optional[int]:
     return None
 
 
+#: Width of the banner produced by :func:`print_stage`, in characters.
+#: The Tee-log parser in ``report.py`` keys its banner-line regex
+#: (``_BANNER_LINE_RE = re.compile(r"^=+$")``) and centered-text regex
+#: (``_BANNER_TEXT_RE``) off this value, so the two must agree. Both
+#: live in the same package; keep them in sync via this constant.
+BANNER_WIDTH = 70
+
+#: Character used to frame the banner. ``report.py``'s parser regex
+#: (``_BANNER_LINE_RE``) hard-codes ``=`` to match, so changing this
+#: requires updating the parser regex too.
+BANNER_CHAR = "="
+
+
 def print_stage(text: Any) -> None:
     """Print a centered banner message framed by ``=`` lines.
 
@@ -71,15 +125,12 @@ def print_stage(text: Any) -> None:
     """
     text = str(text)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    indent = int((BANNER_WIDTH - len(text)) / 2)
 
-    num_chars = 70
-    char = "="
-    indent = int((num_chars - len(text)) / 2)
-
-    print("\n" + num_chars * char)
+    print("\n" + BANNER_WIDTH * BANNER_CHAR)
     print(indent * " " + text)
-    print(f"  [{timestamp}]".center(num_chars))
-    print(num_chars * char)
+    print(f"  [{timestamp}]".center(BANNER_WIDTH))
+    print(BANNER_WIDTH * BANNER_CHAR)
 
 
 class Stopwatch:
@@ -110,6 +161,46 @@ class Stopwatch:
             print(f"{text} Time: {time.time() - self._time_start:.2f}s")
 
 
+class _TeeWriter:
+    """File-like wrapper that mirrors writes to both a file and stdout.
+
+    Internal helper for :class:`Tee`. Encapsulates the dual-write
+    behaviour as an explicit class with a public ``write`` method,
+    replacing the prior ``types.MethodType`` monkey-patch on the
+    file object. Behaviour is identical:
+
+      - Every ``write(s)`` writes ``s`` to the underlying file.
+      - When ``mirror_to_stdout`` is True and ``s`` is more than a
+        single newline or space, ``s`` is also printed to the
+        original stdout (with the trailing newline that ``print``
+        appends).
+
+    The ``mirror_to_stdout`` flag is toggled off by :class:`Tee`'s
+    exit path so traceback writes go to the log file only, not to
+    a possibly-defunct stdout.
+    """
+
+    def __init__(self, file_path: Union[str, Path], file_mode: str) -> None:
+        self._file = open(file_path, file_mode)
+        # Plain attribute (not a property) so existing tests + callers
+        # can swap in a mock stdout for verification.
+        self.stdout = sys.stdout
+        self.mirror_to_stdout = True
+
+    def write(self, s: str) -> None:
+        self._file.write(s)
+        if self.mirror_to_stdout and s != "\n" and s != " ":
+            print(s, file=self.stdout)
+
+    def flush(self) -> None:
+        self._file.flush()
+        if self.mirror_to_stdout:
+            self.stdout.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
 class Tee:
     """Context manager that mirrors ``stdout`` to a log file.
 
@@ -124,34 +215,25 @@ class Tee:
     """
 
     def __init__(self, file_path: Union[str, Path], file_mode: str = "a") -> None:
-        from types import MethodType
-
-        _file = open(file_path, file_mode)
-        _file.stdout = sys.stdout
-        _file.file_write = _file.write
-        _file.write = MethodType(Tee._write, _file)
-        self._file = _file
+        self._writer = _TeeWriter(file_path, file_mode)
 
     def __enter__(self) -> Any:
-        sys.stdout = self._file
-        return self._file
+        sys.stdout = self._writer
+        return self._writer
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         import traceback
 
         if exc_type:
-            self._file.write = self._file.file_write
+            # Disable stdout mirror for traceback output — the original
+            # behaviour was to restore ``_file.write`` to the unwrapped
+            # ``file_write`` so traceback lines went to the file only.
+            self._writer.mirror_to_stdout = False
             print("Traceback (most recent call last):")
-            traceback.print_tb(exc_tb, file=self._file)
+            traceback.print_tb(exc_tb, file=self._writer)
             print(f"{exc_type.__name__}: {exc_val}")
-        sys.stdout = self._file.stdout
-        self._file.close()
-
-    @staticmethod
-    def _write(self, s: str) -> None:
-        self.file_write(s)
-        if s != "\n" and s != " ":
-            print(s, file=self.stdout)
+        sys.stdout = self._writer.stdout  # original stdout captured at __init__
+        self._writer.close()
 
 
 def create_folder(folder: Union[str, Path], parents: bool = True) -> None:
@@ -184,7 +266,11 @@ def delete_folder(folder: Union[str, Path]) -> None:
 
 
 def get_paths(
-    rec_path: Any, inter_path: Any, results_path: Any, execution_config: Any = None
+    rec_path: Any,
+    inter_path: Any,
+    results_path: Any,
+    execution_config: Any = None,
+    sorter_name: Optional[str] = None,
 ) -> Tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     """Resolve and prepare all directory paths for one recording run.
 
@@ -200,6 +286,14 @@ def get_paths(
         execution_config (ExecutionConfig or None): When provided, its
             ``recompute_*`` flags control which intermediate folders
             are deleted before running.
+        sorter_name (str or None): Name of the configured sorter.
+            Controls the sorter output folder name
+            (``{sorter_name}_results``). When ``None``, falls back to
+            the legacy ``"kilosort2_results"`` and emits a
+            ``DeprecationWarning`` so callers update; passing the
+            configured ``config.sorter.sorter_name`` keeps caches
+            from different sorters from silently colliding in a
+            shared ``kilosort2_results/`` folder.
 
     Returns:
         tuple: ``(rec_path, inter_path, recording_dat_path,
@@ -221,7 +315,16 @@ def get_paths(
     inter_path = Path(inter_path)
 
     recording_dat_path = inter_path / (rec_name + "_scaled_filtered.dat")
-    output_folder = inter_path / "kilosort2_results"
+    if sorter_name is None:
+        warnings.warn(
+            "get_paths called without sorter_name; defaulting to "
+            "'kilosort2_results'. Pass sorter_name=config.sorter.sorter_name "
+            "to avoid cross-sorter cache collisions.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        sorter_name = "kilosort2"
+    output_folder = inter_path / f"{sorter_name}_results"
 
     waveforms_root_folder = inter_path / "waveforms"
     curation_folder = inter_path / "curation"

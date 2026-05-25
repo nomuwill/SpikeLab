@@ -123,7 +123,7 @@ class TestHDF5Loaders:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         loaded_idces, loaded_times = sd.idces_times()
-        assert np.allclose(loaded_times, times_ms)
+        np.testing.assert_allclose(loaded_times, times_ms)
 
     def test_hdf5_group_per_unit_seconds(self, tmp_path):
         """
@@ -144,8 +144,8 @@ class TestHDF5Loaders:
             path, group_per_unit="units", group_time_unit="s"
         )
         # Expect ms
-        assert np.allclose(sd.train[0], np.array([100.0, 200.0]))
-        assert np.allclose(sd.train[1], np.array([50.0]))
+        np.testing.assert_allclose(sd.train[0], np.array([100.0, 200.0]))
+        np.testing.assert_allclose(sd.train[1], np.array([50.0]))
 
     def test_hdf5_group_per_unit_empty_units(self, tmp_path):
         """
@@ -173,6 +173,32 @@ class TestHDF5Loaders:
         assert len(sd.train[0]) == 0
         assert len(sd.train[1]) == 0
 
+    def test_hdf5_group_per_unit_no_datasets_zero_units(self, tmp_path):
+        """
+        An HDF5 group-per-unit file with an empty units group (zero
+        datasets) loads as a zero-unit SpikeData with length 0.
+
+        Distinct from ``test_hdf5_group_per_unit_empty_units`` (which
+        creates two empty-train units) — here the group itself contains
+        no datasets at all. Pins the contract that the loader does not
+        error and yields the zero-unit shape invariant.
+
+        Tests:
+            (Test Case 1) ``SpikeData.N == 0``.
+            (Test Case 2) ``SpikeData.length == 0.0``.
+            (Test Case 3) ``SpikeData.train`` is an empty sequence.
+        """
+        path = str(tmp_path / "empty_group.h5")
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.create_group("units")
+
+        sd = loaders.load_spikedata_from_hdf5(
+            path, group_per_unit="units", group_time_unit="ms"
+        )
+        assert sd.N == 0
+        assert sd.length == 0.0
+        assert len(sd.train) == 0
+
     def test_hdf5_ragged_spike_times(self, tmp_path):
         """
         Test loading flat (ragged) spike_times with cumulative index in seconds.
@@ -197,8 +223,8 @@ class TestHDF5Loaders:
             spike_times_index_dataset="spike_times_index",
             spike_times_unit="s",
         )
-        assert np.allclose(sd.train[0], [100.0, 200.0])
-        assert np.allclose(sd.train[1], [500.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[1], [500.0])
 
     def test_hdf5_idces_times_samples_with_fs(self, tmp_path):
         """
@@ -225,8 +251,8 @@ class TestHDF5Loaders:
             times_unit="samples",
             fs_Hz=1000.0,
         )
-        assert np.allclose(sd.train[0], [100.0, 300.0])
-        assert np.allclose(sd.train[1], [200.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 300.0])
+        np.testing.assert_allclose(sd.train[1], [200.0])
 
     def test_hdf5_raw_attachment_seconds_and_samples(self, tmp_path):
         """
@@ -258,7 +284,7 @@ class TestHDF5Loaders:
             raw_time_unit="s",
         )
         assert sd_s.raw_data.shape == (2, 5)
-        assert np.allclose(sd_s.raw_time, np.arange(5) * 1.0)
+        np.testing.assert_allclose(sd_s.raw_time, np.arange(5) * 1.0)
 
         # samples path
         sd_p = loaders.load_spikedata_from_hdf5(
@@ -270,7 +296,7 @@ class TestHDF5Loaders:
             raw_time_unit="samples",
             fs_Hz=1000.0,
         )
-        assert np.allclose(sd_p.raw_time, np.arange(5) * 1.0)
+        np.testing.assert_allclose(sd_p.raw_time, np.arange(5) * 1.0)
 
     def test_hdf5_no_style_raises(self, tmp_path):
         """
@@ -394,7 +420,7 @@ class TestHDF5Loaders:
         )
         # Explicit length_ms should override the inferred value (200 ms)
         assert sd.length == pytest.approx(5000.0)
-        assert np.allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
 
     def test_ec_dl_02_explicit_metadata_parameter(self, tmp_path):
         """
@@ -469,8 +495,8 @@ class TestNWBLoader:
             g.create_dataset("spike_times_index", data=np.array([2, 3]))
 
         sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
-        assert np.allclose(sd.train[0], [100.0, 200.0])
-        assert np.allclose(sd.train[1], [500.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0])
+        np.testing.assert_allclose(sd.train[1], [500.0])
 
     def test_nwb_missing_units_raises(self, tmp_path):
         """
@@ -504,8 +530,8 @@ class TestNWBLoader:
             g.create_dataset("xx_spike_times_index", data=np.array([1, 2]))
 
         sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
-        assert np.allclose(sd.train[0], [200.0])
-        assert np.allclose(sd.train[1], [700.0])
+        np.testing.assert_allclose(sd.train[0], [200.0])
+        np.testing.assert_allclose(sd.train[1], [700.0])
 
     def test_nwb_empty_units_group(self, tmp_path):
         """
@@ -595,7 +621,7 @@ class TestKiloSortAndSpikeInterface:
         all_trains_ms = [np.array([10.0, 20.0]), np.array([15.0])]
         # order by cluster id ascending
         for train, truth in zip(sd.train, all_trains_ms):
-            assert np.allclose(train, truth)
+            np.testing.assert_allclose(train, truth)
 
     def test_spikeinterface_mock(self):
         """
@@ -623,8 +649,8 @@ class TestKiloSortAndSpikeInterface:
         sorting = MockSorting()
         sd = loaders.load_spikedata_from_spikeinterface(sorting)
         # samples -> ms at 2kHz => 0.5 ms increments
-        assert np.allclose(sd.train[0], [10.0, 20.0])
-        assert np.allclose(sd.train[1], [2.5])
+        np.testing.assert_allclose(sd.train[0], [10.0, 20.0])
+        np.testing.assert_allclose(sd.train[1], [2.5])
 
     def test_spikeinterface_base_recording_thresholding(self):
         """
@@ -696,7 +722,7 @@ class TestKiloSortAndSpikeInterface:
         )
         # Only unit 2, times in ms equal to samples at 1kHz
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [0.0, 10.0])
+        np.testing.assert_allclose(sd.train[0], [0.0, 10.0])
 
     def test_spikeinterface_invalid_object_raises(self):
         """
@@ -1030,7 +1056,7 @@ class TestPickleLoaders:
         sd2 = loaders.load_spikedata_from_pickle(path)
         assert isinstance(sd2, SpikeData)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
         # Verify metadata is preserved
         assert sd.metadata == sd2.metadata
 
@@ -1058,14 +1084,17 @@ class TestPickleLoaders:
         # Mock ensure_local_file to return our temp path (as if S3 was already downloaded)
         mock_ensure.return_value = (path, False)
 
-        # Load via S3 URL; ensure_local_file is mocked so no real S3 call
-        sd2 = loaders.load_spikedata_from_pickle("s3://bucket/key.pkl")
+        # Load via S3 URL; ensure_local_file is mocked so no real S3 call.
+        # Pass allow_remote=True to opt in to the S3 fetch path.
+        sd2 = loaders.load_spikedata_from_pickle(
+            "s3://bucket/key.pkl", allow_remote=True
+        )
 
         # Verify ensure_local_file was called with S3 URL (and optional cred kwargs)
         mock_ensure.assert_called_once()
         assert mock_ensure.call_args[0][0] == "s3://bucket/key.pkl"
         # Verify loaded data matches
-        assert np.allclose(sd2.train[0], sd.train[0])
+        np.testing.assert_allclose(sd2.train[0], sd.train[0])
 
     def test_pickle_non_spikedata_raises_valueerror(self, tmp_path):
         """
@@ -1110,7 +1139,7 @@ class TestPickleLoaders:
         mock_ensure.return_value = (path, True)
 
         # Load; loader should remove temp file in finally block
-        loaders.load_spikedata_from_pickle("s3://bucket/key.pkl")
+        loaders.load_spikedata_from_pickle("s3://bucket/key.pkl", allow_remote=True)
 
         # Verify temp file was removed
         assert not os.path.exists(path)
@@ -1129,6 +1158,44 @@ class TestPickleLoaders:
 
         with pytest.raises(Exception):
             loaders.load_spikedata_from_pickle(path)
+
+    @patch("spikelab.data_loaders.s3_utils.ensure_local_file")
+    def test_pickle_temp_file_cleanup_on_load_failure(self, mock_ensure, tmp_path):
+        """
+        When ``pickle.load`` itself raises (not just an EOFError on an
+        empty file), the loader's ``finally`` block still removes the
+        downloaded temp file so the caller does not leak disk.
+
+        Pins the contract of the ``try / finally`` around ``pickle.load``
+        in ``load_spikedata_from_pickle``: cleanup must fire on *any*
+        exception from ``pickle.load``, not just clean returns.
+
+        Tests:
+            (Test Case 1) An UnpicklingError raised by ``pickle.load``
+                on garbage bytes still triggers ``os.remove`` of the
+                temp file.
+            (Test Case 2) The original exception propagates to the
+                caller.
+        """
+        # Write garbage bytes that will trip pickle.UnpicklingError or
+        # similar inside pickle.load (not at file-open time).
+        fd, path = tempfile.mkstemp(suffix=".pkl")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(b"\x80\x04\x95not-a-valid-pickle-stream")
+
+        # Pretend this file came from S3 so the loader treats it as a
+        # temp file and routes through the cleanup path.
+        mock_ensure.return_value = (path, True)
+
+        with pytest.raises(Exception):
+            loaders.load_spikedata_from_pickle(
+                "s3://bucket/garbage.pkl", allow_remote=True
+            )
+
+        # finally block ran → temp file removed even though pickle.load
+        # raised.
+        assert not os.path.exists(path)
 
 
 @skip_no_pandas
@@ -1366,7 +1433,7 @@ class TestIBLLoader:
         # Source times are in seconds; loaded times must be x 1000
         source_times_s = spikes["times"][spikes["clusters"] == good_ids[0]]
         expected_ms = source_times_s * 1000.0
-        assert np.allclose(np.sort(sd.train[0]), np.sort(expected_ms))
+        np.testing.assert_allclose(np.sort(sd.train[0]), np.sort(expected_ms))
 
     def test_trial_timing_arrays_in_ms(self):
         """
@@ -1381,10 +1448,10 @@ class TestIBLLoader:
         sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
         expected_stim_on_ms = trials_df["stimOn_times"].to_numpy() * 1000.0
-        assert np.allclose(sd.metadata["stim_on_times"], expected_stim_on_ms)
+        np.testing.assert_allclose(sd.metadata["stim_on_times"], expected_stim_on_ms)
 
         expected_start_ms = trials_df["intervals_0"].to_numpy() * 1000.0
-        assert np.allclose(sd.metadata["trial_start_times"], expected_start_ms)
+        np.testing.assert_allclose(sd.metadata["trial_start_times"], expected_start_ms)
 
     def test_behavioral_arrays_not_converted(self):
         """
@@ -1398,8 +1465,10 @@ class TestIBLLoader:
         mock_one_api, mock_brainwidemap, trials_df, _, _ = self._build_mocks(pid, eid)
         sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
-        assert np.allclose(sd.metadata["choice"], trials_df["choice"].to_numpy())
-        assert np.allclose(
+        np.testing.assert_allclose(
+            sd.metadata["choice"], trials_df["choice"].to_numpy()
+        )
+        np.testing.assert_allclose(
             sd.metadata["feedback_type"], trials_df["feedbackType"].to_numpy()
         )
 
@@ -1456,13 +1525,14 @@ class TestIBLLoader:
         assert isinstance(sd, SpikeData)
         assert sd.N == 3
 
-    def test_no_spikes_produces_empty_trains(self):
+    def test_no_spikes_produces_empty_trains_with_explicit_length(self):
         """
-        Test that units get empty spike trains when all spike collections are unavailable.
+        With all spike collections unavailable and an explicit ``length_ms``
+        supplied, the loader returns a SpikeData with empty trains.
 
         Tests:
             (Test Case 1) Each unit's spike train is an empty array.
-            (Test Case 2) session length falls back to 10000 ms.
+            (Test Case 2) ``sd.length`` matches the explicit ``length_ms``.
         """
         eid, pid = "test-eid", "test-pid"
         all_collections = {
@@ -1473,11 +1543,32 @@ class TestIBLLoader:
         mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
             pid, eid, fail_collections=all_collections
         )
-        sd = self._load(eid, pid, mock_one_api, mock_brainwidemap)
+        sd = self._load(eid, pid, mock_one_api, mock_brainwidemap, length_ms=5_000.0)
 
         for train in sd.train:
             assert len(train) == 0
-        assert sd.length == pytest.approx(10_000.0)
+        assert sd.length == pytest.approx(5_000.0)
+
+    def test_no_spikes_without_length_raises(self):
+        """
+        When all spike collections fail AND no explicit ``length_ms`` is
+        passed, the loader raises ValueError rather than fabricating a
+        default duration.
+
+        Tests:
+            (Test Case 1) ValueError is raised naming the probe.
+        """
+        eid, pid = "test-eid", "test-pid"
+        all_collections = {
+            "alf/probe00/pykilosort",
+            "alf/probe01/pykilosort",
+            "alf",
+        }
+        mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
+            pid, eid, fail_collections=all_collections
+        )
+        with pytest.raises(ValueError, match="length_ms"):
+            self._load(eid, pid, mock_one_api, mock_brainwidemap)
 
     def test_missing_one_api_raises_import_error(self):
         """
@@ -1577,7 +1668,7 @@ class TestIBLLoader:
         ):
             with _warnings.catch_warnings(record=True) as w:
                 _warnings.simplefilter("always")
-                sd = loaders.load_spikedata_from_ibl(eid, pid)
+                sd = loaders.load_spikedata_from_ibl(eid, pid, length_ms=5_000.0)
 
         assert isinstance(sd, SpikeData)
         assert sd.N == 2
@@ -1596,13 +1687,13 @@ class TestIBLLoader:
 
     def test_ec_dl_09_no_good_units(self):
         """
-        EC-DL-09: Verify behavior when the bwm_units DataFrame has no good
-        units (label==1) for the requested probe. The loader should return
-        a SpikeData with N=0 and use the default length of 10000 ms.
+        Verify behavior when the bwm_units DataFrame has no good units
+        (label==1) for the requested probe. With an explicit ``length_ms``
+        the loader returns SpikeData with N=0 at the requested duration.
 
         Tests:
             (Test Case 1) sd.N == 0.
-            (Test Case 2) sd.length defaults to 10000.0 ms.
+            (Test Case 2) sd.length equals the requested length_ms.
         """
         import pandas as pd
 
@@ -1678,10 +1769,10 @@ class TestIBLLoader:
                 "brainwidemap": mock_brainwidemap,
             },
         ):
-            sd = loaders.load_spikedata_from_ibl(eid, pid)
+            sd = loaders.load_spikedata_from_ibl(eid, pid, length_ms=5_000.0)
 
         assert sd.N == 0
-        assert sd.length == pytest.approx(10_000.0)
+        assert sd.length == pytest.approx(5_000.0)
 
 
 @skip_no_pandas
@@ -2486,7 +2577,7 @@ class TestHDF5Loader:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [5.0])
+        np.testing.assert_allclose(sd.train[0], [5.0])
 
     def test_nan_spike_times_in_hdf5(self, tmp_path):
         """
@@ -2736,7 +2827,7 @@ class TestTrainsFromFlatIndex:
             np.array([5.0]), np.array([1]), unit="ms", fs_Hz=None
         )
         assert len(trains) == 1
-        assert np.allclose(trains[0], [5.0])
+        np.testing.assert_allclose(trains[0], [5.0])
 
     def test_end_indices_exceeding_flat_times_length(self):
         """
@@ -2746,7 +2837,7 @@ class TestTrainsFromFlatIndex:
             (Test Case 1) ValueError is raised because end_indices[-1]
                 exceeds flat_times length.
         """
-        with pytest.raises(ValueError, match="exceeds flat_times length"):
+        with pytest.raises(ValueError, match="exceeds flat array length"):
             loaders._trains_from_flat_index(
                 np.array([1.0, 2.0, 3.0]), np.array([10]), unit="ms", fs_Hz=None
             )
@@ -3016,7 +3107,7 @@ class TestKiloSort:
 
         sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [10.0, 20.0, 30.0])
+        np.testing.assert_allclose(sd.train[0], [10.0, 20.0, 30.0])
         assert sd.metadata["cluster_ids"] == [0]
 
     def test_kilosort_time_unit_seconds(self, tmp_path):
@@ -3033,7 +3124,7 @@ class TestKiloSort:
 
         sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0, time_unit="s")
         assert sd.N == 1
-        assert np.allclose(sd.train[0], [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(sd.train[0], [100.0, 200.0, 300.0])
 
     def test_kilosort_include_noise(self, tmp_path):
         """
@@ -5423,3 +5514,861 @@ class TestLoadSpikedataFromKilosortClusterIdExceedsChannelMapWarning:
         # length.
         assert "100" in joined
         assert "channel_map" in joined.lower()
+
+
+class TestLoadKilosortInvalidTimeUnit:
+    """``load_spikedata_from_kilosort`` with an unrecognised ``time_unit``
+    propagates the ``ValueError`` raised by the shared ``to_ms`` helper.
+    The error message names the offending unit so the user can attribute
+    the failure to the loader argument rather than guessing where it came
+    from in the call chain.
+    """
+
+    def test_unknown_time_unit_raises_value_error_naming_unit(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``time_unit='hz'`` raises ``ValueError``.
+            (Test Case 2) The message mentions the offending unit name
+                ``'hz'`` so the failure is attributable.
+        """
+        d = str(tmp_path / "ks")
+        os.makedirs(d)
+        np.save(os.path.join(d, "spike_times.npy"), np.array([10, 20, 30]))
+        np.save(os.path.join(d, "spike_clusters.npy"), np.array([0, 0, 0]))
+
+        with pytest.raises(ValueError, match=r"hz"):
+            loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0, time_unit="hz")
+
+
+@skip_no_h5py
+class TestRawArraysShapeMismatch:
+    """``_read_raw_arrays`` validates ``raw_data.shape[-1] ==
+    raw_time.shape[0]`` at the loader boundary. A mismatched HDF5
+    file raises :class:`ValueError` with both shapes in the message
+    so the user can diagnose the misalignment without first having
+    to chase through the SpikeData constructor's suffix-shape check.
+    """
+
+    def test_mismatched_shapes_raises(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``_read_raw_arrays`` raises ``ValueError``
+                when ``raw_data.shape[-1] != raw_time.shape[0]``.
+            (Test Case 2) The error message includes both array shapes
+                so the caller can identify the mismatch.
+        """
+        path = str(tmp_path / "mismatch.h5")
+        raw_data = np.random.randn(3, 100)
+        raw_time = np.arange(50, dtype=float)  # length 50 != 100
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.create_dataset("raw", data=raw_data)
+            f.create_dataset("raw_time", data=raw_time)
+
+        with h5py.File(path, "r") as f:  # type: ignore
+            with pytest.raises(
+                ValueError, match="does not match raw_time length"
+            ) as exc_info:
+                loaders._read_raw_arrays(f, "raw", "raw_time", "ms", None)
+        msg = str(exc_info.value)
+        assert "(3, 100)" in msg, f"raw_data shape missing from message: {msg}"
+        assert "(50,)" in msg, f"raw_time shape missing from message: {msg}"
+
+    def test_matched_shapes_succeed(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Matched shapes (raw_data trailing axis equal to
+                raw_time length) load cleanly, no exception.
+            (Test Case 2) Time vector is converted to ms as specified by
+                ``raw_time_unit``.
+        """
+        path = str(tmp_path / "match.h5")
+        raw_data = np.random.randn(3, 100)
+        raw_time = np.arange(100, dtype=float)  # matches!
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.create_dataset("raw", data=raw_data)
+            f.create_dataset("raw_time", data=raw_time)
+
+        with h5py.File(path, "r") as f:  # type: ignore
+            rd, rt = loaders._read_raw_arrays(f, "raw", "raw_time", "s", None)
+        assert rd is not None and rt is not None
+        assert rd.shape == (3, 100)
+        # Seconds -> milliseconds.
+        np.testing.assert_array_equal(rt, raw_time * 1e3)
+
+
+# ---------------------------------------------------------------------------
+# Batch B — load_spikedata_from_kilosort: Phy channel_map resolution chain
+#
+# Pins the three-tier cluster→channel resolution introduced by
+# commit a57e74f:
+#   1. ``cluster_info.tsv["ch"]`` — canonical Phy post-curation answer.
+#   2. ``spike_templates.npy + templates.npy`` — phylib-style fallback,
+#      built per-cluster from the dominant template's peak channel.
+#   3. Legacy ``channel_map[cluster_id]`` — only correct for fresh
+#      uncurated kilosort output (sequential cluster IDs).
+# ---------------------------------------------------------------------------
+
+
+@skip_no_pandas
+class TestKilosortPhyChannelMapResolution:
+    """Three-tier cluster→channel resolution + non-sequential warning gating."""
+
+    def _write_ks_folder(
+        self,
+        folder,
+        *,
+        spike_times,
+        spike_clusters,
+        channel_map=None,
+        cluster_info_rows=None,
+        spike_templates=None,
+        templates=None,
+    ):
+        """Build a minimal kilosort/Phy output folder for the loader.
+
+        Parameters mirror the .npy files the loader reads. ``None``
+        for an argument skips writing that file (so we can drive the
+        loader through each tier of the resolution chain).
+        """
+        import os as _os
+
+        if not _os.path.isdir(folder):
+            _os.makedirs(folder)
+        np.save(_os.path.join(folder, "spike_times.npy"), spike_times)
+        np.save(_os.path.join(folder, "spike_clusters.npy"), spike_clusters)
+        if channel_map is not None:
+            np.save(_os.path.join(folder, "channel_map.npy"), channel_map)
+        if cluster_info_rows is not None:
+            import pandas as pd
+
+            df = pd.DataFrame(cluster_info_rows)
+            df.to_csv(_os.path.join(folder, "cluster_info.tsv"), sep="\t", index=False)
+        if spike_templates is not None:
+            np.save(_os.path.join(folder, "spike_templates.npy"), spike_templates)
+        if templates is not None:
+            np.save(_os.path.join(folder, "templates.npy"), templates)
+
+    def test_tsv_ch_column_drives_electrode_assignment(self, tmp_path):
+        """``cluster_info.tsv["ch"]`` is the canonical Phy answer and
+        wins over both the templates fallback and the legacy
+        ``channel_map[cluster_id]`` lookup. Non-sequential cluster IDs
+        — i.e. post-merge/split — map to their TSV-recorded channels.
+        """
+        d = str(tmp_path / "ks")
+        spike_times = np.array([10, 20, 30, 40, 50, 60], dtype=np.int64)
+        spike_clusters = np.array([5, 5, 12, 12, 7, 7], dtype=np.int64)
+        # Channel map deliberately wrong-length / unrelated; ``ch``
+        # column should override anything channel_map would have said.
+        channel_map = np.arange(20)
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+            cluster_info_rows=[
+                {"cluster_id": 5, "ch": 3, "group": "good"},
+                {"cluster_id": 12, "ch": 7, "group": "good"},
+                {"cluster_id": 7, "ch": 0, "group": "good"},
+            ],
+        )
+
+        sd = loaders.load_spikedata_from_kilosort(
+            d,
+            fs_Hz=1000.0,
+            cluster_info_tsv="cluster_info.tsv",
+        )
+        cluster_ids = sd.metadata["cluster_ids"]
+        # The loader iterates np.unique(spike_clusters) — sorted ascending.
+        expected = {5: 3, 12: 7, 7: 0}
+        for i, clu in enumerate(cluster_ids):
+            assert sd.neuron_attributes[i]["electrode"] == expected[int(clu)], (
+                f"Cluster {clu}: TSV says ch={expected[int(clu)]}, "
+                f"got electrode={sd.neuron_attributes[i].get('electrode')}"
+            )
+
+    def test_templates_fallback_when_tsv_absent(self, tmp_path):
+        """Without ``cluster_info.tsv``, the loader uses
+        ``spike_templates.npy + templates.npy`` to resolve each cluster
+        to its dominant template's peak channel, then translates that
+        position through ``channel_map``. Pins the phylib-style
+        fallback added in commit a57e74f.
+        """
+        d = str(tmp_path / "ks")
+        # Three non-sequential clusters; each gets a unique dominant
+        # template whose peak is on a known channel position.
+        # spike order: c5(2 spikes), c12(2), c7(2)
+        spike_times = np.array([10, 20, 30, 40, 50, 60], dtype=np.int64)
+        spike_clusters = np.array([5, 5, 12, 12, 7, 7], dtype=np.int64)
+        # template_id 0 → peak position 3, template_id 1 → 7, template_id 2 → 0
+        spike_templates = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)
+
+        n_templates = 3
+        nsamples = 9
+        n_pos = 8
+        templates = np.zeros((n_templates, nsamples, n_pos), dtype=np.float32)
+        templates[0, nsamples // 2, 3] = -10.0
+        templates[1, nsamples // 2, 7] = -10.0
+        templates[2, nsamples // 2, 0] = -10.0
+
+        # channel_map: position → physical channel. Use a non-identity
+        # mapping so we can verify the loader routes through it.
+        channel_map = np.array([100, 101, 102, 103, 104, 105, 106, 107])
+
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+            spike_templates=spike_templates,
+            templates=templates,
+        )
+
+        sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
+
+        cluster_ids = sd.metadata["cluster_ids"]
+        expected = {
+            5: int(channel_map[3]),
+            12: int(channel_map[7]),
+            7: int(channel_map[0]),
+        }
+        for i, clu in enumerate(cluster_ids):
+            assert sd.neuron_attributes[i]["electrode"] == expected[int(clu)], (
+                f"Cluster {clu}: expected templates fallback electrode "
+                f"{expected[int(clu)]}, got "
+                f"{sd.neuron_attributes[i].get('electrode')}"
+            )
+
+    def test_tsv_beats_templates_when_both_present(self, tmp_path):
+        """TSV ``ch`` column wins over the templates fallback when both
+        files are present. Templates fallback only runs when
+        ``cluster_id_to_channel`` is still ``None`` after the TSV pass.
+        """
+        d = str(tmp_path / "ks")
+        spike_times = np.array([10, 20, 30, 40], dtype=np.int64)
+        spike_clusters = np.array([5, 5, 12, 12], dtype=np.int64)
+        # Templates: would map cluster 5 → channel_map[7]=107,
+        # cluster 12 → channel_map[3]=103.
+        spike_templates = np.array([0, 0, 1, 1], dtype=np.int64)
+        templates = np.zeros((2, 9, 8), dtype=np.float32)
+        templates[0, 4, 7] = -10.0
+        templates[1, 4, 3] = -10.0
+        channel_map = np.array([100, 101, 102, 103, 104, 105, 106, 107])
+        # TSV: maps 5→2, 12→5. Should win over the templates path.
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+            spike_templates=spike_templates,
+            templates=templates,
+            cluster_info_rows=[
+                {"cluster_id": 5, "ch": 2, "group": "good"},
+                {"cluster_id": 12, "ch": 5, "group": "good"},
+            ],
+        )
+
+        sd = loaders.load_spikedata_from_kilosort(
+            d,
+            fs_Hz=1000.0,
+            cluster_info_tsv="cluster_info.tsv",
+        )
+        cluster_ids = sd.metadata["cluster_ids"]
+        expected = {5: 2, 12: 5}
+        for i, clu in enumerate(cluster_ids):
+            assert sd.neuron_attributes[i]["electrode"] == expected[int(clu)], (
+                f"Cluster {clu}: TSV should have won — expected "
+                f"electrode {expected[int(clu)]}, got "
+                f"{sd.neuron_attributes[i].get('electrode')}"
+            )
+
+    def test_legacy_path_still_works_for_fresh_kilosort(self, tmp_path):
+        """Sequential cluster IDs (0..N-1), no TSV, no templates →
+        legacy ``channel_map[cluster_id]`` resolution still works.
+        Pins backward compatibility for users who haven't run Phy.
+        """
+        d = str(tmp_path / "ks")
+        spike_times = np.array([10, 20, 30, 40], dtype=np.int64)
+        spike_clusters = np.array([0, 0, 1, 1], dtype=np.int64)
+        channel_map = np.array([100, 101, 102, 103])
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+        )
+
+        sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
+        cluster_ids = sd.metadata["cluster_ids"]
+        for i, clu in enumerate(cluster_ids):
+            assert sd.neuron_attributes[i]["electrode"] == int(channel_map[int(clu)]), (
+                f"Cluster {clu}: legacy channel_map lookup broke — "
+                f"expected {int(channel_map[int(clu)])}, got "
+                f"{sd.neuron_attributes[i].get('electrode')}"
+            )
+
+    def test_non_sequential_warning_suppressed_when_fix_applies(self, tmp_path):
+        """Non-sequential cluster IDs + TSV ``ch`` map → the legacy
+        ``channel_map[cluster_id]`` path is bypassed, so the
+        "not sequential" warning should NOT fire (it warned about the
+        misalignment bug, which the fix sidesteps).
+        """
+        d = str(tmp_path / "ks")
+        spike_times = np.array([10, 20, 30, 40], dtype=np.int64)
+        spike_clusters = np.array([5, 5, 12, 12], dtype=np.int64)
+        channel_map = np.arange(20)
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+            cluster_info_rows=[
+                {"cluster_id": 5, "ch": 3, "group": "good"},
+                {"cluster_id": 12, "ch": 7, "group": "good"},
+            ],
+        )
+
+        with warnings.catch_warnings(record=True) as recwarn:
+            warnings.simplefilter("always")
+            loaders.load_spikedata_from_kilosort(
+                d, fs_Hz=1000.0, cluster_info_tsv="cluster_info.tsv"
+            )
+
+        sequential_warns = [w for w in recwarn if "not sequential" in str(w.message)]
+        assert sequential_warns == [], (
+            "Non-sequential warning fired even though TSV ``ch`` map "
+            f"resolved every cluster: {[str(w.message) for w in sequential_warns]}"
+        )
+
+    def test_non_sequential_warning_fires_on_legacy_fallback(self, tmp_path):
+        """Non-sequential cluster IDs, no TSV, no templates → the
+        legacy ``channel_map[cluster_id]`` path is the only thing
+        left, and the "not sequential" warning fires to flag the
+        misalignment risk. Pins the existing safety signal.
+        """
+        d = str(tmp_path / "ks")
+        spike_times = np.array([10, 20, 30, 40], dtype=np.int64)
+        spike_clusters = np.array([5, 5, 12, 12], dtype=np.int64)
+        channel_map = np.arange(20)
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+        )
+
+        with warnings.catch_warnings(record=True) as recwarn:
+            warnings.simplefilter("always")
+            loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
+
+        sequential_warns = [w for w in recwarn if "not sequential" in str(w.message)]
+        assert sequential_warns, (
+            "Expected 'not sequential' warning on legacy fallback — "
+            f"saw warnings: {[str(w.message) for w in recwarn]}"
+        )
+
+    def test_templates_fallback_skipped_on_shape_mismatch(self, tmp_path):
+        """A 2-D ``templates.npy`` triggers the
+        ``"Templates fallback skipped"`` warning and the loader falls
+        through to the legacy ``channel_map[cluster_id]`` path. The
+        warning includes the offending shape so users can debug.
+        """
+        d = str(tmp_path / "ks")
+        # Sequential cluster IDs so the legacy fallback gives a
+        # well-defined answer to assert on.
+        spike_times = np.array([10, 20, 30, 40], dtype=np.int64)
+        spike_clusters = np.array([0, 0, 1, 1], dtype=np.int64)
+        # Matching length so the shape mismatch is purely the
+        # ``ndim != 3`` check.
+        spike_templates = np.array([0, 0, 1, 1], dtype=np.int64)
+        channel_map = np.array([100, 101, 102, 103])
+        # 2-D templates.npy — wrong rank.
+        templates_2d = np.zeros((2, 9), dtype=np.float32)
+        self._write_ks_folder(
+            d,
+            spike_times=spike_times,
+            spike_clusters=spike_clusters,
+            channel_map=channel_map,
+            spike_templates=spike_templates,
+            templates=templates_2d,
+        )
+
+        with warnings.catch_warnings(record=True) as recwarn:
+            warnings.simplefilter("always")
+            sd = loaders.load_spikedata_from_kilosort(d, fs_Hz=1000.0)
+
+        skip_warns = [
+            w for w in recwarn if "Templates fallback skipped" in str(w.message)
+        ]
+        assert skip_warns, (
+            "Expected 'Templates fallback skipped' warning for 2-D "
+            f"templates.npy. Got: {[str(w.message) for w in recwarn]}"
+        )
+        # Legacy fallback path produced electrodes via channel_map.
+        for i, clu in enumerate(sd.metadata["cluster_ids"]):
+            assert sd.neuron_attributes[i]["electrode"] == int(channel_map[int(clu)]), (
+                f"Cluster {clu}: legacy fallback after templates-skip "
+                f"gave electrode {sd.neuron_attributes[i].get('electrode')}, "
+                f"expected {int(channel_map[int(clu)])}"
+            )
+
+
+class TestLoadNwbStartTimeAttribute:
+    """``load_spikedata_from_nwb`` honors the ``start_time`` file
+    attribute (written by :func:`export_spikedata_to_nwb` in commit
+    609aa09) and falls back to 0.0 when the attribute is absent. The
+    ``start_time_ms`` keyword argument overrides both.
+
+    Existing tests pin the round-trip via the exporter side
+    (``TestNWBExporters::test_nonzero_start_time_roundtrips``); these
+    tests pin the loader side directly through hand-written h5py
+    fixtures so the loader's three-tier resolution (caller arg →
+    file attr → 0.0 default) is locked.
+    """
+
+    def test_caller_start_time_ms_overrides_file_attribute(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) File written with ``start_time=100.0`` attr;
+                loader called with explicit ``start_time_ms=50.0``;
+                resulting ``SpikeData.start_time == 50.0`` (caller wins).
+        """
+        path = str(tmp_path / "override.nwb")
+        with h5py.File(path, "w") as f:  # type: ignore
+            f.attrs["start_time"] = 100.0
+            g = f.create_group("units")
+            g.create_dataset("spike_times", data=np.array([0.2, 0.3]))
+            g.create_dataset("spike_times_index", data=np.array([1, 2]))
+
+        sd = loaders.load_spikedata_from_nwb(
+            path,
+            prefer_pynwb=False,
+            start_time_ms=50.0,
+            length_ms=500.0,
+        )
+        assert sd.start_time == 50.0
+
+    def test_missing_start_time_attr_falls_back_to_zero(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) NWB file without a ``start_time`` file
+                attribute loads with ``start_time == 0.0`` (no error,
+                no warning required — the default is documented).
+        """
+        path = str(tmp_path / "no_start_time.nwb")
+        with h5py.File(path, "w") as f:  # type: ignore
+            # Deliberately do NOT set f.attrs["start_time"].
+            g = f.create_group("units")
+            g.create_dataset("spike_times", data=np.array([0.2, 0.3]))
+            g.create_dataset("spike_times_index", data=np.array([1, 2]))
+
+        sd = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
+        assert sd.start_time == 0.0
+
+
+class TestParseS3UrlMixedCase:
+    """``parse_s3_url`` should treat host buckets case-insensitively
+    (S3 bucket names are restricted to lowercase, but path-style URLs
+    with mixed-case bucket names should still parse — they're invalid
+    S3 names but the parser shouldn't crash).
+    """
+
+    def test_mixed_case_path_style_bucket(self):
+        """
+        Tests:
+            (Test Case 1) Path-style HTTPS URL with mixed-case bucket
+                parses without raising. (S3 itself would reject the
+                bucket name on a real call, but the parser is purely
+                syntactic.)
+            (Test Case 2) Bucket portion is preserved verbatim — the
+                parser does not silently lowercase.
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        bucket, key = parse_s3_url("https://s3.amazonaws.com/MyBucket/path/file.h5")
+        assert bucket == "MyBucket"
+        assert key == "path/file.h5"
+
+    def test_mixed_case_virtual_hosted_bucket(self):
+        """
+        Tests:
+            (Test Case 1) Virtual-hosted-style URL with mixed-case
+                bucket parses without raising.
+            (Test Case 2) Bucket name preserved exactly.
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        bucket, key = parse_s3_url("https://MyBucket.s3.amazonaws.com/key/file.h5")
+        assert bucket == "MyBucket"
+        assert key == "key/file.h5"
+
+
+# ============================================================================
+# I/O review (2026-05-24) — data_loaders edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestTrainsFromFlatIndexLengthMismatch:
+    """``_trains_from_flat_index`` with ``n_units`` provided: the
+    function accepts length-N (cumulative-end) and length-N+1-with-
+    leading-zero (NWB leading-zero variant). Any other shape — including
+    length-N+1 with a non-zero head — falls through to the explicit
+    ``ValueError`` at source line 148-153. Pin the boundary.
+    """
+
+    def test_length_n_plus_one_with_non_zero_head_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``end_indices=[1, 3, 5]`` with ``n_units=2``
+                (length-N+1 but head != 0) raises ValueError.
+            (Test Case 2) Error message mentions both conventions.
+        """
+        from spikelab.data_loaders.data_loaders import _trains_from_flat_index
+
+        with pytest.raises(ValueError, match="cumulative-end|leading-zero"):
+            _trains_from_flat_index(
+                np.array([0.1, 0.2, 0.3, 0.4, 0.5]),
+                np.array([1, 3, 5]),
+                unit="s",
+                fs_Hz=None,
+                n_units=2,
+            )
+
+    def test_n_units_zero_with_non_empty_end_indices_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_units=0`` with non-empty ``end_indices``
+                raises ValueError via the length-mismatch branch.
+        """
+        from spikelab.data_loaders.data_loaders import _trains_from_flat_index
+
+        with pytest.raises(ValueError, match="does not match"):
+            _trains_from_flat_index(
+                np.array([0.1, 0.2]),
+                np.array([2]),
+                unit="s",
+                fs_Hz=None,
+                n_units=0,
+            )
+
+
+class TestReadRawArraysZeroBoundaries:
+    """``_read_raw_arrays`` shape boundaries: empty raw_data with
+    matching empty raw_time, and single-sample raw_time. These pass
+    the trailing-axis check at source line 200-202; pin the documented
+    no-rejection contract so a future stricter guard would surface.
+    """
+
+    def test_empty_raw_data_and_time_succeed(self):
+        """
+        Tests:
+            (Test Case 1) ``raw_data.shape=(0, 0)`` with ``raw_time.shape=(0,)``
+                returns valid empty arrays (trailing-axis match is 0==0).
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import _read_raw_arrays
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset("raw", data=np.zeros((0, 0)))
+                f.create_dataset("raw_t", data=np.zeros((0,)))
+            with h5py.File(path, "r") as f:
+                raw_data, raw_time = _read_raw_arrays(
+                    f,
+                    raw_dataset="raw",
+                    raw_time_dataset="raw_t",
+                    raw_time_unit="ms",
+                    fs_Hz=None,
+                )
+            assert raw_data.shape == (0, 0)
+            assert raw_time.shape == (0,)
+        finally:
+            os.unlink(path)
+
+    def test_single_sample_raw_time(self):
+        """
+        Tests:
+            (Test Case 1) ``raw_data.shape=(C, 1)`` with ``raw_time.shape=(1,)``
+                returns valid arrays with trailing-axis 1.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import _read_raw_arrays
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset("raw", data=np.array([[1.0]]))
+                f.create_dataset("raw_t", data=np.array([5.0]))
+            with h5py.File(path, "r") as f:
+                raw_data, raw_time = _read_raw_arrays(
+                    f,
+                    raw_dataset="raw",
+                    raw_time_dataset="raw_t",
+                    raw_time_unit="ms",
+                    fs_Hz=None,
+                )
+            assert raw_data.shape == (1, 1)
+            assert raw_time.shape == (1,)
+            assert raw_time[0] == pytest.approx(5.0)
+        finally:
+            os.unlink(path)
+
+
+class TestBuildSpikeDataAllEmptyWithStartTime:
+    """``_build_spikedata`` with all-empty trains AND a non-zero
+    ``start_time``: the length-inference path falls through to
+    ``length_ms = 0.0`` (per source: ``max_last`` defaults to
+    ``start_time`` when no spikes are present). Pin the resulting
+    SpikeData has ``length=0`` and ``start_time=start_time``.
+    """
+
+    def test_all_empty_trains_preserves_start_time(self):
+        """
+        Tests:
+            (Test Case 1) Empty trains with ``start_time=100.0`` yield
+                SpikeData with length=0 and start_time=100.0.
+            (Test Case 2) ``N`` matches the input length.
+        """
+        from spikelab.data_loaders.data_loaders import _build_spikedata
+
+        sd = _build_spikedata(
+            trains_ms=[np.array([]), np.array([])],
+            length_ms=None,
+            start_time=100.0,
+        )
+        assert sd.N == 2
+        assert sd.length == 0
+        assert sd.start_time == 100.0
+
+
+class TestLoadPickleRejectsNonSpikeData:
+    """``load_spikedata_from_pickle`` rejects every type other than
+    ``SpikeData``, even though ``export_to_pickle`` accepts six types
+    (SpikeData, RateData, PairwiseCompMatrix, PairwiseCompMatrixStack,
+    RateSliceStack, SpikeSliceStack). The asymmetry is documented in
+    the code review as a UX gap; pin the rejection behaviour so a
+    regression that silently returned a non-SpikeData would surface.
+    """
+
+    def test_pickle_with_ratedata_rejected(self):
+        """
+        Tests:
+            (Test Case 1) A pickle containing a RateData raises
+                ValueError mentioning "SpikeData".
+            (Test Case 2) The error message names the actual loaded
+                type (RateData).
+        """
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_pickle
+        from spikelab.spikedata.ratedata import RateData
+
+        rd = RateData(np.zeros((1, 3)), np.array([0.0, 1.0, 2.0]))
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(rd, f)
+            with pytest.raises(ValueError, match="SpikeData"):
+                load_spikedata_from_pickle(path)
+            with pytest.raises(ValueError, match="RateData"):
+                load_spikedata_from_pickle(path)
+        finally:
+            os.unlink(path)
+
+
+class TestNwbElectrodesIndexExactBoundary:
+    """NWB ``electrodes_index[-1]`` exactly equal to ``len(electrodes)``
+    (no truncation): the loader at source line 715 uses strict ``>``
+    so the equal-boundary case does NOT trigger the truncation warning.
+    Pin the silent-success contract at the exact boundary.
+    """
+
+    def test_electrodes_index_exactly_equals_electrodes_length(self):
+        """
+        Tests:
+            (Test Case 1) NWB file with ``electrodes_index[-1] == len(electrodes)``
+                loads without emitting a truncation warning.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        with tempfile.NamedTemporaryFile(suffix=".nwb", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                units = f.create_group("units")
+                units.create_dataset("id", data=np.array([0, 1]))
+                units.create_dataset(
+                    "spike_times", data=np.array([0.001, 0.002, 0.003])
+                )
+                units.create_dataset("spike_times_index", data=np.array([2, 3]))
+                # electrodes_index[-1] == len(electrodes): exact boundary.
+                units.create_dataset("electrodes", data=np.array([0, 1, 2]))
+                units.create_dataset("electrodes_index", data=np.array([2, 3]))
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                sd = load_spikedata_from_nwb(path, prefer_pynwb=False)
+            # No "truncated" warning fires.
+            assert not any("truncat" in str(w.message).lower() for w in caught)
+            assert sd.N == 2
+        finally:
+            os.unlink(path)
+
+
+class TestLoadHDF5RawThresholdedFsHzTypeQuirks:
+    """``load_spikedata_from_hdf5_raw_thresholded`` validates
+    ``fs_Hz`` with the existing ``not fs_Hz or fs_Hz <= 0`` guard.
+    Python ``bool`` is an int subclass, so ``True > 0`` passes — pin
+    the current passthrough (which is likely unintended but documented).
+    """
+
+    def test_fs_hz_true_accepted_as_1hz(self):
+        """
+        Tests:
+            (Test Case 1) ``fs_Hz=True`` is accepted (not rejected),
+                effectively meaning 1 Hz sample rate.
+
+        Notes:
+            - Documents the current behaviour. A future stricter
+              ``isinstance(fs_Hz, bool)`` rejection would surface here.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import (
+            load_spikedata_from_hdf5_raw_thresholded,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset(
+                    "data", data=np.random.RandomState(0).randn(2, 50) * 0.1
+                )
+            # fs_Hz=True coerces to 1.0; if the function rejects bool
+            # in the future this becomes a TypeError.
+            try:
+                sd = load_spikedata_from_hdf5_raw_thresholded(
+                    path,
+                    dataset="data",
+                    fs_Hz=True,
+                    threshold_sigma=5.0,
+                    filter=False,
+                )
+                # Successful path: SpikeData constructed, possibly zero spikes.
+                assert sd.N == 2
+            except (ValueError, TypeError) as exc:
+                # If a future guard rejects bool, accept the rejection.
+                pytest.skip(f"fs_Hz=True now rejected (was previously accepted): {exc}")
+        finally:
+            os.unlink(path)
+
+
+# ============================================================================
+# Test Coverage Scan + Edge Case residuals (2026-05-25) — more pins.
+# ============================================================================
+
+
+class TestBuildS3Kwargs:
+    """``_build_s3_kwargs`` builds boto3 client kwargs from optional
+    credential params. Pin filtering and passthrough.
+    """
+
+    def test_empty_credentials_yields_empty_dict(self):
+        """
+        Tests:
+            (Test Case 1) All-None args produce an empty dict.
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs() == {}
+
+    def test_region_name_alone(self):
+        """
+        Tests:
+            (Test Case 1) Only ``region_name`` set produces a single-
+                entry dict (no credentials).
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(region_name="us-west-2") == {"region_name": "us-west-2"}
+
+    def test_full_credentials_passed_through(self):
+        """
+        Tests:
+            (Test Case 1) Access key, secret, session token, and region
+                all populate the result.
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(
+            aws_access_key_id="AKID",
+            aws_secret_access_key="secret",
+            aws_session_token="token",
+            region_name="us-east-1",
+        ) == {
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret",
+            "aws_session_token": "token",
+            "region_name": "us-east-1",
+        }
+
+    def test_empty_string_credentials_filtered_out(self):
+        """
+        Tests:
+            (Test Case 1) Empty-string credential args are filtered
+                (falsy values do not enter the dict).
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(
+            aws_access_key_id="",
+            aws_secret_access_key="",
+            region_name="us-east-1",
+        ) == {"region_name": "us-east-1"}
+
+
+class TestNwbLoaderStartTimeMsBrittleness:
+    """The NWB loader uses ``start_time=start_time_ms or 0.0`` — the
+    ``or`` pattern only falls back when LHS is falsy. Pin negative
+    values survive (Python truthy) but ``0.0`` falls to the default.
+    """
+
+    def test_negative_start_time_preserved(self):
+        """
+        Tests:
+            (Test Case 1) ``start_time_ms=-200.0`` survives the
+                ``or 0.0`` brittleness; SpikeData has start_time=-200.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        with tempfile.NamedTemporaryFile(suffix=".nwb", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                units = f.create_group("units")
+                units.create_dataset("id", data=np.array([0]))
+                units.create_dataset("spike_times", data=np.array([0.001, 0.002]))
+                units.create_dataset("spike_times_index", data=np.array([2]))
+            sd = load_spikedata_from_nwb(
+                path,
+                start_time_ms=-200.0,
+                length_ms=1000.0,
+                prefer_pynwb=False,
+            )
+            assert sd.start_time == -200.0
+        finally:
+            os.unlink(path)

@@ -126,20 +126,24 @@ def export_spikedata_to_hdf5(
     # been created and partially populated — the user is left with a
     # half-written file on disk. Validate the active style's time unit
     # against the unit→fs_Hz contract upfront.
-    if style == "ragged" and spike_times_unit == "samples" and not fs_Hz:
+    if (
+        style == "ragged"
+        and spike_times_unit == "samples"
+        and (not fs_Hz or fs_Hz <= 0)
+    ):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "spike_times_unit='samples' (style='ragged')."
+            f"spike_times_unit='samples' (style='ragged'), got {fs_Hz!r}."
         )
-    if style == "group" and group_time_unit == "samples" and not fs_Hz:
+    if style == "group" and group_time_unit == "samples" and (not fs_Hz or fs_Hz <= 0):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "group_time_unit='samples' (style='group')."
+            f"group_time_unit='samples' (style='group'), got {fs_Hz!r}."
         )
-    if style == "paired" and times_unit == "samples" and not fs_Hz:
+    if style == "paired" and times_unit == "samples" and (not fs_Hz or fs_Hz <= 0):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "times_unit='samples' (style='paired')."
+            f"times_unit='samples' (style='paired'), got {fs_Hz!r}."
         )
 
     # Create or overwrite the HDF5 file
@@ -194,10 +198,24 @@ def export_spikedata_to_hdf5(
                 raise ValueError(
                     "raster_bin_size_ms must be provided and > 0 for raster style"
                 )
+            # Raster convention: ``sd.raster(...)`` returns a bin matrix
+            # whose column 0 corresponds to the recording's start_time
+            # (not literal t=0). On reload, the loader passes
+            # ``start_time=file_start_time`` into ``from_raster``, which
+            # offsets the generated spike times. Event-centered data
+            # (``start_time<0``) therefore round-trips correctly only
+            # when the file-level ``start_time`` attr is preserved —
+            # which it is (written above on line 151). Document the
+            # convention here so a future refactor of either side
+            # doesn't accidentally drop the offset.
             raster = sd.raster(raster_bin_size_ms)
             f.create_dataset(raster_dataset, data=np.asarray(raster))
             # Store bin size as an attribute for provenance (readers can ignore)
             f[raster_dataset].attrs["bin_size_ms"] = float(raster_bin_size_ms)
+            # Tag the raster's time origin so an external consumer (not
+            # the matching loader) knows that ``column 0 == start_time``,
+            # not ``column 0 == 0``.
+            f[raster_dataset].attrs["time_origin_ms"] = float(sd.start_time)
             return  # file-level attr (start_time) already written above
 
         if style == "ragged":
@@ -270,13 +288,6 @@ def export_spikedata_to_nwb(
           when prefer_pynwb=False.
     """
     ensure_h5py()
-    if sd.start_time != 0:
-        warnings.warn(
-            f"Exporting event-centered SpikeData (start_time={sd.start_time}) "
-            "to NWB. The NWB format does not store start_time, so spike times "
-            "are written as-is. On reload, start_time will default to 0.",
-            UserWarning,
-        )
     counts = [len(t) for t in sd.train]
     flat_ms = np.concatenate(sd.train) if sum(counts) else np.array([], float)
     flat_s = times_from_ms(flat_ms, "s", fs_Hz=None)
@@ -361,8 +372,12 @@ def export_spikedata_to_kilosort(
             'samples': integer sample indices (default, KiloSort
             standard). 'ms': milliseconds (float). 's': seconds (float).
         cluster_ids (Sequence[int] | None): Custom cluster IDs for each
-            unit. If None, uses sequential integers 0, 1, 2, ... Length
-            must match sd.N.
+            unit. Length **must match sd.N** even when some units are
+            empty — ``cluster_ids[i]`` reserves the cluster identifier
+            for unit ``i`` so the unit ordering is stable on reload.
+            For empty units the ``cluster_ids[i]`` entry is consumed
+            but contributes no rows to the output arrays. If None, uses
+            sequential integers 0, 1, 2, ...
 
     Returns:
         paths (tuple[str, str]): Paths to the created spike_times.npy
@@ -373,7 +388,7 @@ def export_spikedata_to_kilosort(
           across all units).
         - Spike times are sorted by unit order, not chronologically.
         - Empty units (no spikes) don't contribute entries to the output
-          arrays.
+          arrays, but their ``cluster_ids[i]`` slot is still consumed.
         - The 'samples' time unit produces integer arrays suitable for
           KiloSort/Phy.
         - Cluster IDs can be arbitrary integers and don't need to be
@@ -521,8 +536,24 @@ def export_to_pickle(
         dirpath = os.path.dirname(filepath)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
-        with open(filepath, "wb") as f:
-            pickle.dump(sd, f, protocol=protocol)
+        # Write atomically: serialise into ``{filepath}.tmp`` first
+        # and ``os.replace`` onto the final path on success. Without
+        # this, a failed pickle.dump (disk full, segfault inside a
+        # user-supplied ``__reduce__``, etc.) would leave the
+        # already-truncated destination as a corrupt file — silently
+        # destroying any previous good export. ``os.replace`` is
+        # atomic on POSIX and NTFS.
+        tmp_path = f"{filepath}.tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(sd, f, protocol=protocol)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
         return filepath
 
 

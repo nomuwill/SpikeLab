@@ -37,6 +37,15 @@ def _apply_image_selection(
     image_profile: str | None,
     image_override: str | None,
 ) -> Dict[str, Any]:
+    # Deep-copy the payload before mutating. Callers (notably
+    # ``_cmd_render`` which dispatches to ``_cmd_deploy``) reuse the
+    # parsed config dict across invocations; in-place mutation here
+    # leaked the resolved image into the caller's dict, surprising
+    # any caller that re-applied a different image_profile on the
+    # second call.
+    import copy
+
+    payload = copy.deepcopy(payload)
     container = payload.get("container")
     if container is None:
         container = {}
@@ -52,6 +61,19 @@ def _apply_image_selection(
     default_image = profile.default_images.get(selected_profile)
     if default_image and not container.get("image"):
         container["image"] = default_image
+    # Fail loudly at the resolution site rather than letting the
+    # downstream Pydantic validation surface a generic
+    # "container.image: field required" error.
+    if not container.get("image"):
+        available = sorted(profile.default_images.keys())
+        available_str = f"{available}" if available else "(profile has none configured)"
+        raise SystemExit(
+            f"No image available: profile {profile.name!r} has no "
+            f"default_images[{selected_profile!r}] entry. "
+            f"Available image profiles in this cluster profile: "
+            f"{available_str}. Pass --image <tag> or use a profile "
+            "with default_images set."
+        )
     return payload
 
 

@@ -15,7 +15,7 @@ These helpers avoid hard dependencies: optional libraries are imported lazily.
 
 from __future__ import annotations
 
-from typing import List, Mapping, Optional, Sequence, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Union
 
 import os
 import re
@@ -114,28 +114,62 @@ def _trains_from_flat_index(
         trains (list of np.ndarray): Per-unit spike-time arrays in
             milliseconds.
     """
+    segments = _split_by_index(
+        flat_times, end_indices, n_units=n_units, name="spike_times_index"
+    )
+    return [to_ms(seg, unit, fs_Hz) for seg in segments]
+
+
+def _split_by_index(
+    flat: np.ndarray,
+    end_indices: np.ndarray,
+    *,
+    n_units: Optional[int] = None,
+    name: str = "index",
+) -> List[np.ndarray]:
+    """Split a flat array into per-unit chunks via cumulative end indices.
+
+    Handles both NWB conventions: cumulative-end (length N) and
+    leading-zero (length N+1). Disambiguation matches the rules in
+    :func:`_trains_from_flat_index`: when ``n_units`` is provided, length
+    is checked against both candidates; otherwise a heuristic
+    auto-detect runs.
+
+    Parameters:
+        flat (np.ndarray): The concatenated array to split.
+        end_indices (np.ndarray): Cumulative end indices.
+        n_units (int or None): Known number of units, used to
+            disambiguate the index convention. ``None`` triggers the
+            heuristic auto-detect.
+        name (str): Display name for error messages (e.g.
+            ``"spike_times_index"`` or ``"electrodes_index"``).
+
+    Returns:
+        chunks (list of np.ndarray): Per-unit slices of ``flat``. No
+            type conversion is applied.
+    """
     end_indices = np.asarray(end_indices)
     if len(end_indices) > 0:
         # Reject float / non-integer dtype upfront with a friendly error;
         # numpy slicing on float indices raises a confusing TypeError mid-loop.
         if not np.issubdtype(end_indices.dtype, np.integer):
             raise ValueError(
-                "spike_times_index must be an integer array, got dtype "
+                f"{name} must be an integer array, got dtype "
                 f"{end_indices.dtype}. HDF5 datasets stored as float should "
                 "be cast (e.g. `np.asarray(f[idx_key]).astype(np.int64)`)."
             )
         if end_indices[0] < 0:
             raise ValueError(
-                f"spike_times_index entries must be non-negative; got "
+                f"{name} entries must be non-negative; got "
                 f"{end_indices[0]} at position 0. Cumulative-end indices "
-                "represent spike counts and cannot be negative."
+                "represent counts and cannot be negative."
             )
         if not np.all(np.diff(end_indices) >= 0):
-            raise ValueError("spike_times_index must be monotonically non-decreasing")
-        if end_indices[-1] > len(flat_times):
+            raise ValueError(f"{name} must be monotonically non-decreasing")
+        if end_indices[-1] > len(flat):
             raise ValueError(
-                f"spike_times_index final value ({end_indices[-1]}) exceeds "
-                f"flat_times length ({len(flat_times)})"
+                f"{name} final value ({end_indices[-1]}) exceeds "
+                f"flat array length ({len(flat)})"
             )
 
     if n_units is not None:
@@ -147,7 +181,7 @@ def _trains_from_flat_index(
             end_indices = end_indices[1:]
         elif len(end_indices) != n_units:
             raise ValueError(
-                f"spike_times_index length {len(end_indices)} does not match "
+                f"{name} length {len(end_indices)} does not match "
                 f"n_units={n_units} for either cumulative-end (length N) or "
                 f"leading-zero (length N+1) convention."
             )
@@ -158,13 +192,12 @@ def _trains_from_flat_index(
         # when the array is entirely zero, which is excluded here).
         end_indices = end_indices[1:]
 
-    trains: List[np.ndarray] = []
+    chunks: List[np.ndarray] = []
     start = 0
     for stop in end_indices:
-        segment = flat_times[start:stop]
-        trains.append(to_ms(segment, unit, fs_Hz))
+        chunks.append(flat[start:stop])
         start = stop
-    return trains
+    return chunks
 
 
 def _read_raw_arrays(
@@ -174,13 +207,34 @@ def _read_raw_arrays(
     raw_time_unit: str,
     fs_Hz: Optional[float],
 ) -> tuple[Optional[np.ndarray], Optional[Union[np.ndarray, float]]]:
-    """Read optional raw arrays and convert the time vector to milliseconds."""
+    """Read optional raw arrays and convert the time vector to milliseconds.
+
+    Raises:
+        ValueError: If ``raw_data.shape[-1]`` does not equal
+            ``raw_time.shape[0]``. The trailing axis of ``raw_data`` is
+            the time axis by convention; a mismatch with the time vector
+            length means the two arrays are not aligned and the resulting
+            ``SpikeData`` would carry silently corrupt raw signal.
+    """
     raw_data = None
     raw_time: Optional[Union[np.ndarray, float]] = None
     if raw_dataset is not None:
         raw_data = np.asarray(f[raw_dataset])
         if raw_time_dataset is not None:
             raw_time_vals = np.asarray(f[raw_time_dataset])
+            # Reject shape mismatch at the loader boundary. Without this
+            # the SpikeData constructor accepts the mis-aligned arrays
+            # (its own suffix-shape check tolerates extra axes) and the
+            # silent corruption only surfaces when downstream code indexes
+            # into the wrong sample positions.
+            if raw_data.shape[-1] != raw_time_vals.shape[0]:
+                raise ValueError(
+                    f"raw_data trailing axis length ({raw_data.shape[-1]}) "
+                    f"does not match raw_time length ({raw_time_vals.shape[0]}). "
+                    f"raw_data.shape={raw_data.shape}, "
+                    f"raw_time.shape={raw_time_vals.shape}. The trailing axis "
+                    "of raw_data is the time axis by convention."
+                )
             if raw_time_unit == "s":
                 raw_time = raw_time_vals * 1e3
             elif raw_time_unit == "ms":
@@ -236,7 +290,20 @@ def _build_spikedata(
     """Internal helper to construct a SpikeData with sensible defaults. Infers `length_ms` from the last spike if not provided."""
     if length_ms is None:
         last = [t[-1] for t in trains_ms if len(t) > 0]
-        length_ms = float(max(last)) - start_time if last else 0.0
+        if last:
+            # Add one ULP at the magnitude of the latest spike so the
+            # constructor's strict ``t[-1] > start_time + length`` check
+            # passes even when unit-conversion round-trips (samples → s
+            # → ms in the loaders) drift the loaded spike value by a
+            # ULP above the inferred end. ``np.spacing(x)`` returns the
+            # gap between ``x`` and the next float; at typical recording
+            # scales (~1e5 ms) that's ~1.5e-11 ms — far below any
+            # measurable precision but enough to keep the inequality
+            # strict.
+            max_last = float(max(last))
+            length_ms = max_last - start_time + np.spacing(max_last)
+        else:
+            length_ms = 0.0
     return SpikeData(
         trains_ms,
         length=length_ms,
@@ -433,6 +500,28 @@ def load_spikedata_from_hdf5(
                 f"got len(idces)={len(idces)}, len(times)={len(times)}."
             )
         N = int(idces.max()) + 1 if idces.size else 0
+        # Surface sparse cluster_id padding so the operator can tell a
+        # legitimate "unit N had no spikes" case apart from "unit N
+        # was dropped by Phy curation and the loader filled in an
+        # empty train". Without this, a curated Phy export that
+        # dropped clusters 2..46 silently produced 45 empty units in
+        # the middle and downstream consumers had no signal.
+        unique_ids = np.unique(idces) if idces.size else np.array([])
+        if idces.size and len(unique_ids) != N:
+            missing = sorted(set(range(N)) - set(int(u) for u in unique_ids))
+            preview = missing[:5]
+            more = "..." if len(missing) > 5 else ""
+            warnings.warn(
+                f"paired-style HDF5 has sparse cluster_ids: max+1={N} "
+                f"but only {len(unique_ids)} distinct ids present. "
+                f"The loader will create {len(missing)} empty unit(s) "
+                f"to pad (cluster_ids {preview}{more}). If this is a "
+                "Phy-curated export, the empty units may not match the "
+                "user's mental model — consider compacting the cluster "
+                "ids upstream.",
+                UserWarning,
+                stacklevel=2,
+            )
         sd = SpikeData.from_idces_times(
             idces,
             times,
@@ -483,6 +572,16 @@ def load_spikedata_from_hdf5_raw_thresholded(
     ensure_h5py()
     with h5py.File(filepath, "r") as f:  # type: ignore
         data = np.asarray(f[dataset])
+        # Honour the same file-level ``length_ms``/``start_time`` attrs
+        # that ``load_spikedata_from_hdf5`` reads. Without these, the
+        # two loaders for the same on-disk file format had asymmetric
+        # round-trip semantics for trailing silence and event-centered
+        # start_time: the raster path preserved them, the thresholded
+        # path silently inferred from data shape.
+        file_length = float(f.attrs["length_ms"]) if "length_ms" in f.attrs else None
+        file_start_time = (
+            float(f.attrs["start_time"]) if "start_time" in f.attrs else None
+        )
     return SpikeData.from_thresholding(
         data,
         fs_Hz=fs_Hz,
@@ -490,6 +589,8 @@ def load_spikedata_from_hdf5_raw_thresholded(
         filter=filter,
         hysteresis=hysteresis,
         direction=direction,  # type: ignore[arg-type]
+        length=file_length,
+        start_time=file_start_time,
     )
 
 
@@ -503,6 +604,7 @@ def load_spikedata_from_nwb(
     *,
     prefer_pynwb: bool = True,
     length_ms: Optional[float] = None,
+    start_time_ms: Optional[float] = None,
 ) -> SpikeData:
     """Load spike trains from an NWB file's Units table.
 
@@ -510,6 +612,15 @@ def load_spikedata_from_nwb(
         filepath (str): Path to the NWB file.
         prefer_pynwb (bool): If True, try pynwb first; if False, try h5py.
         length_ms (float | None): Recording duration in milliseconds.
+            When ``None``, reads from the file-level ``length_ms``
+            attribute (written by ``export_spikedata_to_nwb``); falls
+            back to inferring from the latest spike time if the
+            attribute is absent.
+        start_time_ms (float | None): Recording start time in
+            milliseconds. When ``None``, reads from the file-level
+            ``start_time`` attribute (written by
+            ``export_spikedata_to_nwb``); falls back to 0.0 if the
+            attribute is absent. Mirrors the ``length_ms`` ladder.
 
     Returns:
         sd (SpikeData): The loaded spike train data.
@@ -517,6 +628,30 @@ def load_spikedata_from_nwb(
     trains: List[np.ndarray] = []
     neuron_attributes: List[dict] = []
     meta = {"source_file": os.path.abspath(filepath), "format": "NWB"}
+
+    # Read file-level attributes via h5py up-front so both the pynwb
+    # and h5py paths benefit. Caller overrides take precedence; missing
+    # attrs fall back to None/0 (the SpikeData defaults).
+    file_length_ms: Optional[float] = None
+    file_start_time_ms: float = 0.0
+    if length_ms is None or start_time_ms is None:
+        try:
+            import h5py as _h5  # type: ignore
+
+            with _h5.File(filepath, "r") as _attrs_f:
+                if "length_ms" in _attrs_f.attrs:
+                    file_length_ms = float(_attrs_f.attrs["length_ms"])
+                if "start_time" in _attrs_f.attrs:
+                    file_start_time_ms = float(_attrs_f.attrs["start_time"])
+        except Exception:
+            # Attribute read is best-effort; if h5py can't open the file
+            # (corrupt, unsupported plugin, etc.) the loader proper will
+            # raise the real error below.
+            pass
+    if length_ms is None:
+        length_ms = file_length_ms
+    if start_time_ms is None:
+        start_time_ms = file_start_time_ms
 
     if prefer_pynwb:
         try:
@@ -572,6 +707,7 @@ def load_spikedata_from_nwb(
             return _build_spikedata(
                 trains,
                 length_ms=length_ms,
+                start_time=start_time_ms if start_time_ms is not None else 0.0,
                 metadata=meta,
                 neuron_attributes=neuron_attributes,
             )
@@ -657,11 +793,23 @@ def load_spikedata_from_nwb(
                     "/units/electrodes_index and /units/electrodes datasets.",
                     UserWarning,
                 )
-            electrode_indices = []
-            start = 0
-            for stop in elec_idx:
-                electrode_indices.append(elec_flat[start:stop])
-                start = stop
+                # Clip the index so _split_by_index's strict
+                # overflow check doesn't promote the warning to an
+                # error. We've already told the caller about the
+                # truncation; preserve the pre-refactor lenient
+                # contract for this specific NWB-in-the-wild quirk.
+                elec_idx = np.minimum(elec_idx, len(elec_flat))
+            # Use the shared splitter so the leading-zero (length N+1)
+            # NWB convention is honoured the same way it is for
+            # spike_times_index. The previous inline ``for stop in
+            # elec_idx`` loop silently misaligned per-unit electrodes
+            # by one when the file used the leading-zero convention.
+            electrode_indices = _split_by_index(
+                elec_flat,
+                elec_idx,
+                n_units=n_units,
+                name="electrodes_index",
+            )
 
         electrode_positions: Optional[dict] = None
         elec_table_path = "general/extracellular_ephys/electrodes"
@@ -719,7 +867,11 @@ def load_spikedata_from_nwb(
             neuron_attributes.append(attr)
 
     return _build_spikedata(
-        trains, length_ms=length_ms, metadata=meta, neuron_attributes=neuron_attributes
+        trains,
+        length_ms=length_ms,
+        start_time=start_time_ms if start_time_ms is not None else 0.0,
+        metadata=meta,
+        neuron_attributes=neuron_attributes,
     )
 
 
@@ -882,6 +1034,24 @@ def load_spikedata_from_kilosort(
         except (IOError, ValueError) as e:
             warnings.warn(f"Failed loading channel_positions: {e}")
 
+    # Per-cluster physical-channel mapping. Built by one of:
+    #   (1) cluster_info.tsv ``ch`` column — canonical Phy answer, set
+    #       below if the TSV provides it.
+    #   (2) spike_templates.npy + templates.npy — Phy/phylib's
+    #       template-amplitude fallback, set further below if the
+    #       intermediate kilosort files are present.
+    #   (3) channel_map[cluster_id] — legacy fallback used per-cluster
+    #       inside the main loop when neither (1) nor (2) yields an
+    #       entry for the cluster.
+    #
+    # Phy's merge/split renumbers ``spike_clusters`` non-sequentially
+    # but leaves ``spike_templates`` invariant, so the templates-based
+    # path survives curation. The legacy fallback only happens to give
+    # correct results when cluster IDs are sequential 0..N-1 AND each
+    # cluster's dominant template lives at the matching ordinal
+    # channel position — i.e. fresh, uncurated kilosort output.
+    cluster_id_to_channel: Optional[Dict[int, int]] = None
+
     keep_clusters: Optional[set] = None
     if cluster_info_tsv is not None:
         tsv_path = os.path.join(folder, cluster_info_tsv)
@@ -923,6 +1093,28 @@ def load_spikedata_from_kilosort(
                             .isin(["good", "mua", "mua good"])
                         )  # permissive
                         keep_clusters = set(df.loc[mask, id_col].astype(int).tolist())
+                # Extract Phy's canonical post-curation channel mapping
+                # from the ``ch`` column when present. ``cluster_info.tsv``
+                # is written by ``phy save`` and survives merge/split
+                # because Phy recomputes the dominant channel per
+                # cluster from current waveforms. This bypasses the
+                # buggy ``channel_map[cluster_id]`` lookup entirely.
+                if id_col is not None and "ch" in df.columns:
+                    try:
+                        cluster_id_to_channel = dict(
+                            zip(
+                                df[id_col].astype(int).tolist(),
+                                df["ch"].astype(int).tolist(),
+                            )
+                        )
+                    except (ValueError, TypeError) as exc:
+                        warnings.warn(
+                            f"Failed parsing 'ch' column from cluster TSV "
+                            f"({exc!r}); falling back to templates / "
+                            "channel_map for cluster→channel mapping.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
             except ImportError:
                 warnings.warn(
                     "pandas is required to parse cluster info TSV. "
@@ -940,18 +1132,98 @@ def load_spikedata_from_kilosort(
                     f"Failed parsing cluster info TSV: {e}; keeping all clusters"
                 )
 
+    # Templates-based fallback for cluster→channel when TSV is absent
+    # or lacks the ``ch`` column. Loads ``spike_templates.npy`` (per-spike
+    # template ID — invariant under Phy curation) and ``templates.npy``
+    # (per-template waveform). For each unique cluster:
+    #   1. find its dominant template via mode of ``spike_templates``
+    #      over the cluster's spikes;
+    #   2. find that template's peak channel via argmax of the
+    #      max-absolute-amplitude per channel position;
+    #   3. translate channel position → physical channel ID via
+    #      ``channel_map``.
+    # When either intermediate file is missing or channel_map is
+    # unavailable, the fallback is skipped silently — the per-cluster
+    # loop below then falls through to the legacy
+    # ``channel_map[cluster_id]`` path.
+    if cluster_id_to_channel is None:
+        st_tpl_path = os.path.join(folder, "spike_templates.npy")
+        tpl_path = os.path.join(folder, "templates.npy")
+        if (
+            os.path.exists(st_tpl_path)
+            and os.path.exists(tpl_path)
+            and channel_map is not None
+        ):
+            try:
+                spike_templates_arr = np.load(st_tpl_path).flatten()
+                templates_arr = np.load(tpl_path)
+                if (
+                    templates_arr.ndim == 3
+                    and spike_templates_arr.shape[0] == spike_clusters.shape[0]
+                ):
+                    # Per-template peak channel position (argmax of
+                    # max |amp| across time). Shape: (n_templates,).
+                    amplitudes = np.abs(templates_arr).max(axis=1)
+                    template_peak_pos = amplitudes.argmax(axis=1)
+                    cluster_id_to_channel = {}
+                    for clu in np.unique(spike_clusters):
+                        mask = spike_clusters == clu
+                        if not mask.any():
+                            continue
+                        tpls = spike_templates_arr[mask]
+                        unique_tpl, counts = np.unique(tpls, return_counts=True)
+                        dominant_template = int(unique_tpl[counts.argmax()])
+                        if 0 <= dominant_template < len(template_peak_pos):
+                            pos = int(template_peak_pos[dominant_template])
+                            if 0 <= pos < len(channel_map):
+                                cluster_id_to_channel[int(clu)] = int(channel_map[pos])
+                    if not cluster_id_to_channel:
+                        # No cluster resolved successfully — discard
+                        # the empty dict so the per-cluster loop below
+                        # falls through to the legacy path.
+                        cluster_id_to_channel = None
+                else:
+                    warnings.warn(
+                        f"Templates fallback skipped: templates.npy shape "
+                        f"{templates_arr.shape} is not 3-D, or "
+                        f"spike_templates length {spike_templates_arr.shape[0]} "
+                        f"doesn't match spike_clusters length "
+                        f"{spike_clusters.shape[0]}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+            except (IOError, ValueError) as exc:
+                warnings.warn(
+                    f"Failed loading spike_templates.npy / templates.npy "
+                    f"for cluster→channel fallback: {exc!r}. Falling back "
+                    "to channel_map[cluster_id] lookup.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
     trains: List[np.ndarray] = []
     metadata_units: List[int] = []
     neuron_attributes: List[dict] = []
     unique_clusters = np.unique(spike_clusters)
-    if channel_map is not None and len(unique_clusters) > 0:
+    # Only warn about non-sequential cluster IDs when neither the TSV
+    # ``ch`` map nor the templates fallback resolved a cluster→channel
+    # mapping. With either of those in place the legacy
+    # ``channel_map[cluster_id]`` path is bypassed and the misalignment
+    # bug no longer applies.
+    if (
+        cluster_id_to_channel is None
+        and channel_map is not None
+        and len(unique_clusters) > 0
+    ):
         expected_sequential = np.arange(len(unique_clusters))
         if not np.array_equal(unique_clusters, expected_sequential):
             warnings.warn(
                 f"Cluster IDs are not sequential (0..{len(unique_clusters)-1}): "
                 f"channel_map lookup uses cluster ID as array index, which "
                 f"may assign incorrect electrode/location metadata after "
-                f"Phy curation. Verify spatial analysis results.",
+                f"Phy curation. Provide cluster_info_tsv with a 'ch' column "
+                f"or ensure spike_templates.npy + templates.npy are in the "
+                f"folder so the loader can use the correct mapping.",
                 UserWarning,
             )
     unit_idx = 0
@@ -966,11 +1238,19 @@ def load_spikedata_from_kilosort(
         attr: dict = {"unit_id": int(clu)}
         channel_idx = None
         int_clu = int(clu)
-        # channel_map is indexed by template/cluster ID — only correct
-        # when cluster IDs are sequential integers starting from 0.
-        # After Phy curation (merge/split), IDs become non-sequential
-        # and this lookup silently maps to the wrong channel.
-        if channel_map is not None and int_clu < len(channel_map):
+        # Resolve cluster → physical channel by priority:
+        #   1. ``cluster_id_to_channel`` from TSV ``ch`` or templates
+        #      fallback — both produce physical channel IDs and both
+        #      survive Phy curation.
+        #   2. Legacy ``channel_map[cluster_id]`` lookup — only correct
+        #      for fresh uncurated kilosort output. Kept as last
+        #      resort because removing it would break loaders for
+        #      users who don't provide cluster_info.tsv and whose
+        #      kilosort folders lack spike_templates.npy / templates.npy.
+        if cluster_id_to_channel is not None and int_clu in cluster_id_to_channel:
+            channel_idx = cluster_id_to_channel[int_clu]
+            attr["electrode"] = channel_idx
+        elif channel_map is not None and int_clu < len(channel_map):
             channel_idx = int(channel_map[int_clu])
             attr["electrode"] = channel_idx
         elif channel_map is not None:
@@ -1158,6 +1438,7 @@ def load_spikedata_from_spikeinterface_recording(
 def load_spikedata_from_pickle(
     filepath: str,
     *,
+    allow_remote: bool = False,
     aws_access_key_id: Optional[str] = None,
     aws_secret_access_key: Optional[str] = None,
     aws_session_token: Optional[str] = None,
@@ -1170,11 +1451,17 @@ def load_spikedata_from_pickle(
         deserialization can execute arbitrary code and should never be
         used with untrusted data. The file is deserialized before type
         checking — malicious payloads execute regardless of the
-        subsequent isinstance check.
+        subsequent isinstance check. Remote (S3) loads require
+        ``allow_remote=True`` so the caller has to opt in.
 
     Parameters:
         filepath (str): Path to the pickle file, or an S3 URL
-            (s3://bucket/key).
+            (s3://bucket/key). Remote URLs require ``allow_remote=True``.
+        allow_remote (bool): When ``False`` (default), S3 URLs are
+            rejected with a ``ValueError``. Pass ``True`` to opt in to
+            loading a pickle from a remote bucket; a ``UserWarning``
+            is also emitted at the call site so the risk surfaces in
+            batch-job logs.
         aws_access_key_id (str | None): AWS access key ID for S3
             downloads.
         aws_secret_access_key (str | None): AWS secret access key for
@@ -1186,7 +1473,29 @@ def load_spikedata_from_pickle(
     Returns:
         sd (SpikeData): The deserialized SpikeData object.
     """
-    from .s3_utils import ensure_local_file
+    from .s3_utils import ensure_local_file, is_s3_url
+
+    if is_s3_url(filepath):
+        # Pickle's arbitrary-code-execution risk is amplified when the
+        # source is a remote bucket: a malicious upload (or a workspace
+        # JSON file rewritten by a hostile agent in batch jobs) would
+        # execute attacker code before the isinstance(SpikeData) check
+        # below can reject it. Force callers to opt in, and surface a
+        # warning in logs so the risk is visible at runtime rather
+        # than buried in this docstring.
+        if not allow_remote:
+            raise ValueError(
+                f"Refusing to load pickle from remote URL {filepath!r}: "
+                "pickle.load executes arbitrary code from the source. "
+                "Pass allow_remote=True to confirm you trust the bucket."
+            )
+        warnings.warn(
+            f"Loading pickle from remote URL {filepath!r}; pickle.load "
+            "will execute arbitrary code embedded in the file. Trust "
+            "the bucket and its credentials before continuing.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     local_path, is_temp = ensure_local_file(
         filepath,
@@ -1208,9 +1517,99 @@ def load_spikedata_from_pickle(
 
     if not isinstance(obj, SpikeData):
         raise ValueError(
-            f"Pickle file does not contain a SpikeData object (found {type(obj).__name__})"
+            f"Pickle file does not contain a SpikeData object (found {type(obj).__name__}). "
+            "Use load_from_pickle for the generic loader that accepts any spikelab data type."
         )
 
+    return obj
+
+
+def load_from_pickle(
+    filepath: str,
+    *,
+    allow_remote: bool = False,
+    aws_access_key_id: Optional[str] = None,
+    aws_secret_access_key: Optional[str] = None,
+    aws_session_token: Optional[str] = None,
+    region_name: Optional[str] = None,
+):
+    """Load any spikelab data object from a pickle file.
+
+    Companion to ``load_spikedata_from_pickle``: accepts any of the six
+    types that ``export_to_pickle`` supports (``SpikeData``, ``RateData``,
+    ``PairwiseCompMatrix``, ``PairwiseCompMatrixStack``, ``RateSliceStack``,
+    ``SpikeSliceStack``).
+
+    Warning:
+        Only load pickle files from trusted sources. Pickle
+        deserialization can execute arbitrary code; the type check below
+        runs after deserialisation completes.
+
+    Parameters:
+        filepath (str): Path to the pickle file, or an S3 URL.
+        allow_remote (bool): Opt-in flag for S3 URLs (default False).
+        aws_access_key_id (str | None): AWS access key ID for S3 downloads.
+        aws_secret_access_key (str | None): AWS secret access key.
+        aws_session_token (str | None): AWS session token.
+        region_name (str | None): AWS region name.
+
+    Returns:
+        obj: The deserialized spikelab data object.
+    """
+    from ..spikedata.pairwise import PairwiseCompMatrix, PairwiseCompMatrixStack
+    from ..spikedata.ratedata import RateData
+    from ..spikedata.rateslicestack import RateSliceStack
+    from ..spikedata.spikeslicestack import SpikeSliceStack
+    from .s3_utils import ensure_local_file, is_s3_url
+
+    _SUPPORTED = (
+        SpikeData,
+        RateData,
+        PairwiseCompMatrix,
+        PairwiseCompMatrixStack,
+        RateSliceStack,
+        SpikeSliceStack,
+    )
+
+    if is_s3_url(filepath):
+        if not allow_remote:
+            raise ValueError(
+                f"Refusing to load pickle from remote URL {filepath!r}: "
+                "pickle.load executes arbitrary code from the source. "
+                "Pass allow_remote=True to confirm you trust the bucket."
+            )
+        warnings.warn(
+            f"Loading pickle from remote URL {filepath!r}; pickle.load "
+            "will execute arbitrary code embedded in the file. Trust "
+            "the bucket and its credentials before continuing.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    local_path, is_temp = ensure_local_file(
+        filepath,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        region_name=region_name,
+    )
+
+    try:
+        with open(local_path, "rb") as f:
+            obj = pickle.load(f)
+    finally:
+        if is_temp:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+    if not isinstance(obj, _SUPPORTED):
+        supported_names = ", ".join(t.__name__ for t in _SUPPORTED)
+        raise ValueError(
+            f"Pickle file does not contain a spikelab data object "
+            f"({supported_names}); found {type(obj).__name__}"
+        )
     return obj
 
 
@@ -1354,7 +1753,24 @@ def load_spikedata_from_ibl(
     # Infer session length from the largest spike time if not provided.
     if length_ms is None:
         max_t = max((t.max() for t in spike_trains if len(t) > 0), default=0.0)
-        length_ms = float(max_t) if max_t > 0 else 10_000.0
+        if max_t > 0:
+            length_ms = float(max_t)
+        else:
+            # All surviving units returned zero spikes for this probe.
+            # The previous fabricated 10 000 ms default silently produced
+            # a SpikeData whose downstream rate normalisation
+            # (``rates()``) and binning (``raster(bin_size_ms)``) were
+            # based on the magic duration. Refuse instead and force the
+            # caller to supply ``length_ms`` explicitly, so the time
+            # axis used downstream is provenance-traceable.
+            raise ValueError(
+                f"IBL probe {pid!r} returned zero spikes for every "
+                "surviving unit, so the session length cannot be "
+                "inferred from spike times. Pass an explicit "
+                "``length_ms`` argument to load_spikedata_from_ibl "
+                "(typically the session duration from the IBL "
+                "trials table)."
+            )
 
     # Load trials and extract relevant fields as numpy arrays (seconds → ms).
     trials = one.load_object(eid, "trials")

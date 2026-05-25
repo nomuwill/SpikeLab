@@ -236,9 +236,9 @@ def load_recording(
     """Load a recording, apply optional truncation and coordinate transforms.
 
     Public entry point. Returns just the loaded recording so existing
-    callers (``trace_io.save_traces``, downstream tooling) remain
-    unaffected. Backends that need the effective chunk list and the
-    per-file recording names should call
+    callers (the rt_sort ``save_traces`` chain, downstream tooling)
+    remain unaffected. Backends that need the effective chunk list
+    and the per-file recording names should call
     :func:`_load_recording_with_state` directly to receive the full
     :class:`LoadRecordingResult`.
 
@@ -411,62 +411,9 @@ def load_single_recording(
     if isinstance(rec_path, BaseRecording):
         rec = rec_path
     elif str(rec_path).endswith(".h5"):
-        maxwell_kwargs = {}
-        if rec_cfg.stream_id is not None:
-            maxwell_kwargs["stream_id"] = rec_cfg.stream_id
-        used_native_fallback = False
-        try:
-            rec = MaxwellRecordingExtractor(rec_path, **maxwell_kwargs)
-        except ValueError as exc:
-            # neo's MaxwellRawIO rejects mxw v25.x files whose
-            # settings/mapping table has duplicate channel IDs.  Fall
-            # back to the native loader, which dedupes and bypasses neo
-            # entirely.  Any other ValueError is re-raised.
-            if "do not have unique ids" not in str(exc):
-                raise
-            from .maxwell_io import load_maxwell_native
+        from .maxwell_io import load_maxwell_with_fallback
 
-            print(
-                "MaxwellRecordingExtractor rejected the file (non-unique "
-                "channel IDs in settings/mapping); falling back to "
-                "spikelab.spike_sorting.maxwell_io.load_maxwell_native()."
-            )
-            well_id = maxwell_kwargs.get("stream_id", "well000")
-            rec = load_maxwell_native(rec_path, well_id=well_id)
-            used_native_fallback = True
-
-        if not used_native_fallback:
-            # The HDF5-plugin probe and routed-channel reconciliation
-            # below are specific to the MaxwellRecordingExtractor path.
-            # The native loader already opened the file with h5py
-            # (which would have errored out without the plugin) and
-            # only returns the routed channels.
-            test_file = h5py.File(rec_path)
-            if "sig" not in test_file:  # Test if hdf5_plugin_path is needed
-                try:
-                    test_file["/data_store/data0000/groups/routed/raw"][0, 0]
-                except OSError as exception:
-                    test_file.close()
-                    print("*" * 10)
-                    print("""This MaxWell Biosystems file format is based on HDF5.
-The internal compression requires a custom plugin.
-Please visit this page and install the missing decompression libraries:
-https://share.mxwbio.com/d/4742248b2e674a85be97/
-
-Setup options (choose one):
-    1. Pass hdf5_plugin_path='/path/to/plugin/' to sort_with_kilosort2().
-    2. Set os.environ['HDF5_PLUGIN_PATH'] BEFORE importing this module.
-    3. Follow the Maxwell instructions at the link above.
-""")
-                    print("*" * 10)
-                    raise (exception)
-            test_file.close()
-            # Reconcile declared vs. routed channels. MaxOne recordings report
-            # 1024 readout channels but get_traces() returns the full 1024-wide
-            # array regardless of routing; slicing by the extractor's own
-            # channel_ids forces the width to match get_num_channels(). No-op
-            # when all channels are routed (MaxTwo).
-            rec = rec.select_channels(rec.get_channel_ids())
+        rec = load_maxwell_with_fallback(rec_path, stream_id=rec_cfg.stream_id)
     elif str(rec_path).endswith(".nwb"):
         rec = NwbRecordingExtractor(rec_path)
     else:

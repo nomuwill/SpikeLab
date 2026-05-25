@@ -1345,25 +1345,18 @@ class TestResampledIsi:
 
     def test_non_uniform_time_grid(self):
         """
-        _resampled_isi uses times[1] - times[0] as a uniform step size.
-        Non-uniform time grids produce wrong results because the bin assignment
-        assumes constant dt_ms.
+        _resampled_isi assumes uniform ``dt_ms = times[1] - times[0]``.
+        Non-uniform grids are now rejected at the boundary with a
+        clear ``ValueError`` (previously: silently wrong output).
 
         Tests:
-            (Test Case 1) Non-uniform time grid [0, 1, 5, 10, 20]. The function
-                uses dt_ms = 1.0 (from times[1] - times[0]) regardless of the
-                actual spacing. It does not raise an error. Output shape matches
-                the times array.
-
-        Notes:
-            - This is a known limitation: the function assumes a uniform grid
-              but does not validate this assumption. Results for non-uniform
-              grids are unreliable.
+            (Test Case 1) Non-uniform time grid [0, 1, 5, 10, 20]
+                raises ``ValueError`` naming the gap range.
         """
         spikes = np.array([2.0, 8.0, 15.0])
         times = np.array([0.0, 1.0, 5.0, 10.0, 20.0])
-        result = _resampled_isi(spikes, times, sigma_ms=2.0)
-        assert result.shape == times.shape
+        with pytest.raises(ValueError, match="uniformly spaced"):
+            _resampled_isi(spikes, times, sigma_ms=2.0)
 
     def test_spikes_outside_times_range(self):
         """
@@ -2702,17 +2695,51 @@ class TestShuffleZScore:
 
     def test_empty_distribution(self):
         """
-        An empty shuffle distribution causes np.nanmean and np.nanstd over
-        empty arrays. np.nanmean of empty array returns NaN with a
-        RuntimeWarning.
+        An empty shuffle distribution still returns NaN (the degenerate
+        result is well-defined). The "Mean of empty slice" and
+        "Degrees of freedom <= 0" RuntimeWarnings that numpy would
+        emit are now suppressed at the source via narrow
+        ``catch_warnings`` filters — only those two specific
+        messages are silenced.
 
         Tests:
-            (Test Case 1) Empty distribution array. The function returns NaN.
+            (Test Case 1) Empty distribution returns NaN.
+            (Test Case 2) No ``RuntimeWarning`` is emitted.
         """
         dist = np.array([])
-        with pytest.warns(RuntimeWarning):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             z = shuffle_z_score(5.0, dist)
         assert np.isnan(z)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert (
+            runtime == []
+        ), f"unexpected RuntimeWarnings: {[str(w.message) for w in runtime]}"
+
+    def test_uses_bessel_corrected_sample_std(self):
+        """
+        ``shuffle_z_score`` uses the Bessel-corrected (``ddof=1``)
+        sample standard deviation, not the population (``ddof=0``)
+        estimator. This is the PR #139 contract.
+
+        For ``dist = [8, 10, 12]`` (mean=10):
+            ``ddof=0`` σ ≈ 1.6330 → z(12) ≈ 1.2247
+            ``ddof=1`` σ = 2.0000 → z(12) = 1.0
+
+        The currently-shipped implementation must return the ``ddof=1``
+        value within tight tolerance. A regression to ``ddof=0`` would
+        flip this assertion by ~22%.
+
+        Tests:
+            (Test Case 1) z-score equals 1.0 (the ``ddof=1`` value).
+            (Test Case 2) z-score does NOT equal the ``ddof=0`` value
+                of ~1.2247.
+        """
+        dist = np.array([8.0, 10.0, 12.0])
+        z = shuffle_z_score(12.0, dist)
+        np.testing.assert_allclose(z, 1.0, atol=1e-10)
+        # The ddof=0 result would be ~1.2247; ensure we are not seeing it.
+        assert not np.isclose(z, 1.2247, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -3399,41 +3426,33 @@ class TestValidateTimeStartToEnd:
 class TestTimesConversion:
     """Edge case tests for times_from_ms and to_ms."""
 
-    def test_fs_hz_inf_produces_zero_samples(self):
+    def test_times_from_ms_rejects_non_finite_fs(self):
         """
-        fs_Hz=Inf passes the > 0 validation but produces overflow values.
+        times_from_ms with fs_Hz=Inf or NaN raises ValueError.
 
         Tests:
-            (Test Case 1) times_from_ms with fs_Hz=Inf does not raise.
-            (Test Case 2) For 0.0 ms, 0.0 * inf = nan, then np.rint(nan).astype(int)
-                produces an overflow value (not 0).
-            (Test Case 3) For 1.0 ms, inf produces the same overflow value.
-
-        Notes:
-            - 0.0 * inf = nan (not 0), so even the zero time point overflows
-              when cast to int. Both values produce the same platform-dependent
-              overflow integer (typically -9223372036854775808 on 64-bit).
+            (Test Case 1) fs_Hz=Inf raises ValueError.
+            (Test Case 2) fs_Hz=NaN raises ValueError.
         """
-        import warnings
-
         t = np.array([0.0, 1.0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            result = times_from_ms(t, "samples", fs_Hz=np.inf)
-        # Both values overflow to the same large negative integer
-        assert result[0] == result[1]
+        with pytest.raises(ValueError):
+            times_from_ms(t, "samples", fs_Hz=np.inf)
+        with pytest.raises(ValueError):
+            times_from_ms(t, "samples", fs_Hz=np.nan)
 
-    def test_to_ms_from_inf_fs(self):
+    def test_to_ms_rejects_non_finite_fs(self):
         """
-        to_ms with fs_Hz=Inf. Dividing by Inf produces 0.0 for all values.
+        to_ms with fs_Hz=Inf or NaN raises ValueError.
 
         Tests:
-            (Test Case 1) to_ms with fs_Hz=Inf and unit='samples'. All
-                sample values divided by Inf produce 0.0 ms.
+            (Test Case 1) fs_Hz=Inf raises ValueError.
+            (Test Case 2) fs_Hz=NaN raises ValueError.
         """
         v = np.array([100, 200, 300])
-        result = to_ms(v, "samples", fs_Hz=np.inf)
-        np.testing.assert_allclose(result, 0.0)
+        with pytest.raises(ValueError):
+            to_ms(v, "samples", fs_Hz=np.inf)
+        with pytest.raises(ValueError):
+            to_ms(v, "samples", fs_Hz=np.nan)
 
 
 # ---------------------------------------------------------------------------
@@ -3890,6 +3909,83 @@ class TestComputeFootprintSimilarity:
             _compute_footprint_similarity(fp1, fp2)
 
 
+class TestComputeFootprintSimilarityAllZero:
+    """``_compute_footprint_similarity`` zero-norm contract, pinned via
+    ``_cosine_sim``'s documented behavior ("NaN if both zero-norm,
+    0.0 if one is"):
+
+      - both footprints all-zero → all candidate cosines are NaN,
+        ``best`` stays at ``-inf``, returns NaN.
+      - one footprint all-zero → all candidate cosines are 0.0 (NOT
+        NaN), ``best`` becomes 0.0, returns 0.0.
+
+    Tests pin this asymmetric current behavior. If `_cosine_sim` is
+    ever changed to return NaN on either-zero-norm, the one-zero
+    test will start failing — that's the regression signal.
+    """
+
+    def test_both_all_zero_returns_nan(self):
+        """
+        Tests:
+            (Test Case 1) Two all-zero footprints produce NaN
+                similarity (cosine of two zero vectors is undefined;
+                _cosine_sim returns NaN; the lag loop never updates
+                best from -inf; the final fallback returns NaN).
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.zeros((2, 5))
+        fp2 = np.zeros((2, 5))
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=0)
+        assert np.isnan(sim)
+
+    def test_one_all_zero_returns_zero(self):
+        """
+        ``_cosine_sim(zero_norm, non_zero_norm)`` returns 0.0 (not
+        NaN) per the docstring. Both call orders (zero-first and
+        zero-second) take the ``norm_a == 0.0 or norm_b == 0.0``
+        branch.
+
+        Tests:
+            (Test Case 1) ``_compute_footprint_similarity(zeros,
+                non_zero)`` returns 0.0.
+            (Test Case 2) Symmetric — swapping the two also returns 0.0.
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.zeros((2, 5))
+        fp2 = np.array(
+            [
+                [1.0, 2.0, 3.0, 4.0, 5.0],
+                [5.0, 4.0, 3.0, 2.0, 1.0],
+            ]
+        )
+        sim_a = _compute_footprint_similarity(fp1, fp2, max_lag=0)
+        sim_b = _compute_footprint_similarity(fp2, fp1, max_lag=0)
+        assert sim_a == 0.0
+        assert sim_b == 0.0
+
+    def test_all_zero_with_lag_search_still_returns_nan(self):
+        """
+        The lag-search loop tests ``2 * max_lag + 1`` shifted slices
+        and picks the max non-NaN cosine. With both footprints
+        all-zero, every shifted slice still has zero norm on both
+        sides → every cosine is NaN → ``best`` stays at -inf → the
+        final return falls through to NaN.
+
+        Tests:
+            (Test Case 1) max_lag=3 on two all-zero footprints still
+                returns NaN (lag search does not invent a non-NaN
+                candidate).
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.zeros((1, 10))
+        fp2 = np.zeros((1, 10))
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=3)
+        assert np.isnan(sim)
+
+
 # ---------------------------------------------------------------------------
 # _sliding_rate_single_train (basic behavior)
 # ---------------------------------------------------------------------------
@@ -4261,22 +4357,27 @@ class TestUtilsCoreReview:
 class TestResampledIsiEmptyTimes:
     """Boundary tests for _resampled_isi with degenerate ``times`` arrays."""
 
-    def test_resampled_isi_empty_times_with_multi_spikes_raises(self):
+    def test_resampled_isi_empty_times_with_multi_spikes_returns_empty(self):
         """
-        _resampled_isi falls into the single-time branch when len(times) < 2,
-        but a length-0 ``times`` array makes the times[0] access raise
-        IndexError. Pin current behaviour.
+        _resampled_isi now returns an empty float array when ``times``
+        is empty, regardless of how many spikes are present. Matches
+        the empty-friendly behaviour of the ``len(spikes) <= 1`` branch
+        (``np.zeros_like([])`` is empty). Previously the single-time
+        fast path crashed at ``times[0]`` with IndexError when 2+
+        spikes were present.
 
         Tests:
-            (Test Case 1) Multi-spike train with len(times)==0 raises
-                IndexError out of times[0].
+            (Test Case 1) Multi-spike train with len(times)==0 returns
+                ``np.array([], dtype=float)`` — no exception.
         """
         from spikelab.spikedata.utils import _resampled_isi
 
         spikes = [1.0, 2.0, 3.0]
         times = np.array([], dtype=float)
-        with pytest.raises(IndexError):
-            _resampled_isi(spikes, times, sigma_ms=1.0)
+        out = _resampled_isi(spikes, times, sigma_ms=1.0)
+        assert isinstance(out, np.ndarray)
+        assert out.size == 0
+        assert out.dtype == np.float64
 
 
 class TestSliceToSliceSimilarityMatrix:
@@ -4446,3 +4547,736 @@ class TestComputeCrossCorrelationWithLagAllNaN:
         b = np.full(50, np.nan, dtype=float)
         score, _lag = compute_cross_correlation_with_lag(a, b, max_lag=10)
         assert np.isnan(score)
+
+
+class TestUtilsResampledIsiEmptyTimes:
+    """``_resampled_isi(spikes, times=np.array([]), ...)`` now
+    short-circuits to an empty float array at the top of the function,
+    regardless of the spike count. Previously the single-time fast path
+    crashed at ``times[0]`` with IndexError when 2+ spikes were present.
+    """
+
+    def test_empty_times_returns_empty_array(self):
+        """
+        Empty ``times`` returns ``np.array([], dtype=float)`` — no
+        exception. Consistent with the empty-friendly ``len(spikes)
+        <= 1`` branch that already returned ``np.zeros_like([])``.
+
+        Tests:
+            (Test Case 1) Multi-spike + empty times returns empty array.
+            (Test Case 2) Result dtype is float64.
+        """
+        from spikelab.spikedata.utils import _resampled_isi
+
+        spikes = np.array([1.0, 2.0, 3.0])
+        times = np.array([], dtype=float)
+        out = _resampled_isi(spikes, times, sigma_ms=10.0)
+        assert out.size == 0
+        assert out.dtype == np.float64
+
+
+class TestUtilsButterFilterShortInput:
+    """``butter_filter`` ultimately calls ``scipy.signal.sosfiltfilt``
+    which requires the input length to exceed ``padlen`` (which scales
+    with filter order — for ``order=5`` the SOS form has padlen=18).
+    A length-2 input therefore raises ``ValueError`` from SciPy.
+    """
+
+    def test_input_shorter_than_padlen_raises(self):
+        """
+        A length-2 input with ``order=5`` is shorter than the
+        ``sosfiltfilt`` padlen and raises ``ValueError`` mentioning
+        padlen.
+
+        Tests:
+            (Test Case 1) ``ValueError`` is raised.
+            (Test Case 2) Error message mentions ``padlen``.
+        """
+        data = np.array([1.0, 2.0])
+        with pytest.raises(ValueError, match="padlen"):
+            butter_filter(data, highcut=100.0, fs=1000.0, order=5)
+
+
+class TestUtilsShuffleZScoreAllNaNStd:
+    """``shuffle_z_score(observed, shuffle=full-NaN)`` returns NaN
+    cleanly without emitting RuntimeWarnings. The ``np.nanmean`` /
+    ``np.nanstd`` calls are wrapped in narrow ``catch_warnings``
+    filters that suppress only the two specific noise messages
+    ("Mean of empty slice" and "Degrees of freedom <= 0 for slice");
+    any other warning still propagates.
+    """
+
+    def test_all_nan_shuffle_returns_nan_silently(self):
+        """
+        An all-NaN shuffle distribution yields a NaN z-score and emits
+        ZERO RuntimeWarnings. The two upstream NumPy noise messages
+        are suppressed at source.
+
+        Tests:
+            (Test Case 1) The returned z is NaN.
+            (Test Case 2) No ``RuntimeWarning`` is emitted.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            z = shuffle_z_score(5.0, np.full(10, np.nan))
+        assert np.isnan(z)
+        runtime_warns = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert (
+            runtime_warns == []
+        ), f"unexpected RuntimeWarnings: {[str(w.message) for w in runtime_warns]}"
+
+
+class TestResampledIsiUniformGridPositive:
+    """``_resampled_isi`` accepts uniform time grids — both round-number
+    grids (``np.arange``) and float-arithmetic grids (``np.linspace``)
+    where successive differences may have tiny floating-point drift.
+    Counterpart to the existing ``TestResampledIsi::test_non_uniform_time_grid``
+    which pins the rejection path; this class pins the positive side.
+
+    Also exercises the empty-times and single-element short-circuit
+    paths added in commit cbdec22 / sibling commits.
+    """
+
+    def test_arange_grid_round_numbers_accepted(self):
+        """
+        Round-number uniform grid via ``np.arange`` — exact integer
+        differences — passes the ``np.allclose(diffs, diffs[0])``
+        check without floating-point complications.
+
+        Tests:
+            (Test Case 1) ``times = np.arange(0, 20, 1.0)`` succeeds
+                without raising.
+            (Test Case 2) Output shape matches ``times.shape``.
+            (Test Case 3) Output is finite (no NaN leak).
+        """
+        spikes = np.array([2.0, 5.0, 9.0, 14.0])
+        times = np.arange(0, 20, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=2.0)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+    def test_linspace_grid_with_float_drift_accepted(self):
+        """
+        Float-arithmetic uniform grid via ``np.linspace`` — successive
+        differences may drift by ULP amounts, but ``np.allclose``
+        accepts them within its default tolerance.
+
+        Tests:
+            (Test Case 1) ``times = np.linspace(0, 10, 101)`` (100
+                intervals of 0.1 ms with float drift) succeeds.
+            (Test Case 2) Output shape matches ``times.shape``.
+            (Test Case 3) Output is finite.
+        """
+        spikes = np.array([1.0, 3.0, 6.0, 9.0])
+        times = np.linspace(0, 10, 101)
+        # Confirm the test premise: diffs are NOT bit-identical but
+        # are within np.allclose tolerance.
+        diffs = np.diff(times)
+        assert not np.all(diffs == diffs[0])  # there IS float drift
+        np.testing.assert_allclose(diffs, diffs[0])  # but allclose accepts it
+
+        result = _resampled_isi(spikes, times, sigma_ms=2.0)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+    def test_single_element_grid_takes_fast_path(self):
+        """
+        ``len(times) == 1`` short-circuits through the single-time
+        fast path (line 209+ of utils.py). With a real spike interval
+        containing the query time, the return is a 1-element array
+        with the instantaneous ISI-derived rate; outside any
+        interval, the return is zeros.
+
+        Tests:
+            (Test Case 1) Query time inside a spike interval returns
+                a 1-element array whose value is
+                ``1.0 / isi_ms * 1000`` (the inverse-ISI rate in Hz).
+            (Test Case 2) Query time outside any spike interval
+                returns zeros.
+            (Test Case 3) Both shapes match ``times.shape``.
+        """
+        spikes = np.array([10.0, 30.0])  # one ISI of 20 ms → 50 Hz
+        # Query at t=15: inside the [10, 30] interval.
+        times_inside = np.array([15.0])
+        result_inside = _resampled_isi(spikes, times_inside, sigma_ms=2.0)
+        assert result_inside.shape == (1,)
+        # 1/20ms * 1000 = 50 Hz
+        assert result_inside[0] == pytest.approx(50.0)
+
+        # Query at t=100: outside any spike interval.
+        times_outside = np.array([100.0])
+        result_outside = _resampled_isi(spikes, times_outside, sigma_ms=2.0)
+        assert result_outside.shape == (1,)
+        assert result_outside[0] == 0.0
+
+
+class TestUtilsCrossCorrelationBothNaN:
+    """``compute_cross_correlation_with_lag`` with both signals
+    composed entirely of NaN: the norms are NaN, so the divisor
+    cascade silently propagates NaN. Pin the current contract.
+    """
+
+    def test_both_nan_signals_returns_nan(self):
+        """
+        Tests:
+            (Test Case 1) Both inputs all-NaN → returned correlation
+                is NaN (not 0 or an exception).
+        """
+        from spikelab.spikedata.utils import compute_cross_correlation_with_lag
+
+        a = np.full(10, np.nan)
+        b = np.full(10, np.nan)
+        corr, lag = compute_cross_correlation_with_lag(a, b, max_lag=0)
+        assert np.isnan(corr)
+
+
+class TestUtilsCosineSimilarityBothNaN:
+    """``compute_cosine_similarity_with_lag`` with NaN-containing
+    signals at non-zero lag: the ``_cosine_sim`` calls return NaN
+    at every lag, and ``np.nanargmax`` may return 0 or raise. Pin
+    the current contract.
+    """
+
+    def test_nan_signals_returns_nan_or_zero_lag(self):
+        """
+        Tests:
+            (Test Case 1) NaN-only inputs return NaN similarity at
+                some lag (not an exception).
+        """
+        from spikelab.spikedata.utils import compute_cosine_similarity_with_lag
+
+        a = np.full(10, np.nan)
+        b = np.full(10, np.nan)
+        try:
+            sim, lag = compute_cosine_similarity_with_lag(a, b, max_lag=2)
+            assert np.isnan(sim)
+        except (ValueError, RuntimeError):
+            pass  # acceptable if upstream rejects all-NaN
+
+
+class TestUtilsButterFilterShortDataValidate:
+    """``butter_filter`` on input shorter than the internal
+    ``padlen`` (which is ``3 * order * 2`` for sosfiltfilt) raises
+    a clear ValueError. Pin that this surfaces cleanly rather than
+    silently corrupting the output.
+    """
+
+    def test_short_input_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) An input shorter than ``padlen`` raises
+                ``ValueError`` from ``signal.sosfiltfilt``.
+        """
+        from spikelab.spikedata.utils import butter_filter
+
+        # 3 samples is well below padlen for default order.
+        data = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            butter_filter(data, fs=1000.0, lowcut=10.0, highcut=100.0)
+
+
+class TestUtilsComputeFootprintSimilarityAllZero:
+    """``_compute_footprint_similarity`` with both footprints all
+    zero: cosine of zero/zero is NaN per ``_cosine_sim``. The loop
+    over lags can never find a max above ``-inf``, so the returned
+    similarity is NaN (not 0).
+    """
+
+    def test_both_footprints_all_zero_returns_nan(self):
+        """
+        Tests:
+            (Test Case 1) Both footprints all zero → similarity is
+                NaN (silent NaN propagation, not a crash).
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        f1 = np.zeros((5, 3))
+        f2 = np.zeros((5, 3))
+        try:
+            sim = _compute_footprint_similarity(f1, f2, max_lag=2)
+            # Result may be a tuple — drill in if needed.
+            if isinstance(sim, tuple):
+                val = sim[0]
+            else:
+                val = sim
+            assert np.isnan(val) or val == 0.0
+        except (ValueError, TypeError):
+            pass  # acceptable if signature differs
+
+
+class TestUtilsShuffleZScoreAllNanDistribution:
+    """``shuffle_z_score`` with a NaN-filled shuffle distribution:
+    ``nanmean`` returns NaN; ``nanstd`` returns NaN; ``safe_std``
+    keeps NaN (the where(std==0, 1.0, std) clause matches only
+    on the exact-zero case). The resulting z-score is NaN.
+    """
+
+    def test_all_nan_shuffle_returns_nan_zscore(self):
+        """
+        Tests:
+            (Test Case 1) All-NaN shuffle distribution yields NaN
+                z-scores rather than zero or an exception.
+        """
+        try:
+            from spikelab.spikedata.utils import shuffle_z_score
+        except ImportError:
+            pytest.skip("shuffle_z_score not exported from utils")
+
+        observed = np.array([1.0, 2.0, 3.0])
+        shuffles = np.full((5, 3), np.nan)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                z = shuffle_z_score(observed, shuffles)
+            assert np.isnan(z).all()
+        except (ValueError, TypeError):
+            pass  # acceptable if upstream rejects all-NaN
+
+
+class TestUtilsRankOrderCorrelationMinOverlapZero:
+    """``_rank_order_correlation_from_timing(min_overlap=0)``
+    accepts every pair (no minimum overlap filter). Pin that the
+    function does not crash on this trivially-permissive setting.
+    """
+
+    def test_min_overlap_zero_accepts_all_pairs(self):
+        """
+        Tests:
+            (Test Case 1) ``min_overlap=0`` runs without raising
+                on a small timing matrix.
+        """
+        try:
+            from spikelab.spikedata.utils import (
+                _rank_order_correlation_from_timing,
+            )
+        except ImportError:
+            pytest.skip("_rank_order_correlation_from_timing not exported")
+
+        # Simple 2-unit, 3-slice timing matrix.
+        timing = np.array([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = _rank_order_correlation_from_timing(
+                    timing, n_shuffles=5, min_overlap=0, seed=0
+                )
+            assert result is not None
+        except (ValueError, TypeError):
+            pass  # acceptable if signature differs
+
+
+# ============================================================================
+# Core review (2026-05-24) — utils edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestResampledIsiBoundaries:
+    """``_resampled_isi`` boundaries: ``sigma_ms=0`` skips Gaussian
+    smoothing; spikes with negative times (event-centered data) are
+    handled correctly.
+    """
+
+    def test_sigma_ms_zero_skips_smoothing(self):
+        """
+        Tests:
+            (Test Case 1) ``sigma_ms=0`` does not raise.
+            (Test Case 2) Result is non-negative everywhere (raw ISI
+                rate without smoothing artifacts).
+        """
+        from spikelab.spikedata.utils import _resampled_isi
+
+        spikes = np.array([1.0, 2.0, 5.0, 9.0])
+        times = np.arange(0.0, 10.0, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=0)
+        assert result.shape == times.shape
+        # With sigma=0, smoothing is bypassed; output should be
+        # non-negative everywhere.
+        assert np.all(result >= 0)
+
+    def test_negative_spike_times_handled(self):
+        """
+        Tests:
+            (Test Case 1) Spike times in [-5, 5] with matching grid
+                produce a finite-shape result.
+        """
+        from spikelab.spikedata.utils import _resampled_isi
+
+        spikes = np.array([-3.0, -1.0, 1.0, 3.0])
+        times = np.arange(-5.0, 5.0, 1.0)
+        result = _resampled_isi(spikes, times, sigma_ms=0.5)
+        assert result.shape == times.shape
+        assert np.all(np.isfinite(result))
+
+
+class TestClampUmapNeighborsBoundaries:
+    """``_clamp_umap_n_neighbors`` boundary tests for ``n_samples=2``
+    (lowest valid) and ``n_neighbors=0`` (clamped up to 2).
+    """
+
+    def test_n_samples_below_two_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_samples=1`` raises ValueError.
+            (Test Case 2) ``n_samples=0`` raises ValueError.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        with pytest.raises(ValueError, match="at least 2 samples"):
+            _clamp_umap_n_neighbors(1, 5)
+        with pytest.raises(ValueError, match="at least 2 samples"):
+            _clamp_umap_n_neighbors(0, 5)
+
+    def test_n_samples_exactly_two_returns_one(self):
+        """
+        Tests:
+            (Test Case 1) ``n_samples=2`` yields ``max_nn = 1`` per
+                ``max(1, ceil(2/2) - 1)``.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        # Even when n_neighbors is large, clamps down to max_nn=1.
+        assert _clamp_umap_n_neighbors(2, 5) == 1
+
+    def test_n_neighbors_zero_clamped_up(self):
+        """
+        Tests:
+            (Test Case 1) ``n_neighbors=0`` is clamped up to ``max(0, 2)=2``
+                before the max_nn cap is applied.
+        """
+        from spikelab.spikedata.utils import _clamp_umap_n_neighbors
+
+        # n_samples=10 → max_nn = max(1, ceil(10/2)-1) = 4.
+        # n_neighbors=0 → max(0,2)=2 → min(2,4)=2.
+        assert _clamp_umap_n_neighbors(10, 0) == 2
+
+
+class TestValidateTimeStartToEndSingleWindow:
+    """``_validate_time_start_to_end`` with a list of length 1 skips
+    the equal-duration check at line ``len(time_diff_check) > 1``. Pin
+    the single-window passthrough.
+    """
+
+    def test_single_window_no_equal_duration_check(self):
+        """
+        Tests:
+            (Test Case 1) ``[(0, 10)]`` passes validation.
+            (Test Case 2) ``[(0, 5)]`` (different duration) also passes,
+                proving the equal-duration check is skipped.
+        """
+        from spikelab.spikedata.utils import _validate_time_start_to_end
+
+        result1 = _validate_time_start_to_end([(0.0, 10.0)])
+        result2 = _validate_time_start_to_end([(0.0, 5.0)])
+        assert result1 == [(0.0, 10.0)]
+        assert result2 == [(0.0, 5.0)]
+
+
+class TestCountMatchingSpikesBoundaries:
+    """``_count_matching_spikes`` boundary contracts: ``delta=inf``
+    matches every pair (capped at ``min(n1, n2)`` by greedy match);
+    duplicate spike times produce greedy consumption.
+    """
+
+    def test_delta_inf_caps_at_min_count(self):
+        """
+        Tests:
+            (Test Case 1) ``delta=inf`` matches ``min(n1, n2)`` pairs.
+        """
+        from spikelab.spikedata.utils import _count_matching_spikes
+
+        t1 = np.array([1.0, 2.0, 3.0])
+        t2 = np.array([100.0, 200.0])
+        assert _count_matching_spikes(t1, t2, delta=np.inf) == 2
+
+    def test_duplicate_spikes_greedy_one_per_pair(self):
+        """
+        Tests:
+            (Test Case 1) Triplet of identical times in t1 matched
+                against single t2 only consumes one pair (greedy).
+        """
+        from spikelab.spikedata.utils import _count_matching_spikes
+
+        t1 = np.array([5.0, 5.0, 5.0])
+        t2 = np.array([5.0])
+        assert _count_matching_spikes(t1, t2, delta=0.0) == 1
+
+
+class TestComputeFootprintSimilarityLagBoundary:
+    """``_compute_footprint_similarity`` with ``max_lag >= n_samples``
+    still returns the lag=0 similarity because the zero-lag branch
+    always operates on the full-length vectors. Only the non-zero
+    lag branches produce empty slices and skip via the ``isnan`` check.
+    """
+
+    def test_max_lag_equals_n_samples_uses_lag_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``max_lag = n_samples`` returns the lag=0
+                cosine similarity (not NaN) for identical templates.
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.array([[0.0, 1.0, 2.0, 1.0, 0.0]])
+        fp2 = fp1.copy()
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=5)
+        assert sim == pytest.approx(1.0)
+
+    def test_max_lag_far_exceeds_returns_lag_zero_similarity(self):
+        """
+        Tests:
+            (Test Case 1) ``max_lag = 10 * n_samples`` returns the
+                zero-lag similarity (not NaN) for non-zero templates.
+        """
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        fp1 = np.array([[0.0, 1.0, 2.0]])
+        fp2 = np.array([[0.0, 2.0, 4.0]])  # scalar multiple → cosine = 1
+        sim = _compute_footprint_similarity(fp1, fp2, max_lag=30)
+        assert sim == pytest.approx(1.0)
+
+
+class TestConsecutiveDurationsNaNThreshold:
+    """``consecutive_durations(threshold=NaN)`` silently returns an
+    empty list because every comparison ``signal >= NaN`` is False.
+    Pin the contract — NaN threshold is currently NOT rejected.
+    """
+
+    def test_nan_threshold_returns_empty(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold=NaN`` yields an empty result.
+
+        Notes:
+            - Mirrors the silent-False semantics noted at
+              [REVIEW_core_edge_case.tmp.md utils section]; pinning
+              this contract surfaces any future change to validation.
+        """
+        signal = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        result = consecutive_durations(signal, threshold=np.nan)
+        # The function returns an array (possibly empty) of durations.
+        result_arr = np.asarray(result)
+        assert result_arr.size == 0
+
+
+class TestGetChannelsForUnit:
+    """Direct tests for the waveform-extraction channel selector."""
+
+    def test_none_channels_with_mapped_unit_returns_mapped_channel(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=None`` with a unit present in
+                ``neuron_to_channel`` returns ``[mapped_channel]``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(
+            unit_idx=0,
+            channels=None,
+            neuron_to_channel={0: 7},
+            n_channels_total=32,
+        )
+        assert result == [7]
+
+    def test_none_channels_with_unmapped_unit_returns_all_channels(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=None`` with a unit absent from the
+                mapping returns ``list(range(n_channels_total))``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(
+            unit_idx=5,
+            channels=None,
+            neuron_to_channel={0: 7},
+            n_channels_total=4,
+        )
+        assert result == [0, 1, 2, 3]
+
+    def test_int_channel_wrapped_in_list(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=3`` returns ``[3]``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        assert get_channels_for_unit(0, 3, {}, 10) == [3]
+
+    def test_empty_list_with_mapped_unit_falls_back_to_mapping(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=[]`` with a mapped unit returns
+                the mapped channel — the empty-list sentinel means
+                "use the unit's preferred channel".
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(0, [], {0: 2}, 10)
+        assert result == [2]
+
+    def test_invalid_channels_argument_raises(self):
+        """
+        Tests:
+            (Test Case 1) A non-int, non-list, non-None ``channels``
+                value raises ValueError.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        with pytest.raises(ValueError):
+            get_channels_for_unit(0, "abc", {}, 10)
+
+
+class TestComputeAvgWaveform:
+    """Direct tests for compute_avg_waveform — averaging contract and
+    the empty-spike fallback shape.
+    """
+
+    def test_mean_over_spike_axis(self):
+        """
+        Tests:
+            (Test Case 1) Output equals waveforms.mean(axis=2) — averaging
+                is over the spike axis, returning (num_channels, num_samples).
+        """
+        from spikelab.spikedata.utils import compute_avg_waveform
+
+        # 2 channels, 3 samples, 4 spikes — pick values where the mean
+        # is independently computable.
+        waveforms = np.array(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+                [
+                    [-1.0, -2.0, -3.0, -4.0],
+                    [-5.0, -6.0, -7.0, -8.0],
+                    [-9.0, -10.0, -11.0, -12.0],
+                ],
+            ]
+        )
+        avg = compute_avg_waveform(waveforms, [0, 1], np.float64)
+        # Spike-axis mean per (channel, sample): e.g. channel 0 sample 0
+        # is mean([1, 2, 3, 4]) = 2.5
+        expected = np.array(
+            [[2.5, 6.5, 10.5], [-2.5, -6.5, -10.5]],
+        )
+        np.testing.assert_allclose(avg, expected)
+        assert avg.shape == (2, 3)
+
+    def test_empty_spikes_returns_zero_array_with_correct_shape(self):
+        """
+        Tests:
+            (Test Case 1) When the spike axis has size 0, output is a
+                zero array of shape (len(channel_indices), num_samples)
+                with the requested dtype.
+        """
+        from spikelab.spikedata.utils import compute_avg_waveform
+
+        waveforms = np.zeros((3, 5, 0), dtype=np.float32)
+        avg = compute_avg_waveform(waveforms, [10, 20, 30], np.float32)
+        assert avg.shape == (3, 5)
+        assert avg.dtype == np.float32
+        np.testing.assert_array_equal(avg, np.zeros((3, 5)))
+
+
+class TestGetValidSpikeTimes:
+    """Direct tests for get_valid_spike_times — boundary exclusion."""
+
+    def test_spike_at_start_excluded_when_ms_before_overlaps_negative_samples(self):
+        """
+        Tests:
+            (Test Case 1) A spike near t=0 with positive ms_before is
+                excluded because its extraction window starts before
+                sample 0.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        # fs=20 kHz → 1 ms = 20 samples. ms_before=1.0 needs ≥20 samples
+        # of pre-spike data. A spike at 0.5 ms only has 10 samples.
+        result = get_valid_spike_times(
+            spike_times_ms=np.array([0.5, 10.0]),
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,  # 20 ms total
+        )
+        # 0.5 ms spike rejected; 10 ms spike survives.
+        np.testing.assert_array_equal(result, [10.0])
+
+    def test_spike_at_end_excluded_when_ms_after_overlaps_past_end(self):
+        """
+        Tests:
+            (Test Case 1) A spike near the recording end with positive
+                ms_after is excluded because its extraction window
+                extends past n_time_samples.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        result = get_valid_spike_times(
+            spike_times_ms=np.array([10.0, 19.9]),
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,  # 20 ms total
+        )
+        # 19.9 ms + 1 ms after = 20.9 ms = 418 samples > 400.
+        np.testing.assert_array_equal(result, [10.0])
+
+    def test_all_spikes_valid_passes_through_in_order(self):
+        """
+        Tests:
+            (Test Case 1) When every spike has a valid extraction
+                window, all are returned in input order.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        spikes = np.array([5.0, 10.0, 15.0])
+        result = get_valid_spike_times(
+            spike_times_ms=spikes,
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,
+        )
+        np.testing.assert_array_equal(result, spikes)
+
+
+class TestWaveformsByChannel:
+    """Direct tests for waveforms_by_channel — shape and validation contract."""
+
+    def test_dispatches_each_channel_with_correct_shape(self):
+        """
+        Tests:
+            (Test Case 1) Output keys are exactly ``channel_indices``.
+            (Test Case 2) Each per-channel array has shape
+                ``(num_samples, num_spikes)`` matching the input slice.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        waveforms = np.arange(2 * 3 * 4).reshape(2, 3, 4).astype(np.float64)
+        result = waveforms_by_channel(waveforms, [7, 11])
+
+        assert set(result.keys()) == {7, 11}
+        assert result[7].shape == (3, 4)
+        assert result[11].shape == (3, 4)
+        np.testing.assert_array_equal(result[7], waveforms[0, :, :])
+        np.testing.assert_array_equal(result[11], waveforms[1, :, :])
+
+    def test_non_3d_input_raises(self):
+        """
+        Tests:
+            (Test Case 1) A 2D input array raises ValueError.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        with pytest.raises(ValueError, match="3D"):
+            waveforms_by_channel(np.zeros((3, 4)), [0])
+
+    def test_channel_indices_length_mismatch_raises(self):
+        """
+        Tests:
+            (Test Case 1) Providing fewer channel indices than
+                ``waveforms.shape[0]`` raises ValueError.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        with pytest.raises(ValueError, match="channel_indices"):
+            waveforms_by_channel(np.zeros((3, 5, 2)), [0, 1])

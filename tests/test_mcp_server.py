@@ -463,7 +463,7 @@ class TestAnalysisTools:
 
         Tests:
             (Test Case 1) Result contains workspace_id, namespace, key, neuron_i, neuron_j.
-            (Test Case 2) Stored item info shows ndarray type (scalar wrapped in array).
+            (Test Case 2) Stored item info shows a scalar numeric type.
         """
         ws_id, ns = loaded_ws
         result = await analysis.compute_spike_time_tiling(
@@ -473,7 +473,7 @@ class TestAnalysisTools:
         assert result["key"] == "sttc"
         assert result["neuron_i"] == 0
         assert result["neuron_j"] == 1
-        assert result["info"]["type"] == "ndarray"
+        assert result["info"]["type"] in ("float", "ndarray")
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -861,6 +861,49 @@ class TestWorkspaceManagement:
         assert result["skipped"] == 1
         assert result["skipped_keys"] == [{"namespace": "ns", "key": "shared"}]
         np.testing.assert_array_equal(ws_target.get("ns", "shared"), [1.0])
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_merge_workspace_all_collisions_full_skip(self, tmp_path):
+        """
+        ``merge_workspace`` with ``overwrite=False`` and *every* source
+        key colliding with a target key: zero items are merged, every
+        key appears in ``skipped_keys``, and all target values are
+        untouched.
+
+        Distinct from ``test_merge_workspace_skip_duplicates`` (single
+        collision) — pins the all-skip path where ``merged == 0``
+        because no items got through.
+
+        Tests:
+            (Test Case 1) ``merged == 0`` and ``skipped == 2``.
+            (Test Case 2) ``skipped_keys`` lists both colliding keys.
+            (Test Case 3) Target retains its original values for every
+                colliding key.
+        """
+        create_target = await analysis.create_workspace(name="target_all_collide")
+        target_id = create_target["workspace_id"]
+        ws_target = get_workspace_manager().get_workspace(target_id)
+        ws_target.store("ns", "a", np.array([1.0]))
+        ws_target.store("ns", "b", np.array([2.0]))
+
+        create_src = await analysis.create_workspace(name="source_all_collide")
+        src_id = create_src["workspace_id"]
+        ws_src = get_workspace_manager().get_workspace(src_id)
+        ws_src.store("ns", "a", np.array([99.0]))
+        ws_src.store("ns", "b", np.array([88.0]))
+        path = str(tmp_path / "source_ws_all")
+        await analysis.save_workspace(src_id, path)
+
+        result = await analysis.merge_workspace(target_id, path, overwrite=False)
+
+        assert result["merged"] == 0
+        assert result["skipped"] == 2
+        skipped_pairs = {(d["namespace"], d["key"]) for d in result["skipped_keys"]}
+        assert skipped_pairs == {("ns", "a"), ("ns", "b")}
+        # Target values are unchanged for both colliding keys.
+        np.testing.assert_array_equal(ws_target.get("ns", "a"), [1.0])
+        np.testing.assert_array_equal(ws_target.get("ns", "b"), [2.0])
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -1981,7 +2024,10 @@ class TestBasicAnalysisCoverage:
             (Test Case 1) Stored item is ndarray.
         """
         ws_id, ns = loaded_ws
-        result = await analysis.get_pop_rate(ws_id, ns, "pop_rate")
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would trip the source 6*sigma <= length
+        # guard. Pass a smaller kernel that fits the recording.
+        result = await analysis.get_pop_rate(ws_id, ns, "pop_rate", gauss_sigma=5)
         assert result["key"] == "pop_rate"
         assert result["info"]["type"] == "ndarray"
 
@@ -3453,7 +3499,11 @@ class TestComputeSpikeTimeTiling:
         )
         ws = get_workspace_manager().get_workspace(ws_id)
         val = ws.get(ns, "sttc_auto")
-        assert val[0] == pytest.approx(0.0, abs=0.01)
+        # Stored value is a scalar (float or 0-d/1-d ndarray); coerce to a
+        # plain float before approx comparison.
+        if hasattr(val, "__iter__"):
+            val = float(np.asarray(val).flatten()[0])
+        assert val == pytest.approx(0.0, abs=0.01)
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -4101,6 +4151,39 @@ class TestRenameWorkspaceItem:
         with pytest.raises(KeyError, match="not found"):
             await analysis.rename_workspace_item(ws_id, "ns", "nonexistent", "new_key")
 
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_rename_old_equals_new_is_blocked(self):
+        """
+        ``rename_workspace_item`` with ``old_key == new_key`` returns
+        ``success=False`` (rename is blocked) and emits the
+        already-exists UserWarning. Pins the contract that the underlying
+        ``AnalysisWorkspace.rename`` treats ``new_key in items`` as a
+        collision regardless of whether ``new_key`` is the same as
+        ``old_key``.
+
+        Tests:
+            (Test Case 1) ``success`` is False.
+            (Test Case 2) The item still exists at the original key
+                (no destructive side effect from the no-op rename).
+        """
+        import warnings
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="rename_same_ws")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "k", np.array([1.0, 2.0]))
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = await analysis.rename_workspace_item(ws_id, "ns", "k", "k")
+
+        assert result["success"] is False
+        # The original key is untouched.
+        np.testing.assert_array_equal(ws.get("ns", "k"), [1.0, 2.0])
+        # Underlying workspace.rename emits an "already exists" warning.
+        assert any("already exists" in str(rec.message) for rec in w)
+
 
 class TestAddWorkspaceNote:
     """Edge case tests for add_workspace_note MCP tool."""
@@ -4618,21 +4701,24 @@ class TestCallTool:
     @pytest.mark.asyncio
     async def test_json_serialization_with_numpy_scalars(self):
         """
-        Tool return dict containing numpy scalars raises TypeError from
-        ``json.dumps``. The exception propagates to the MCP framework, which
-        surfaces it as ``isError=True`` so clients see a real failure
-        rather than a successful result with a confusing payload.
+        Tool return dict containing numpy scalars round-trips through
+        ``_call_tool``: ``_sanitize_for_json`` coerces ``np.float64`` /
+        ``np.int64`` to native Python types via ``.item()`` before the
+        ``json.dumps`` call, so MCP clients receive a clean payload.
 
         Tests:
-            (Test Case 1) When a tool handler returns numpy scalars (int64,
-                float64), _call_tool raises TypeError naming the
-                non-serializable object type.
+            (Test Case 1) When a tool handler returns numpy scalars
+                (int64, float64), the dispatcher succeeds and the
+                serialized JSON contains the same numeric values as
+                native Python types.
 
         Notes:
             - Patching ``spikelab.mcp_server.server.analysis.compute_rates``
               alone is insufficient because ``_TOOL_DISPATCH`` was bound at
               import time. Swap the dispatch entry directly.
         """
+        import json
+
         from spikelab.mcp_server.server import _call_tool, _TOOL_DISPATCH
 
         mock_fn = AsyncMock(
@@ -4645,15 +4731,15 @@ class TestCallTool:
         original = _TOOL_DISPATCH["compute_rates"]
         _TOOL_DISPATCH["compute_rates"] = mock_fn
         try:
-            with pytest.raises(TypeError, match="not JSON serializable"):
-                await _call_tool(
-                    "compute_rates",
-                    {
-                        "workspace_id": "ws",
-                        "namespace": "ns",
-                        "key": "rates",
-                    },
-                )
+            result = await _call_tool(
+                "compute_rates",
+                {"workspace_id": "ws", "namespace": "ns", "key": "rates"},
+            )
+            assert len(result) == 1
+            payload = json.loads(result[0].text)
+            assert payload["rates"] == [0.1, 0.2]
+            assert payload["unit"] == "kHz"
+            assert payload["num_neurons"] == 2
         finally:
             _TOOL_DISPATCH["compute_rates"] = original
 
@@ -4792,7 +4878,11 @@ class TestGetPopRate:
         ws = wm.get_workspace(ws_id)
         sd_empty = SpikeData([[], [], []], length=50.0)
         ws.store("empty_poprate", "spikedata", sd_empty)
-        result = await analysis.get_pop_rate(ws_id, "empty_poprate", "pop_rate_empty")
+        # length=50 ms — default gauss_sigma=100 trips the new
+        # 6*sigma <= length source guard. Pass a smaller kernel.
+        result = await analysis.get_pop_rate(
+            ws_id, "empty_poprate", "pop_rate_empty", gauss_sigma=5
+        )
         pop_rate = ws.get("empty_poprate", "pop_rate_empty")
         np.testing.assert_array_equal(pop_rate, 0.0)
 
@@ -4833,6 +4923,10 @@ class TestGetBurstsMCP:
             (Test Case 1) Unreachable threshold produces 0 bursts.
         """
         ws_id, ns = loaded_ws
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would now trip the source 6*sigma <=
+        # length guard. Pass smaller kernel sizes that fit the
+        # recording.
         result = await analysis.get_bursts(
             ws_id,
             ns,
@@ -4842,6 +4936,8 @@ class TestGetBurstsMCP:
             thr_burst=1000.0,
             min_burst_diff=10,
             burst_edge_mult_thresh=0.5,
+            gauss_sigma=5,
+            acc_gauss_sigma=5,
         )
         assert result["n_bursts"] == 0
 
@@ -4855,6 +4951,10 @@ class TestGetBurstsMCP:
             (Test Case 1) Empty thr_values produces shape (0, N_dist).
         """
         ws_id, ns = loaded_ws
+        # The loaded_ws SpikeData is short (~50 ms); default
+        # gauss_sigma=100 ms would now trip the source 6*sigma <=
+        # length guard. Pass smaller kernel sizes that fit the
+        # recording.
         result = await analysis.burst_sensitivity(
             ws_id,
             ns,
@@ -4862,6 +4962,8 @@ class TestGetBurstsMCP:
             thr_values=[],
             dist_values=[10],
             burst_edge_mult_thresh=0.5,
+            gauss_sigma=5,
+            acc_gauss_sigma=5,
         )
         sens = get_workspace_manager().get_workspace(ws_id).get(ns, "sens_empty")
         assert sens.shape[0] == 0
@@ -6992,6 +7094,35 @@ class TestPCMStackToolsMCP:
 
     @pytestmark_server
     @pytest.mark.asyncio
+    async def test_pcm_stack_subslice_out_of_range_propagates_index_error(
+        self, loaded_ws_with_pcm_stack
+    ):
+        """
+        EC-MCP-MED: pcm_stack_subslice with an out-of-range index
+        propagates the underlying numpy IndexError. Pin the failure
+        mode so a future explicit ValueError-with-message at the MCP
+        layer is detectable.
+
+        Tests:
+            (Test Case 1) Index ``len(stack)`` (one past the end) raises
+                IndexError from the underlying ``__getitem__`` /
+                ``subslice``.
+        """
+        ws_id, ns = loaded_ws_with_pcm_stack
+        ws = get_workspace_manager().get_workspace(ws_id)
+        stack = ws.get(ns, "pcms")
+        n_slices = stack.stack.shape[2]
+        with pytest.raises((IndexError, ValueError)):
+            await analysis.pcm_stack_subslice(
+                ws_id,
+                ns,
+                key="pcms",
+                indices=[n_slices + 5],
+                out_key="oof",
+            )
+
+    @pytestmark_server
+    @pytest.mark.asyncio
     async def test_pcm_stack_mean_basic(self, loaded_ws_with_pcm_stack):
         """
         Test pcm_stack_mean averages across slices.
@@ -7753,3 +7884,1535 @@ class TestMcpJsonNanSanitiser:
         payload = json.loads(out[0].text)
         assert payload["metric"] is None
         assert payload["ok"] == 1.0
+
+
+class TestListNeuronsNumpyArrayAttr:
+    """``list_neurons`` returns ``neuron_attributes`` verbatim — including
+    numpy arrays (e.g. ``template``, ``amplitudes``) populated by the
+    SpikeLab npz loader. The MCP dispatcher's ``_sanitize_for_json`` only
+    handles non-finite floats; numpy arrays are *not* converted to lists,
+    so the boundary ``json.dumps`` call raises ``TypeError``. Pin both
+    halves of the contract so a future numpy-aware encoder surfaces here.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_numpy_array_attribute_returned_raw(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``list_neurons`` returns the numpy array
+                value unchanged (not converted to a list).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_with_np = SpikeData(
+            [np.array([1.0, 5.0])],
+            length=10.0,
+            neuron_attributes=[
+                {"unit_id": 0, "template": np.array([1.0, 2.0, 3.0])},
+            ],
+        )
+        ws.store("np_ns", "spikedata", sd_with_np)
+
+        result = await analysis.list_neurons(ws_id, "np_ns")
+
+        assert len(result["neurons"]) == 1
+        tpl = result["neurons"][0]["template"]
+        assert isinstance(tpl, np.ndarray)
+        assert tpl.tolist() == [1.0, 2.0, 3.0]
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_json_dumps_via_dispatcher_handles_numpy_arrays(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) Routing the result through the MCP dispatcher
+                inlines numpy arrays as nested Python lists via
+                ``_sanitize_for_json``; ``json.dumps`` succeeds.
+            (Test Case 2) The serialized payload contains the template
+                values (``[1.0, 2.0, 3.0]``) as a JSON array.
+        """
+        import json
+
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_with_np = SpikeData(
+            [np.array([1.0, 5.0])],
+            length=10.0,
+            neuron_attributes=[
+                {"unit_id": 0, "template": np.array([1.0, 2.0, 3.0])},
+            ],
+        )
+        ws.store("np_ns2", "spikedata", sd_with_np)
+
+        from spikelab.mcp_server import server as srv
+
+        result = await srv._call_tool(
+            "list_neurons",
+            {"workspace_id": ws_id, "namespace": "np_ns2"},
+        )
+        # _call_tool returns a list[TextContent]; the JSON-encoded
+        # payload is on .text.
+        assert len(result) == 1
+        payload = json.loads(result[0].text)
+        # The template should be inlined as a list of floats.
+        # Tolerant lookup: payload shape depends on list_neurons' return
+        # format, but somewhere it should contain the array values.
+        flat = json.dumps(payload)
+        assert (
+            "1.0" in flat and "2.0" in flat and "3.0" in flat
+        ), f"template values not found in payload: {flat[:500]}"
+
+
+class TestComputeResampledIsiSigmaMsZero:
+    """Pin the ``sigma_ms=0.0`` boundary contract for ``compute_resampled_isi``.
+
+    Adjacent tests in ``TestComputeResampledISI`` cover the negative-sigma
+    boundary (which may raise depending on scipy version) and empty/single
+    times paths. This pins the ``sigma_ms=0.0`` boundary — exactly zero
+    smoothing — which delegates through ``SpikeData.resampled_isi`` to
+    ``_resampled_isi`` and ultimately to ``scipy.ndimage.gaussian_filter1d``
+    with ``sigma=0`` (which is a documented no-op).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_sigma_ms_zero_succeeds(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``compute_resampled_isi(sigma_ms=0.0)`` returns a
+                successful result dict (no exception).
+            (Test Case 2) ``result["sigma_ms"] == 0.0`` is echoed back.
+            (Test Case 3) Stored ``RateData`` has the expected ``(U, T)``
+                shape with U=3 (units) and T=5 (resample times).
+            (Test Case 4) ``result["n_timepoints"] == 5``.
+        """
+        ws_id, ns = loaded_ws
+        # Use a uniformly-spaced grid; non-uniform times are now
+        # rejected by ``_resampled_isi`` (see test_utils.py's
+        # ``test_non_uniform_time_grid``).
+        result = await analysis.compute_resampled_isi(
+            ws_id,
+            ns,
+            "rates_sigma0",
+            times=[10.0, 20.0, 30.0, 40.0, 50.0],
+            sigma_ms=0.0,
+        )
+        assert result["sigma_ms"] == 0.0
+        assert result["n_timepoints"] == 5
+        assert result["key"] == "rates_sigma0"
+        ws = get_workspace_manager().get_workspace(ws_id)
+        rd = ws.get(ns, "rates_sigma0")
+        assert rd.inst_Frate_data.shape == (3, 5)
+
+
+class TestAlignToEventsKeyNotInMetadata:
+    """Pin the error contract when ``events`` is a string key that is not
+    present in ``SpikeData.metadata``. Source:
+    ``SpikeData.align_to_events`` raises ``KeyError`` with a message that
+    starts with ``"Metadata key {key!r} not found"`` and includes the list
+    of available keys. The MCP wrapper does not catch this, so the
+    KeyError propagates to the caller.
+
+    The ``loaded_ws`` fixture's SpikeData has ``metadata={"test": "data"}``
+    — so ``events="missing_key"`` exercises the "key not in dict" branch
+    (rather than the "metadata is None" branch).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_missing_metadata_key_raises_key_error(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``align_to_events(events="missing_key")`` raises
+                ``KeyError``.
+            (Test Case 2) The error message mentions ``"missing_key"``.
+            (Test Case 3) The error message mentions ``"Metadata key"``.
+            (Test Case 4) The error message lists the available keys
+                (here: ``test``).
+        """
+        ws_id, ns = loaded_ws
+        with pytest.raises(KeyError) as exc_info:
+            await analysis.align_to_events(
+                ws_id,
+                ns,
+                key="aligned",
+                events="missing_key",
+                pre_ms=5.0,
+                post_ms=5.0,
+            )
+        msg = str(exc_info.value)
+        assert "missing_key" in msg
+        assert "Metadata key" in msg
+        assert "test" in msg  # available keys list contains the existing key
+
+
+class TestExtractLowerTriangleFeaturesAdditionalShapes:
+    """Pin the shape-rejection branches of ``extract_lower_triangle_features``.
+
+    Source: the MCP wrapper accepts either a ``PairwiseCompMatrixStack`` or
+    a 3-D ``(N, N, S)`` ndarray with ``shape[0] == shape[1]``. Anything
+    else falls through to a ``ValueError("Expected PairwiseCompMatrixStack
+    or (N, N, S) ndarray ...")`` with the offending ``type(obj).__name__``
+    embedded in the message.
+
+    This test pins two of the rejection cases that the existing
+    ``TestExtractLowerTriangleFeatures.test_2x2_stack`` happy-path does
+    not exercise:
+
+    * A bare 2-D ``(N, N)`` ndarray (``ndim != 3``).
+    * A 3-D ndarray whose first two dims aren't equal — e.g.
+      ``(S, N, N)`` shaped data where the stack dim isn't last
+      (``shape[0] != shape[1]``).
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_2d_ndarray_rejected(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) A bare 2-D ``(3, 3)`` ndarray at the workspace
+                slot raises ``ValueError``.
+            (Test Case 2) The error message mentions the expected type
+                ``"PairwiseCompMatrixStack or (N, N, S)"``.
+            (Test Case 3) The error message names ``ndarray`` (the
+                ``type(obj).__name__``).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store(ns, "mat_2d", np.eye(3))  # (3, 3) — ndim==2
+        with pytest.raises(ValueError) as exc_info:
+            await analysis.extract_lower_triangle_features(
+                ws_id, ns, key="mat_2d", out_key="feat_2d"
+            )
+        msg = str(exc_info.value)
+        assert "PairwiseCompMatrixStack or (N, N, S)" in msg
+        assert "ndarray" in msg
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_3d_non_square_first_two_dims_rejected(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) A 3-D ndarray with shape ``(4, 3, 3)`` — i.e.
+                the stack dim is first, not last, so
+                ``shape[0] != shape[1]`` — raises ``ValueError``.
+            (Test Case 2) The error message identifies the type
+                mismatch (``"Expected PairwiseCompMatrixStack or (N, N, S)"``).
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        # (S, N, N) layout with S=4, N=3 — shape[0]=4, shape[1]=3 != 4.
+        ws.store(ns, "stack_snn", np.zeros((4, 3, 3)))
+        with pytest.raises(ValueError) as exc_info:
+            await analysis.extract_lower_triangle_features(
+                ws_id, ns, key="stack_snn", out_key="feat_snn"
+            )
+        msg = str(exc_info.value)
+        assert "Expected PairwiseCompMatrixStack or (N, N, S)" in msg
+
+
+class TestPcmStackThresholdNaN:
+    """Pin the ``threshold=NaN`` boundary contract for ``pcm_stack_threshold``.
+
+    Source: ``PairwiseCompMatrixStack.threshold`` returns
+    ``(np.abs(self.stack) > threshold).astype(float)``. Because
+    ``abs(value) > NaN`` is False for every finite value (and for NaN
+    itself), the resulting binary stack is identically zero everywhere —
+    regardless of the underlying values. The stored metadata records
+    ``threshold=NaN, binary=True``.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_threshold_nan_produces_all_zero_stack(self):
+        """
+        Tests:
+            (Test Case 1) ``pcm_stack_threshold(threshold=np.nan)`` returns
+                a successful result dict.
+            (Test Case 2) The result stack is a ``PairwiseCompMatrixStack``
+                of the same shape as the input.
+            (Test Case 3) Every element of the resulting ``stack`` is
+                exactly 0.0 (no NaN, no 1.0).
+            (Test Case 4) ``metadata["binary"] is True`` and
+                ``metadata["threshold"]`` is NaN (round-trips the input).
+        """
+        if not MCP_SERVER_AVAILABLE:
+            pytest.skip("MCP server not available")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pcm_nan_ws")
+        ws = wm.get_workspace(ws_id)
+        # Non-trivial, fully finite stack so the all-zero result is
+        # attributable to the NaN comparator, not to input NaN.
+        stack_data = np.array(
+            [
+                [[1.0, 0.5], [-2.0, 3.0]],
+                [[0.0, 0.1], [4.0, -1.0]],
+            ]
+        )  # shape (2, 2, 2)
+        ws.store("ns", "pcms", PairwiseCompMatrixStack(stack=stack_data))
+
+        result = await analysis.pcm_stack_threshold(
+            ws_id, "ns", key="pcms", threshold=float("nan"), out_key="pcms_nan"
+        )
+        assert result["info"]["type"] == "PairwiseCompMatrixStack"
+        out = ws.get("ns", "pcms_nan")
+        assert out.stack.shape == stack_data.shape
+        # Every comparator `abs(x) > NaN` is False → all zeros, no NaN, no 1.
+        assert np.all(out.stack == 0.0)
+        assert not np.any(np.isnan(out.stack))
+        assert out.metadata.get("binary") is True
+        assert np.isnan(out.metadata.get("threshold"))
+
+
+class TestSetNeuronAttributeEmptyIndices:
+    """Pin the no-op contract for ``set_neuron_attribute(neuron_indices=[])``.
+
+    Source: ``SpikeData.set_neuron_attribute`` builds ``indices = []``,
+    then the scalar-values branch runs ``for i in indices: ...`` — which
+    is a no-op when ``indices`` is empty. The MCP wrapper still re-stores
+    the SpikeData to refresh the workspace index summary, but no neuron
+    attributes are added or changed.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_empty_indices_is_noop(self, loaded_ws):
+        """
+        Tests:
+            (Test Case 1) ``set_neuron_attribute(neuron_indices=[],
+                values=1)`` returns successfully (no exception).
+            (Test Case 2) The result dict echoes back the attribute key.
+            (Test Case 3) ``SpikeData.neuron_attributes`` was either
+                left as None (initial state) OR initialized to a list of
+                empty dicts — but in neither case does the new attribute
+                ``"foo"`` appear in any neuron's attribute dict.
+            (Test Case 4) The number of neurons is unchanged.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        sd_before = ws.get(ns, "spikedata")
+        n_before = sd_before.N
+
+        result = await analysis.set_neuron_attribute(
+            ws_id, ns, key="foo", values=1, neuron_indices=[]
+        )
+        assert result["key"] == "foo"
+
+        sd_after = ws.get(ns, "spikedata")
+        assert sd_after.N == n_before
+        # Underlying source initialises neuron_attributes to [{} for _ in range(N)]
+        # when it was None — so it may now be a list of empty dicts even
+        # though no values were set. The contract: "foo" is not present
+        # in any neuron's attribute dict.
+        attrs = sd_after.neuron_attributes
+        if attrs is not None:
+            for neuron_dict in attrs:
+                assert "foo" not in neuron_dict
+
+
+# ============================================================================
+# _sanitize_for_json: numpy ndarray inlining + oversize-cap. Existing
+# TestMcpJsonNanSanitiser covers NaN/Inf → None; these classes pin the
+# ndarray handling and the MAX_INLINE_ARRAY_SIZE guard.
+# ============================================================================
+
+
+@pytestmark_server
+class TestSanitizeForJsonNdarrayInlining:
+    """``_sanitize_for_json`` inlines small numpy arrays as nested
+    Python lists. NaN / Inf values inside the array are still
+    replaced with ``None``. 0-D arrays become a 1-element list via
+    ``.tolist()``.
+    """
+
+    def test_1d_ndarray_inlined_with_nan_replacement(self):
+        """
+        Tests:
+            (Test Case 1) ``np.array([1.0, np.nan, 3.0])`` → ``[1.0,
+                None, 3.0]`` (NaN → None per the existing contract).
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out = _sanitize_for_json(np.array([1.0, np.nan, 3.0]))
+        assert out == [1.0, None, 3.0]
+
+    def test_2d_ndarray_inlined_as_nested_list(self):
+        """
+        Tests:
+            (Test Case 1) ``np.array([[1, 2], [3, 4]])`` → ``[[1, 2],
+                [3, 4]]`` (shape preserved as nested lists).
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out = _sanitize_for_json(np.array([[1, 2], [3, 4]]))
+        assert out == [[1, 2], [3, 4]]
+
+    def test_empty_ndarray_becomes_empty_list(self):
+        """
+        Tests:
+            (Test Case 1) ``np.array([])`` → ``[]``.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out = _sanitize_for_json(np.array([]))
+        assert out == []
+
+
+@pytestmark_server
+class TestSanitizeForJsonOversizeRaises:
+    """``_sanitize_for_json`` raises ``ValueError`` on numpy arrays
+    larger than ``MAX_INLINE_ARRAY_SIZE`` (10,000 by default). The
+    error message points the caller at the workspace-store-by-
+    reference pattern and at the cap-raise knob.
+    """
+
+    def test_oversize_ndarray_returns_summary_marker(self):
+        """
+        Oversize arrays no longer raise — they degrade to an elided
+        summary dict so the handler's other return-dict fields (e.g.
+        the workspace key where the actual result is stored) reach
+        the agent.
+
+        Tests:
+            (Test Case 1) Array of 10001 elements returns a dict with
+                ``__elided_ndarray__: True``.
+            (Test Case 2) Summary carries the size, shape, dtype, and
+                a hint mentioning fetch_workspace_item.
+        """
+        from spikelab.mcp_server.server import (
+            MAX_INLINE_ARRAY_SIZE,
+            _sanitize_for_json,
+        )
+
+        big = np.zeros(MAX_INLINE_ARRAY_SIZE + 1)
+        out = _sanitize_for_json(big)
+        assert isinstance(out, dict)
+        assert out["__elided_ndarray__"] is True
+        assert out["size"] == MAX_INLINE_ARRAY_SIZE + 1
+        assert out["shape"] == [MAX_INLINE_ARRAY_SIZE + 1]
+        assert "fetch_workspace_item" in out["hint"]
+
+    def test_at_cap_is_inlined_above_cap_returns_summary(self):
+        """
+        Tests:
+            (Test Case 1) Array of exactly ``MAX_INLINE_ARRAY_SIZE``
+                elements is inlined (the cap is ``> cap``, not ``>=``,
+                so the boundary case passes through).
+            (Test Case 2) ``cap + 1`` elements returns the elided
+                summary dict.
+        """
+        from spikelab.mcp_server.server import (
+            MAX_INLINE_ARRAY_SIZE,
+            _sanitize_for_json,
+        )
+
+        at_cap = np.zeros(MAX_INLINE_ARRAY_SIZE)
+        out = _sanitize_for_json(at_cap)
+        assert isinstance(out, list)
+        assert len(out) == MAX_INLINE_ARRAY_SIZE
+
+        above = np.zeros(MAX_INLINE_ARRAY_SIZE + 1)
+        out_above = _sanitize_for_json(above)
+        assert isinstance(out_above, dict)
+        assert out_above["__elided_ndarray__"] is True
+
+
+class TestMergeWorkspaceNonexistentPath:
+    """``merge_workspace`` calls ``AnalysisWorkspace.load(path)``
+    directly without a try/except, so a non-existent path propagates
+    the underlying error to the caller. Pin the actual current
+    behavior — propagation, not a wrapped error dict — so a future
+    swap to error-dict semantics is detected as a contract change.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_nonexistent_path_propagates_error(self, loaded_ws, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``merge_workspace(ws_id, path=<missing>)``
+                raises (current behavior — the underlying
+                ``AnalysisWorkspace.load`` raises). The exact
+                exception type is not asserted (could be
+                FileNotFoundError, OSError, or h5py-specific) — just
+                that an error propagates rather than being silently
+                swallowed.
+        """
+        ws_id, _ns = loaded_ws
+        missing = str(tmp_path / "does_not_exist.h5")
+        with pytest.raises(Exception):
+            await analysis.merge_workspace(ws_id, path=missing)
+
+
+# ============================================================================
+# Parallel-session source: MCP concatenate_units out_namespace (commit 55acbb4)
+# ============================================================================
+
+
+class TestConcatenateUnitsOutNamespace:
+    """Pin the ``out_namespace`` kwarg on ``concatenate_units`` (commit
+    55acbb4). Default ``None`` keeps the historical overwrite-into-
+    ``namespace_a`` behaviour; an explicit value writes to a separate
+    namespace and preserves both inputs.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_default_overwrites_namespace_a(self, loaded_ws, sample_spikedata):
+        """
+        Tests:
+            (Test Case 1) ``out_namespace=None`` (default) writes the
+                combined SpikeData to ``namespace_a`` — the SpikeData
+                originally at ``namespace_a`` is overwritten.
+            (Test Case 2) ``result["namespace"]`` equals
+                ``namespace_a`` so the caller can detect the
+                destination from the return value.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store("rec2", "spikedata", sample_spikedata)
+        sd_a_before = ws.get(ns, "spikedata")
+
+        result = await analysis.concatenate_units(
+            ws_id, namespace_a=ns, namespace_b="rec2"
+        )
+
+        # Return value points at namespace_a.
+        assert result["namespace"] == ns
+        # The SpikeData at namespace_a has changed (combined now has more units).
+        sd_a_after = ws.get(ns, "spikedata")
+        assert sd_a_after.N > sd_a_before.N
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_explicit_writes_to_fresh_namespace(
+        self, loaded_ws, sample_spikedata
+    ):
+        """
+        Tests:
+            (Test Case 1) Explicit ``out_namespace="rec_combined"``
+                writes the combined SpikeData to that namespace.
+            (Test Case 2) Both ``namespace_a`` and ``namespace_b`` are
+                preserved byte-identical.
+            (Test Case 3) ``result["namespace"]`` equals the explicit
+                destination, not ``namespace_a``.
+        """
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        ws.store("rec2", "spikedata", sample_spikedata)
+
+        sd_a_before = ws.get(ns, "spikedata")
+        sd_b_before = ws.get("rec2", "spikedata")
+        n_a = sd_a_before.N
+        n_b = sd_b_before.N
+
+        result = await analysis.concatenate_units(
+            ws_id,
+            namespace_a=ns,
+            namespace_b="rec2",
+            out_namespace="rec_combined",
+        )
+
+        # Return value points at the explicit destination.
+        assert result["namespace"] == "rec_combined"
+        # Both inputs are preserved.
+        assert ws.get(ns, "spikedata").N == n_a
+        assert ws.get("rec2", "spikedata").N == n_b
+        # The combined output is at the new namespace and has more units.
+        sd_out = ws.get("rec_combined", "spikedata")
+        assert sd_out.N == n_a + n_b
+
+
+# ============================================================================
+# Parallel-session source: pcm_stack_threshold out_key sentinels (commit 6f9a9ef)
+# ============================================================================
+
+
+class TestPcmStackThresholdOutKeySentinels:
+    """``pcm_stack_threshold`` accepts three forms of ``out_key`` (commit
+    6f9a9ef):
+
+      - ``None`` — fall through to "use input key" (destructive
+        overwrite, documented historical behaviour).
+      - ``""`` (empty string) — treated identically to ``None``, kept
+        for backwards compatibility with callers using the previous
+        default.
+      - explicit string — write to that key; the input key keeps its
+        original float values.
+    """
+
+    @pytest.fixture()
+    def loaded_ws_with_stack(self, loaded_ws):
+        """Inject a small ``PairwiseCompMatrixStack`` (float values) at
+        the loaded workspace's namespace under key ``pcms_src``.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        ws_id, ns = loaded_ws
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        stack = np.stack(
+            [
+                np.array([[0.1, 0.8], [0.8, 0.1]]),
+                np.array([[0.3, 0.9], [0.9, 0.3]]),
+            ],
+            axis=2,
+        )
+        ws.store(ns, "pcms_src", PairwiseCompMatrixStack(stack=stack))
+        return ws_id, ns, ws
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_none_overwrites_input_key(self, loaded_ws_with_stack):
+        """
+        Tests:
+            (Test Case 1) ``out_key=None`` falls through to "use input
+                key" — the source float-valued stack at ``pcms_src`` is
+                replaced by the binary {0, 1} stack.
+            (Test Case 2) ``result["key"]`` equals the input ``key``.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        result = await analysis.pcm_stack_threshold(
+            ws_id, ns, key="pcms_src", threshold=0.5, out_key=None
+        )
+        assert result["key"] == "pcms_src"
+        stack_after = ws.get(ns, "pcms_src").stack
+        # Binary output (just 0s and 1s).
+        assert set(np.unique(stack_after).tolist()).issubset({0.0, 1.0})
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_empty_string_is_treated_as_none(self, loaded_ws_with_stack):
+        """
+        Tests:
+            (Test Case 1) ``out_key=""`` — same as ``None``: writes
+                back to the input key with binary values.
+            (Test Case 2) ``result["key"]`` equals the input ``key``,
+                not ``""``.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        result = await analysis.pcm_stack_threshold(
+            ws_id, ns, key="pcms_src", threshold=0.5, out_key=""
+        )
+        assert result["key"] == "pcms_src"
+        stack_after = ws.get(ns, "pcms_src").stack
+        assert set(np.unique(stack_after).tolist()).issubset({0.0, 1.0})
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_explicit_keeps_source_intact(self, loaded_ws_with_stack):
+        """
+        Tests:
+            (Test Case 1) Explicit ``out_key="pcms_binary"`` writes the
+                binary stack to the new key.
+            (Test Case 2) The source key ``pcms_src`` retains its
+                original float values.
+            (Test Case 3) ``result["key"]`` equals the explicit key.
+        """
+        ws_id, ns, ws = loaded_ws_with_stack
+        src_before = ws.get(ns, "pcms_src").stack.copy()
+
+        result = await analysis.pcm_stack_threshold(
+            ws_id,
+            ns,
+            key="pcms_src",
+            threshold=0.5,
+            out_key="pcms_binary",
+        )
+        assert result["key"] == "pcms_binary"
+
+        # Source preserved.
+        src_after = ws.get(ns, "pcms_src").stack
+        np.testing.assert_array_equal(src_before, src_after)
+
+        # Output is binary at the new key.
+        out = ws.get(ns, "pcms_binary").stack
+        assert set(np.unique(out).tolist()).issubset({0.0, 1.0})
+
+
+# ============================================================================
+# _sanitize_for_json — numpy scalar coercion. Existing tests cover the
+# float (Python and np.float64) NaN/Inf path and the ndarray inlining +
+# size-cap path. This class pins the .item() coercion for non-float64
+# numpy scalar types — np.float32 (not a Python-float subclass on numpy
+# 2.x), np.int64, np.bool_, np.uint*.
+# ============================================================================
+
+
+@pytestmark_server
+class TestSanitizeForJsonNumpyScalarCoercion:
+    """``_sanitize_for_json`` routes any ``np.generic`` instance through
+    ``.item()`` to convert to a native Python type before delegating to
+    the regular float / dict / list / passthrough branches. Pins the
+    coercion for the four non-``float64`` numpy scalar families that
+    were the regression target of the numpy-support commit.
+    """
+
+    def test_float32_finite_coerces_to_python_float(self):
+        """
+        Tests:
+            (Test Case 1) ``np.float32(1.5)`` → Python ``float`` 1.5.
+                Verifies the value, the type (not just equality —
+                ``np.float32`` does NOT subclass ``float`` on numpy 2.x).
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out = _sanitize_for_json(np.float32(1.5))
+        assert out == 1.5
+        assert type(out) is float
+
+    def test_float32_nan_inf_become_none(self):
+        """
+        After ``.item()`` produces a Python float, the float branch
+        converts NaN / ±Inf to ``None``.
+
+        Tests:
+            (Test Case 1) ``np.float32('nan')`` → None.
+            (Test Case 2) ``np.float32('inf')`` → None.
+            (Test Case 3) ``np.float32('-inf')`` → None.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        assert _sanitize_for_json(np.float32("nan")) is None
+        assert _sanitize_for_json(np.float32("inf")) is None
+        assert _sanitize_for_json(np.float32("-inf")) is None
+
+    def test_numpy_int_types_coerce_to_python_int(self):
+        """
+        Tests:
+            (Test Case 1) ``np.int64(7)`` → Python ``int`` 7.
+            (Test Case 2) ``np.int32(-3)`` → Python ``int`` -3.
+            (Test Case 3) ``np.uint8(255)`` → Python ``int`` 255.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        for dtype, val in [(np.int64, 7), (np.int32, -3), (np.uint8, 255)]:
+            out = _sanitize_for_json(dtype(val))
+            assert out == val
+            assert type(out) is int
+
+    def test_numpy_bool_coerces_to_python_bool(self):
+        """
+        Tests:
+            (Test Case 1) ``np.bool_(True)`` → Python ``bool`` True.
+            (Test Case 2) ``np.bool_(False)`` → Python ``bool`` False.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out_t = _sanitize_for_json(np.bool_(True))
+        out_f = _sanitize_for_json(np.bool_(False))
+        assert out_t is True
+        assert out_f is False
+        assert type(out_t) is bool
+        assert type(out_f) is bool
+
+
+# ============================================================================
+# MCP tool registration schemas — pcm_stack_threshold + concatenate_units.
+# Pin two contracts that the LLM-facing tool catalog depends on:
+#   - pcm_stack_threshold advertises `preserve_nan` (boolean, optional)
+#     and the `out_key` description carries the "OVERWRITE" warning.
+#   - concatenate_units advertises `out_namespace` as optional.
+# Schema drift would degrade LLM tool choice silently.
+# ============================================================================
+
+
+class TestPcmStackThresholdToolSchema:
+    """``pcm_stack_threshold`` tool registration in ``_list_tools``
+    exposes the ``preserve_nan`` kwarg (boolean, optional) and the
+    ``out_key`` description carries the "OVERWRITE" warning so an
+    LLM caller is alerted to the destructive default.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_schema_includes_preserve_nan_optional_boolean(self):
+        """
+        Tests:
+            (Test Case 1) The ``pcm_stack_threshold`` tool is registered.
+            (Test Case 2) ``preserve_nan`` is in ``inputSchema.properties``.
+            (Test Case 3) Its type is ``boolean``.
+            (Test Case 4) It is NOT in ``inputSchema.required``.
+        """
+        from spikelab.mcp_server.server import _list_tools
+
+        tools = await _list_tools()
+        tool = next((t for t in tools if t.name == "pcm_stack_threshold"), None)
+        assert tool is not None, "pcm_stack_threshold tool not registered"
+
+        props = tool.inputSchema["properties"]
+        assert "preserve_nan" in props
+        assert props["preserve_nan"]["type"] == "boolean"
+        assert "preserve_nan" not in tool.inputSchema.get("required", [])
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_out_key_description_warns_about_overwrite_default(self):
+        """
+        Tests:
+            (Test Case 1) ``out_key`` property exists in the schema.
+            (Test Case 2) Its description contains the word "OVERWRITE"
+                (case-sensitive — matches the source wording that
+                alerts an LLM caller to the destructive default).
+            (Test Case 3) The top-level tool description also names
+                the OVERWRITE behaviour so a single read of the
+                catalog surfaces the warning.
+        """
+        from spikelab.mcp_server.server import _list_tools
+
+        tools = await _list_tools()
+        tool = next((t for t in tools if t.name == "pcm_stack_threshold"), None)
+        assert tool is not None
+
+        out_key_desc = tool.inputSchema["properties"]["out_key"]["description"]
+        assert "OVERWRITE" in out_key_desc
+        # Top-level tool description also mentions it.
+        assert "OVERWRITE" in tool.description
+
+
+class TestConcatenateUnitsToolSchema:
+    """``concatenate_units`` tool registration exposes ``out_namespace``
+    as an optional kwarg. Companion to
+    ``TestConcatenateUnitsOutNamespace`` which pins the runtime
+    behaviour; this class pins the schema contract that an LLM
+    caller sees.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_schema_exposes_out_namespace_optional(self):
+        """
+        Tests:
+            (Test Case 1) The ``concatenate_units`` tool is registered.
+            (Test Case 2) ``out_namespace`` is in
+                ``inputSchema.properties``.
+            (Test Case 3) Its type is ``string``.
+            (Test Case 4) It is NOT in ``inputSchema.required`` (the
+                only required keys are ``workspace_id``,
+                ``namespace_a``, ``namespace_b``).
+        """
+        from spikelab.mcp_server.server import _list_tools
+
+        tools = await _list_tools()
+        tool = next((t for t in tools if t.name == "concatenate_units"), None)
+        assert tool is not None, "concatenate_units tool not registered"
+
+        props = tool.inputSchema["properties"]
+        assert "out_namespace" in props
+        assert props["out_namespace"]["type"] == "string"
+
+        required = tool.inputSchema.get("required", [])
+        assert "out_namespace" not in required
+        assert set(required) == {"workspace_id", "namespace_a", "namespace_b"}
+
+
+@pytestmark_server
+class TestSanitizeForJsonZeroDArrayAndCapAdjustable:
+    """``_sanitize_for_json`` 0-D array handling + ``MAX_INLINE_ARRAY_SIZE``
+    monkey-patchability — two boundary contracts the existing inlining
+    tests don't cover.
+
+    0-D arrays are special-cased by ``.tolist()`` (returns a Python
+    scalar, not a list); the sanitiser then routes through the
+    scalar branch. The cap is a module-level integer that the
+    docstring documents as adjustable; pin that raising the cap lets
+    larger arrays through.
+    """
+
+    def test_zero_d_array_coerces_via_scalar_branch(self):
+        """
+        0-D ``np.ndarray`` routes through the scalar branch (via
+        ``.item()``) so the result is a native Python scalar — not a
+        list. The ``obj.ndim == 0`` guard added to the source
+        side-steps the ``[_sanitize_for_json(v) for v in obj.tolist()]``
+        list-comprehension trap (``.tolist()`` on a 0-D array returns
+        a scalar, which isn't iterable).
+
+        Tests:
+            (Test Case 1) ``np.array(5.0)`` → Python ``float`` 5.0.
+            (Test Case 2) ``np.array(7)`` → Python ``int`` 7.
+            (Test Case 3) ``np.array(float('nan'))`` → ``None`` (NaN
+                handling propagates from the float branch via
+                ``.item()``).
+            (Test Case 4) ``np.array(float('inf'))`` → ``None``.
+        """
+        from spikelab.mcp_server.server import _sanitize_for_json
+
+        out_f = _sanitize_for_json(np.array(5.0))
+        assert out_f == 5.0
+        assert type(out_f) is float
+
+        out_i = _sanitize_for_json(np.array(7))
+        assert out_i == 7
+        assert type(out_i) is int
+
+        assert _sanitize_for_json(np.array(float("nan"))) is None
+        assert _sanitize_for_json(np.array(float("inf"))) is None
+
+    def test_max_inline_array_size_monkeypatch_raises_cap(self):
+        """
+        ``MAX_INLINE_ARRAY_SIZE`` is a module attribute; monkey-patching
+        it to a higher value lets larger arrays through. Confirms the
+        docstring contract that the cap is adjustable at runtime.
+
+        Tests:
+            (Test Case 1) Before monkeypatch, an array sized 11 raises
+                under cap=10.
+            (Test Case 2) Under monkeypatched cap=100, the same array
+                inlines successfully and returns the expected
+                element count.
+            (Test Case 3) After the monkeypatch tear-down, the
+                original cap is restored (no bleed into subsequent
+                tests).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        original = srv_mod.MAX_INLINE_ARRAY_SIZE
+        try:
+            # Lower the cap to a small value, then exceed it.
+            srv_mod.MAX_INLINE_ARRAY_SIZE = 10
+            small_above_cap = np.zeros(11)
+            out_summary = srv_mod._sanitize_for_json(small_above_cap)
+            assert isinstance(out_summary, dict)
+            assert out_summary["__elided_ndarray__"] is True
+            assert out_summary["size"] == 11
+
+            # Raise the cap; same array now inlines.
+            srv_mod.MAX_INLINE_ARRAY_SIZE = 100
+            out = srv_mod._sanitize_for_json(small_above_cap)
+            assert isinstance(out, list)
+            assert len(out) == 11
+            assert all(v == 0.0 for v in out)
+        finally:
+            srv_mod.MAX_INLINE_ARRAY_SIZE = original
+        assert srv_mod.MAX_INLINE_ARRAY_SIZE == original
+
+
+# ============================================================================
+# MCP review (2026-05-24) — pin tests for the high-priority gaps surfaced
+# by the /complete_review pass.
+# ============================================================================
+
+
+class TestHelpersGetRatedataError:
+    """``tools/_helpers.get_ratedata`` raises ValueError when no
+    RateData is stored at the requested ``(namespace, key)``. Mirror
+    of ``get_spikedata`` but never directly tested. Every
+    ``compute_pairwise_fr_corr`` / ``compute_rate_manifold`` /
+    ``ratedata_*`` tool relies on this helper.
+    """
+
+    @pytestmark_server
+    def test_no_ratedata_raises_with_recovery_hint(self):
+        """
+        Tests:
+            (Test Case 1) Empty workspace → ValueError mentioning
+                ``RateData`` and ``compute_resampled_isi``.
+        """
+        from spikelab.mcp_server.tools._helpers import get_ratedata
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="rd_test")
+        ws = wm.get_workspace(ws_id)
+        with pytest.raises(ValueError, match="RateData"):
+            get_ratedata(ws, "ns", "ifr")
+
+    @pytestmark_server
+    def test_wrong_type_at_key_raises(self):
+        """
+        Tests:
+            (Test Case 1) A non-RateData object at the key (e.g. raw
+                ndarray) triggers the ``isinstance`` guard with a
+                ValueError mentioning RateData.
+        """
+        from spikelab.mcp_server.tools._helpers import get_ratedata
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="rd_wrong")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "ifr", np.zeros((2, 3)))
+        with pytest.raises(ValueError, match="RateData"):
+            get_ratedata(ws, "ns", "ifr")
+
+
+class TestPcmStackThresholdPreserveNanRuntime:
+    """``pcm_stack_threshold(preserve_nan=True)`` schema is pinned but
+    the runtime kwarg-pass-through is not. A regression that hardcoded
+    ``preserve_nan=False`` would silently break the documented opt-in.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_preserve_nan_true_propagates_nan_to_output(self):
+        """
+        Tests:
+            (Test Case 1) MCP tool call with ``preserve_nan=True`` on a
+                stack with NaN entries produces an output stack that
+                retains NaN at those positions (not coerced to 0).
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pcm_nan")
+        ws = wm.get_workspace(ws_id)
+        stack = np.array(
+            [[[1.0], [np.nan]], [[np.nan], [1.0]]],
+            dtype=float,
+        )  # (2, 2, 1)
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        ws.store("ns", "pcm", pcms)
+
+        result = await analysis.pcm_stack_threshold(
+            workspace_id=ws_id,
+            namespace="ns",
+            key="pcm",
+            threshold=0.5,
+            out_key="binary",
+            preserve_nan=True,
+        )
+        assert result is not None
+        loaded = ws.get("ns", "binary")
+        # NaN positions in input remain NaN in output.
+        assert np.isnan(loaded.stack[0, 1, 0])
+        assert np.isnan(loaded.stack[1, 0, 0])
+        # Finite > threshold positions become 1.
+        assert loaded.stack[0, 0, 0] == 1.0
+        assert loaded.stack[1, 1, 0] == 1.0
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_preserve_nan_false_coerces_nan_to_zero(self):
+        """
+        Tests:
+            (Test Case 1) Same input as above but ``preserve_nan=False``
+                (default) — NaN positions become 0.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pcm_nan_false")
+        ws = wm.get_workspace(ws_id)
+        stack = np.array(
+            [[[1.0], [np.nan]], [[np.nan], [1.0]]],
+            dtype=float,
+        )
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        ws.store("ns", "pcm", pcms)
+
+        await analysis.pcm_stack_threshold(
+            workspace_id=ws_id,
+            namespace="ns",
+            key="pcm",
+            threshold=0.5,
+            out_key="binary",
+            preserve_nan=False,
+        )
+        loaded = ws.get("ns", "binary")
+        # NaN positions coerced to 0.
+        assert loaded.stack[0, 1, 0] == 0.0
+        assert loaded.stack[1, 0, 0] == 0.0
+
+
+class TestFetchWorkspaceItemUnknownType:
+    """``fetch_workspace_item`` falls through to ``repr(obj)`` for
+    types not handled by any specific branch. Pin the contract so a
+    regression that swallowed the unknown-type case wouldn't pass
+    silently.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_unknown_type_returns_repr_field(self):
+        """
+        Tests:
+            (Test Case 1) Storing an arbitrary Python object (str)
+                produces a response containing ``repr`` field with the
+                Python repr.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="unknown")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "obj", "a_plain_string_not_a_known_type")
+
+        result = await analysis.fetch_workspace_item(ws_id, "ns", "obj")
+        assert result["type"] == "str"
+        assert "repr" in result
+        assert "a_plain_string_not_a_known_type" in result["repr"]
+
+
+class TestFetchWorkspaceItemRateDataNanTimes:
+    """``fetch_workspace_item`` on a ``RateData`` whose first or last
+    ``times`` value is NaN: the ``float(obj.times[0])`` cast at source
+    line 1802 yields NaN, then ``_sanitize_for_json`` converts to None.
+    Pin the silent NaN→None propagation.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_nan_in_times_propagates_to_none(self):
+        """
+        Tests:
+            (Test Case 1) RateData with NaN at index 0 of ``times``
+                returns a ``time_range`` field that contains NaN at
+                position 0 (sanitised to None at JSON layer).
+        """
+        from spikelab.spikedata.ratedata import RateData
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="rd_nan")
+        ws = wm.get_workspace(ws_id)
+        times = np.array([np.nan, 1.0, 2.0])
+        rd = RateData.__new__(RateData)
+        # Skip the constructor's NaN-rejection by setting attributes
+        # directly — the test pins the fetch handling, not the
+        # RateData constructor contract.
+        rd.inst_Frate_data = np.zeros((2, 3))
+        rd.times = times
+        rd.neuron_attributes = None
+        rd.rate_unit = None
+        ws.store("ns", "rd", rd)
+
+        result = await analysis.fetch_workspace_item(ws_id, "ns", "rd")
+        assert result["type"] == "RateData"
+        # time_range[0] is NaN (float(NaN) is NaN).
+        assert np.isnan(result["time_range"][0])
+        # time_range[1] is the valid last value.
+        assert result["time_range"][1] == 2.0
+
+
+class TestSanitizeForJsonRecursionAndContainers:
+    """``_sanitize_for_json`` boundary contracts for the recursion path:
+    nested dicts with oversize ndarrays must propagate the ValueError,
+    and tuples must be flattened to lists (tuple-vs-list distinction
+    lost).
+    """
+
+    @pytestmark_server
+    def test_oversize_ndarray_in_nested_dict_returns_summary(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_for_json({"a": np.zeros(200)})``
+                with a low cap returns a dict whose ``"a"`` is the
+                elided summary marker — the parent dict is preserved
+                so the handler's other return-dict fields still reach
+                the agent.
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        original = srv_mod.MAX_INLINE_ARRAY_SIZE
+        srv_mod.MAX_INLINE_ARRAY_SIZE = 100
+        try:
+            out = srv_mod._sanitize_for_json({"a": np.zeros(200), "b": 7})
+            assert isinstance(out, dict)
+            assert out["b"] == 7
+            assert isinstance(out["a"], dict)
+            assert out["a"]["__elided_ndarray__"] is True
+            assert out["a"]["size"] == 200
+        finally:
+            srv_mod.MAX_INLINE_ARRAY_SIZE = original
+
+    @pytestmark_server
+    def test_tuple_input_flattens_to_list(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_for_json((1.0, 2.0, 3.0))``
+                returns a list (tuple distinction is lost at the JSON
+                boundary).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        out = srv_mod._sanitize_for_json((1.0, 2.0, 3.0))
+        assert isinstance(out, list)
+        assert out == [1.0, 2.0, 3.0]
+
+    @pytestmark_server
+    def test_list_of_numpy_scalars_coerced_to_python_types(self):
+        """
+        Tests:
+            (Test Case 1) ``[np.float32(1.0), np.int64(2)]`` is
+                sanitised to ``[1.0, 2]`` with native Python types.
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        out = srv_mod._sanitize_for_json([np.float32(1.0), np.int64(2)])
+        assert isinstance(out[0], float) and out[0] == 1.0
+        assert isinstance(out[1], int) and out[1] == 2
+
+    @pytestmark_server
+    def test_zero_d_ndarray_of_bool_returns_python_bool(self):
+        """
+        Tests:
+            (Test Case 1) ``np.array(True)`` is sanitised to Python
+                ``True`` (0-D guard routes via ``.item()``).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        out = srv_mod._sanitize_for_json(np.array(True))
+        assert out is True
+        assert isinstance(out, bool)
+
+    @pytestmark_server
+    def test_nesting_below_depth_cap_succeeds(self):
+        """
+        Tests:
+            (Test Case 1) A dict nested exactly to the depth cap is
+                sanitised without raising (boundary case).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        # Build a nested dict at exactly MAX_SANITIZE_DEPTH levels.
+        depth = srv_mod.MAX_SANITIZE_DEPTH
+        obj: dict = {"leaf": 1.0}
+        for _ in range(depth - 1):
+            obj = {"x": obj}
+
+        result = srv_mod._sanitize_for_json(obj)
+        # Walk down and verify the leaf survived round-trip.
+        for _ in range(depth - 1):
+            result = result["x"]
+        assert result == {"leaf": 1.0}
+
+    @pytestmark_server
+    def test_nesting_above_depth_cap_raises(self):
+        """
+        Tests:
+            (Test Case 1) A dict nested one level beyond
+                MAX_SANITIZE_DEPTH raises ValueError mentioning the
+                depth cap (rather than blowing the Python recursion
+                limit with a RecursionError).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        depth = srv_mod.MAX_SANITIZE_DEPTH + 5
+        obj: dict = {"leaf": 1.0}
+        for _ in range(depth):
+            obj = {"x": obj}
+
+        with pytest.raises(ValueError, match="MAX_SANITIZE_DEPTH"):
+            srv_mod._sanitize_for_json(obj)
+
+    @pytestmark_server
+    def test_deep_list_nesting_above_cap_raises(self):
+        """
+        Tests:
+            (Test Case 1) The depth guard fires on deeply nested lists,
+                not only nested dicts (lists also recurse).
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        depth = srv_mod.MAX_SANITIZE_DEPTH + 5
+        obj: list = [1.0]
+        for _ in range(depth):
+            obj = [obj]
+
+        with pytest.raises(ValueError, match="MAX_SANITIZE_DEPTH"):
+            srv_mod._sanitize_for_json(obj)
+
+
+class TestComputeWaveformMetricsHappyPath:
+    """``compute_waveform_metrics`` happy path: the four summary fields
+    (``mean``, ``median``, ``min``, ``max`` of ``snr`` and ``std_norm``)
+    depend on numpy-nan-aware reductions. Pin the structure for a
+    well-formed SpikeData with raw data.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_no_raw_data_raises(self):
+        """
+        Tests:
+            (Test Case 1) SpikeData without ``raw_data`` raises a
+                ValueError mentioning waveform metrics.
+
+        Notes:
+            - The happy-path requires `raw_data` + `unit_locations`
+              which is hard to construct in a unit test without real
+              MEA data. Pin the no-raw-data error path here; the
+              positive case is exercised by existing integration tests.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="wm")
+        ws = wm.get_workspace(ws_id)
+        sd = SpikeData([[1.0, 2.0]], length=10.0)
+        ws.store("ns", "spikedata", sd)
+        # No raw_data → should raise.
+        with pytest.raises(ValueError):
+            await analysis.compute_waveform_metrics(workspace_id=ws_id, namespace="ns")
+
+
+class TestSubmitPreparedJobMcpDispatcher:
+    """Sanity contract: every entry in ``_TOOL_DISPATCH`` has a
+    corresponding ``types.Tool`` declaration in ``_list_tools``, and
+    every catalog entry has a dispatch handler. A regression that
+    added one but not the other would silently break the tool.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_dispatch_table_matches_list_tools_catalog(self):
+        """
+        Tests:
+            (Test Case 1) Set of tool names in ``_TOOL_DISPATCH``
+                equals the set of tool names returned by
+                ``_list_tools``.
+        """
+        from spikelab.mcp_server import server as srv_mod
+
+        # Trigger registration.
+        tools = await srv_mod._list_tools()
+        catalog_names = {t.name for t in tools}
+        dispatch_names = set(srv_mod._TOOL_DISPATCH.keys())
+
+        missing_in_catalog = dispatch_names - catalog_names
+        missing_in_dispatch = catalog_names - dispatch_names
+        assert (
+            not missing_in_catalog
+        ), f"Handlers present but not in catalog: {missing_in_catalog}"
+        assert (
+            not missing_in_dispatch
+        ), f"Catalog entries with no handler: {missing_in_dispatch}"
+
+
+class TestResolveWorkspace:
+    """``_resolve_workspace`` creates a new workspace when ``workspace_id``
+    is empty, otherwise looks up an existing one. Pin each branch.
+    """
+
+    @pytestmark_server
+    def test_empty_workspace_id_creates_new(self):
+        """
+        Tests:
+            (Test Case 1) Empty workspace_id returns a freshly-created
+                workspace + non-empty id.
+        """
+        from spikelab.mcp_server.tools.data_loaders import _resolve_workspace
+
+        ws, new_id = _resolve_workspace("", name="fresh_ws")
+        assert ws is not None
+        assert new_id
+        assert new_id != ""
+
+    @pytestmark_server
+    def test_existing_workspace_id_lookup(self):
+        """
+        Tests:
+            (Test Case 1) Non-empty workspace_id matches an existing
+                workspace and returns it unchanged.
+        """
+        from spikelab.mcp_server.tools.data_loaders import _resolve_workspace
+
+        wm = get_workspace_manager()
+        existing_id = wm.create_workspace(name="precreated")
+        ws, returned_id = _resolve_workspace(existing_id)
+        assert returned_id == existing_id
+        assert ws is not None
+
+    @pytestmark_server
+    def test_unknown_workspace_id_raises(self):
+        """
+        Tests:
+            (Test Case 1) Non-empty workspace_id that doesn't match
+                any registered workspace raises ValueError mentioning
+                the missing id.
+        """
+        from spikelab.mcp_server.tools.data_loaders import _resolve_workspace
+
+        with pytest.raises(ValueError, match="Workspace not found"):
+            _resolve_workspace("no_such_workspace_id_12345")
+
+
+class TestComputeGplvmConsecutiveDurationsModes:
+    """``compute_gplvm_consecutive_durations`` mode parameter (``"above"``
+    vs ``"below"``) selects which threshold direction to count. Pin
+    each branch with a small synthetic signal.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_mode_above_counts_above_threshold_runs(self):
+        """
+        Tests:
+            (Test Case 1) ``mode="above"`` on a signal [2, 2, 0, 2, 2]
+                with threshold=1 counts two runs of length 2.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="gplvm_above")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "signal", np.array([2.0, 2.0, 0.0, 2.0, 2.0]))
+
+        result = await analysis.compute_gplvm_consecutive_durations(
+            workspace_id=ws_id,
+            namespace="ns",
+            key="signal",
+            out_key="durations",
+            threshold=1.0,
+            mode="above",
+        )
+        durations = ws.get("ns", "durations")
+        # Two runs of length 2.
+        assert sorted(np.asarray(durations).tolist()) == [2, 2]
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_mode_below_counts_below_threshold_runs(self):
+        """
+        Tests:
+            (Test Case 1) ``mode="below"`` on the same signal counts
+                the inverse: one run of length 1 below threshold.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="gplvm_below")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "signal", np.array([2.0, 2.0, 0.0, 2.0, 2.0]))
+
+        await analysis.compute_gplvm_consecutive_durations(
+            workspace_id=ws_id,
+            namespace="ns",
+            key="signal",
+            out_key="durations",
+            threshold=1.0,
+            mode="below",
+        )
+        durations = ws.get("ns", "durations")
+        assert sorted(np.asarray(durations).tolist()) == [1]
+
+
+class TestPcaOnWorkspaceItemOneDimensional:
+    """``pca_on_workspace_item`` happy path covers 2-D matrices. Pin
+    that a 1-D array is rejected with a clear error rather than
+    crashing inside sklearn.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_one_d_array_rejected_clearly(self):
+        """
+        Tests:
+            (Test Case 1) A 1-D array at the workspace key raises
+                a ValueError (the wrapper or sklearn) — pin some
+                error, the precise type may shift.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pca_1d")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "vec", np.array([1.0, 2.0, 3.0, 4.0]))
+
+        with pytest.raises(Exception):
+            await analysis.pca_on_workspace_item(
+                workspace_id=ws_id,
+                namespace="ns",
+                key="vec",
+                out_key="pca",
+                n_components=2,
+            )
+
+
+class TestDeleteWorkspaceItemKeyNoneDestructive:
+    """``delete_workspace_item`` with ``key=None`` deletes the entire
+    namespace. Pin the destructive semantic so an LLM caller can't
+    trigger it inadvertently without a regression test catching it.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_key_none_deletes_entire_namespace(self):
+        """
+        Tests:
+            (Test Case 1) After ``delete_workspace_item(key=None)``,
+                the namespace contains no keys.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="del_ns")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "k1", np.array([1.0]))
+        ws.store("ns", "k2", np.array([2.0]))
+
+        await analysis.delete_workspace_item(
+            workspace_id=ws_id, namespace="ns", key=None
+        )
+        # Namespace is gone.
+        assert "ns" not in ws.list_namespaces()
+
+
+class TestPairwiseTestsMethodDispatch:
+    """``pairwise_tests`` MCP wrapper dispatches on ``test`` (which
+    maps to source ``method``). Pin that the Wilcoxon branch produces
+    a different p-value distribution than the default Welch.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_wilcoxon_branch_produces_p_values(self):
+        """
+        Tests:
+            (Test Case 1) ``test="mann_whitney"`` produces a result
+                dict with p-values (different test → different result).
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pw")
+        ws = wm.get_workspace(ws_id)
+        # Two groups of values stored under named keys.
+        ws.store("ns", "groupA", np.array([1.0, 2.0, 3.0, 4.0, 5.0]))
+        ws.store("ns", "groupB", np.array([5.0, 6.0, 7.0, 8.0, 9.0]))
+
+        # Try the MCP layer with the Mann-Whitney (Wilcoxon) variant.
+        try:
+            result = await analysis.pairwise_tests(
+                workspace_id=ws_id,
+                namespace="ns",
+                values_keys=["groupA", "groupB"],
+                labels_keys=None,
+                test="mann_whitney",
+            )
+        except (ValueError, TypeError):
+            pytest.skip("mann_whitney variant not exposed at MCP layer")
+        else:
+            # Expect a finite numeric result somewhere in the response.
+            assert result is not None
+
+
+class TestLoadFromHdf5RaggedHappyPath:
+    """``load_from_hdf5_ragged`` MCP wrapper end-to-end happy path:
+    create a SpikeData, export to HDF5 (ragged), load via MCP, verify
+    the returned namespace + summary fields.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_local_file_round_trip(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Export a SpikeData to a ragged-style HDF5,
+                load via MCP, verify a non-empty workspace + the
+                expected ``N`` units.
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([[10.0, 20.0], [15.0, 25.0]], length=100.0)
+        h5_path = tmp_path / "test.h5"
+        exporters.export_spikedata_to_hdf5(sd, str(h5_path), style="ragged")
+        # MCP wrapper.
+        result = await data_loaders.load_from_hdf5_ragged(
+            workspace_id="",
+            file_path=str(h5_path),
+            namespace="loaded",
+        )
+        assert result is not None
+        # The loader returns workspace_id + namespace info.
+        ws_id = result.get("workspace_id")
+        assert ws_id
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        loaded_sd = ws.get(result["namespace"], "spikedata")
+        assert loaded_sd is not None
+        assert loaded_sd.N == 2

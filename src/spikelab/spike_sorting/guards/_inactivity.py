@@ -44,7 +44,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
@@ -217,6 +217,33 @@ def make_in_process_kill_callback(
     return _callback
 
 
+def _require_finite(
+    name: str, value: Any, *, allow_none: bool = False
+) -> Optional[float]:
+    """Reject NaN/Inf at the config-param boundary with a clear error.
+
+    Used by :func:`compute_inactivity_timeout_s` for config parameters
+    (``base_s``, ``per_min_s``, ``max_s``) where NaN almost always
+    indicates a configuration bug rather than legitimate degenerate
+    metadata. Asymmetric with the function's ``recording_duration_min``
+    parameter, which is runtime metadata read from a recording file —
+    NaN there is silently coerced to 0.0 because the upstream is messy
+    and the operator can't always control it.
+    """
+    if allow_none and value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a finite number, got {value!r} "
+            f"({type(value).__name__})."
+        ) from exc
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    return v
+
+
 def compute_inactivity_timeout_s(
     *,
     recording_duration_min: float,
@@ -228,30 +255,60 @@ def compute_inactivity_timeout_s(
 
     Parameters:
         recording_duration_min (float): Recording length in minutes.
-            Negative or NaN values are clamped to zero.
+            **Runtime metadata** — defensively coerced: negative or
+            NaN values become 0.0, numpy scalars are accepted. A
+            malformed upstream never produces a NaN timeout.
         base_s (float): Minimum tolerance applied even for tiny
-            recordings. Defaults to 600 (10 min).
+            recordings. Defaults to 600 (10 min). **Config parameter**
+            — rejected with :class:`ValueError` if NaN or Inf.
         per_min_s (float): Extra seconds of tolerance per minute of
-            recording. Defaults to 30.
+            recording. Defaults to 30. **Config parameter** —
+            rejected with :class:`ValueError` if NaN or Inf.
         max_s (float or None): Hard cap on the tolerance. ``None``
-            means no cap. Defaults to 7200 (2 h).
+            means no cap. Defaults to 7200 (2 h). **Config parameter**
+            — rejected with :class:`ValueError` if NaN or Inf (use
+            ``None`` for "no cap"; NaN-as-no-cap would overload the
+            sentinel and hide misconfig bugs).
 
     Returns:
         timeout_s (float): Resolved inactivity tolerance in seconds.
+
+    Raises:
+        ValueError: If ``base_s``, ``per_min_s``, or ``max_s`` is
+            NaN, Inf, or not coercible to ``float``.
     """
-    # NaN is truthy in Python, so ``recording_duration_min or 0.0``
-    # leaves NaN intact. ``max(0.0, NaN)`` returns NaN on CPython.
-    # Coerce NaN/None to 0 before arithmetic so a malfunctioning
-    # upstream never produces a NaN timeout (NaN comparisons would
-    # silently disable the watchdog).
+    # Config params: strict boundary guard. NaN/Inf in these almost
+    # always indicates a config bug (typo, leaked computation,
+    # missing default); silently propagating produces a NaN timeout
+    # that disables the watchdog without any signal.
+    base_s = _require_finite("base_s", base_s)
+    per_min_s = _require_finite("per_min_s", per_min_s)
+    max_s = _require_finite("max_s", max_s, allow_none=True)
+
+    # Runtime metadata: defensive coerce. NaN is truthy in Python, so
+    # ``recording_duration_min or 0.0`` leaves NaN intact. ``max(0.0,
+    # NaN)`` returns NaN on CPython. Coerce NaN/None to 0 before
+    # arithmetic so a malformed upstream never produces a NaN
+    # timeout. The previous ``isinstance(raw, float)`` check missed
+    # numpy scalars (``np.float64``, ``np.float32``) which are not
+    # Python ``float`` instances — NaN values coming from
+    # numpy-typed metadata could slip through. ``math.isnan``
+    # accepts any real-valued scalar, so guard ``isinstance`` widely
+    # against types ``math.isnan`` rejects (str, list, etc.).
     raw = recording_duration_min
-    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+    is_nan = False
+    if raw is not None:
+        try:
+            is_nan = math.isnan(raw)
+        except TypeError:
+            is_nan = False
+    if raw is None or is_nan:
         duration = 0.0
     else:
         duration = max(0.0, float(raw))
-    timeout = float(base_s) + float(per_min_s) * duration
+    timeout = base_s + per_min_s * duration
     if max_s is not None:
-        timeout = min(timeout, float(max_s))
+        timeout = min(timeout, max_s)
     return timeout
 
 
@@ -314,9 +371,13 @@ class LogInactivityWatchdog:
         kill_grace_s: float = 5.0,
         kill_callback: Optional[Callable[[], None]] = None,
     ) -> None:
-        if inactivity_s is not None and (np.isnan(inactivity_s) or inactivity_s <= 0.0):
+        if inactivity_s is not None and (
+            np.isnan(inactivity_s) or np.isinf(inactivity_s) or inactivity_s <= 0.0
+        ):
             raise ValueError(
-                f"inactivity_s must be positive or None, got {inactivity_s}."
+                f"inactivity_s must be a positive finite number or None, got "
+                f"{inactivity_s}. An infinite tolerance would silently disable the "
+                "stall watchdog."
             )
         if np.isnan(poll_interval_s) or poll_interval_s <= 0.0:
             raise ValueError(
@@ -337,6 +398,14 @@ class LogInactivityWatchdog:
         self._tripped = False
         self._last_seen_mtime: Optional[float] = None
         self._last_seen_size: Optional[int] = None
+        # Track inode too so a log rotated via delete-and-recreate
+        # registers as progress even when the new file inherits the
+        # old file's mtime + size (e.g. ``touch -r`` after recreate,
+        # or external rotation that preserves both signals). On
+        # Windows + FAT/exFAT/some network shares ``st_ino`` is 0
+        # for every file; the change-check below tolerates that by
+        # falling back to mtime+size when both ino values are 0.
+        self._last_seen_ino: Optional[int] = None
         self._inactivity_at_trip: Optional[float] = None
         # Disabled when there is no timeout to enforce, or when there
         # is no kill target at all (neither a subprocess nor a
@@ -384,14 +453,21 @@ class LogInactivityWatchdog:
     def __enter__(self) -> "LogInactivityWatchdog":
         if not self._enabled:
             return self
-        # Capture the pre-existing mtime + size so a stale log from
-        # a previous run does not register as a fresh trip.
+        # Capture the pre-existing mtime + size + inode so a stale
+        # log from a previous run does not register as a fresh trip,
+        # and a same-mtime-same-size recreate is still detected via
+        # the inode change.
         signals = self._read_signals()
         if signals is not None:
-            self._last_seen_mtime, self._last_seen_size = signals
+            (
+                self._last_seen_mtime,
+                self._last_seen_size,
+                self._last_seen_ino,
+            ) = signals
         else:
             self._last_seen_mtime = None
             self._last_seen_size = None
+            self._last_seen_ino = None
         _logger.info(
             "active: sorter=%s tolerance=%.1fs poll=%.1fs log=%s",
             self.sorter,
@@ -418,11 +494,19 @@ class LogInactivityWatchdog:
     # Internals
     # ------------------------------------------------------------------
 
-    def _read_signals(self) -> Optional[Tuple[float, int]]:
-        """Return ``(mtime, size)`` for the log file, or None if absent."""
+    def _read_signals(self) -> Optional[Tuple[float, int, int]]:
+        """Return ``(mtime, size, inode)`` for the log file, or None if absent.
+
+        The inode is included so external log replacement
+        (delete + recreate with the same mtime and size) registers
+        as progress. On Windows + FAT/exFAT/some network shares
+        ``st_ino`` is always 0; the change-check in the poll loop
+        falls back to mtime + size when both old and new inode are
+        0, so the loss of signal is silent on those platforms.
+        """
         try:
             st = os.stat(self.log_path)
-            return float(st.st_mtime), int(st.st_size)
+            return float(st.st_mtime), int(st.st_size), int(st.st_ino)
         except (OSError, FileNotFoundError):
             return None
 
@@ -445,21 +529,38 @@ class LogInactivityWatchdog:
             now = time.time()
 
             if signals is not None:
-                cur_mtime, cur_size = signals
+                cur_mtime, cur_size, cur_ino = signals
                 if not seen_any:
                     # File just appeared.
                     seen_any = True
                     self._last_seen_mtime = cur_mtime
                     self._last_seen_size = cur_size
+                    self._last_seen_ino = cur_ino
                     last_progress_t = now
-                elif (
-                    cur_mtime != self._last_seen_mtime
-                    or cur_size != self._last_seen_size
-                ):
-                    # Either signal advanced — reset the inactivity clock.
-                    self._last_seen_mtime = cur_mtime
-                    self._last_seen_size = cur_size
-                    last_progress_t = now
+                else:
+                    # Inode change indicates the file was replaced
+                    # (delete+recreate, rotation, etc.) — count as
+                    # progress even when mtime + size happen to be
+                    # identical to the prior signal. The ``!= 0``
+                    # guard preserves the prior mtime+size-only
+                    # behaviour on platforms where ``st_ino`` is
+                    # always 0 (Windows + FAT/exFAT/some network
+                    # shares): if neither old nor new ino is
+                    # informative, the ino comparison contributes
+                    # nothing and mtime+size drive the decision.
+                    ino_changed = cur_ino != self._last_seen_ino and (
+                        cur_ino != 0 or self._last_seen_ino != 0
+                    )
+                    if (
+                        cur_mtime != self._last_seen_mtime
+                        or cur_size != self._last_seen_size
+                        or ino_changed
+                    ):
+                        # Any signal advanced — reset the inactivity clock.
+                        self._last_seen_mtime = cur_mtime
+                        self._last_seen_size = cur_size
+                        self._last_seen_ino = cur_ino
+                        last_progress_t = now
                 # Recovered after a previous lost-file episode.
                 lost_warned = False
             elif seen_any:

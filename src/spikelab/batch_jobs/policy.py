@@ -34,6 +34,18 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
     constructs like ``while true; do sleep 60; done`` or obfuscated
     variants. The goal is to flag accidental misuse, not to prevent
     determined circumvention.
+
+    Notes:
+        - The bare-``sleep`` check fires only when ``sleep`` is the sole
+          token across ``command + args``. A trailing token that
+          happens to be the literal string ``"sleep"`` (e.g.
+          ``["python", "-c", "sleep"]``, where ``"sleep"`` is a Python
+          snippet, not a shell command) is intentionally NOT flagged.
+          This avoids false positives on commands that legitimately
+          pass the string ``"sleep"`` as an argument. The downside is
+          that a determined operator can sneak in a real
+          ``exec("sleep infinity")``-style payload; this is documented
+          as out-of-scope for the heuristic.
     """
     # Flatten multi-word tokens (e.g., ["sleep infinity"] from sh -c)
     # into individual words for consistent token-pair matching.
@@ -93,15 +105,31 @@ def evaluate_policy(
             )
         )
 
-    if cfg.block_sleep_infinity and _contains_disallowed_sleep(
+    sleep_present = _contains_disallowed_sleep(
         job_spec.container.command, job_spec.container.args
-    ):
+    )
+    if cfg.block_sleep_infinity and sleep_present:
         findings.append(
             PolicyFinding(
                 "sleep_in_batch_job",
                 "BLOCK",
                 "Batch jobs containing 'sleep infinity' or trailing sleep "
                 "are disallowed.",
+            )
+        )
+    elif sleep_present:
+        # ``block_sleep_infinity`` is disabled in the profile, but a
+        # sleep pattern *was* detected. Surfacing this as a WARN keeps
+        # the audit trail honest — the previous code emitted a PASS
+        # ("No forbidden sleep patterns detected") even though the
+        # pattern was present, just not blocked.
+        findings.append(
+            PolicyFinding(
+                "sleep_in_batch_job",
+                "WARN",
+                "Sleep pattern detected but block_sleep_infinity is "
+                "disabled in this profile; the job will be permitted "
+                "but the pattern is recorded for audit.",
             )
         )
     else:

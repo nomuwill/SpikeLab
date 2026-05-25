@@ -74,12 +74,23 @@ def is_s3_url(url: str) -> bool:
         return True
     if lower.startswith("https://") or lower.startswith("http://"):
         parsed = urlparse(url)
-        # Matches path-style and virtual-hosted-style S3 endpoints:
-        # - s3.amazonaws.com
-        # - s3.<region>.amazonaws.com
-        # - <bucket>.s3.amazonaws.com
-        # - <bucket>.s3.<region>.amazonaws.com
-        return "s3" in parsed.netloc and "amazonaws.com" in parsed.netloc
+        host = parsed.netloc.lower()
+        # Anchor the host check to the right-hand side so a hostile
+        # host like ``s3.evil.amazonaws.com.attacker.example`` (which
+        # passes a naive ``in`` substring test) does not slip
+        # through. Accept any host that ENDS with ``.amazonaws.com``
+        # and either starts with ``s3`` (path-style endpoints like
+        # ``s3.amazonaws.com``, ``s3.us-west-2.amazonaws.com``) or
+        # contains ``.s3`` followed by either ``.amazonaws.com`` or
+        # ``.<region>.amazonaws.com`` (virtual-hosted-style like
+        # ``my-bucket.s3.amazonaws.com``).
+        if not host.endswith(".amazonaws.com") and host != "amazonaws.com":
+            return False
+        if host.startswith("s3.") or host == "s3.amazonaws.com":
+            return True
+        if ".s3." in host or host.endswith(".s3.amazonaws.com"):
+            return True
+        return False
     return False
 
 
@@ -106,7 +117,12 @@ def parse_s3_url(url: str) -> Tuple[str, str]:
         parts = path.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        if not key or key == "/":
+        # Strip a single trailing slash so ``s3://bucket/key/`` is
+        # treated the same as ``s3://bucket/key`` and reaches a real
+        # object instead of falling through to boto3 as an empty
+        # prefix (which produces a cryptic NoSuchKey).
+        key = key.rstrip("/")
+        if not key:
             raise ValueError(
                 f"S3 URL '{url}' has no object key. "
                 "A bucket-only URL cannot identify a downloadable object."
@@ -193,6 +209,11 @@ def download_from_s3(
     )
     s3_client = boto3.client("s3", **s3_kwargs)
 
+    # Track whether we allocated the temp file ourselves so we can
+    # clean it up on failure (the previous path always left the empty
+    # NamedTemporaryFile on disk after a download exception, even when
+    # the caller never saw the path).
+    created_temp = local_path is None
     if local_path is None:
         suffix = Path(key).suffix if key else ".tmp"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -203,8 +224,10 @@ def download_from_s3(
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
 
+    download_succeeded = False
     try:
         s3_client.download_file(bucket, key, local_path)
+        download_succeeded = True
         return local_path
     except ClientError as e:
         error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
@@ -220,6 +243,16 @@ def download_from_s3(
             "AWS credentials not found. Set AWS_ACCESS_KEY_ID and "
             "AWS_SECRET_ACCESS_KEY environment variables or configure AWS credentials."
         ) from e
+    finally:
+        # Tidy up the auto-created temp file when download_file
+        # raised (ClientError, NoCredentialsError, or any other
+        # exception including KeyboardInterrupt). Caller-supplied
+        # ``local_path`` is left untouched — the caller owns it.
+        if not download_succeeded and created_temp:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
 
 def upload_to_s3(

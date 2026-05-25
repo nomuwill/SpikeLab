@@ -27,6 +27,8 @@ import sys
 import tempfile
 import threading
 import time
+
+import numpy as np
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -1275,9 +1277,7 @@ class TestLogInactivityWatchdogConstruction:
             (Test Case 2) inactivity_s=-5 → ValueError.
         """
         for bad in (0, -5):
-            with pytest.raises(
-                ValueError, match="inactivity_s must be positive or None"
-            ):
+            with pytest.raises(ValueError, match="inactivity_s must be"):
                 LogInactivityWatchdog(
                     log_path=tmp_path / "log",
                     popen=mock.Mock(spec=subprocess.Popen),
@@ -5021,22 +5021,28 @@ class TestGetTotalRamBytes:
 
 
 class TestLogInactivityWatchdogReadSignals:
-    """``LogInactivityWatchdog._read_signals`` returns (mtime, size)."""
+    """``LogInactivityWatchdog._read_signals`` returns (mtime, size, ino).
 
-    def test_returns_mtime_size_for_existing_file(self, tmp_path):
+    The third element (inode) lets the watchdog detect log rotation
+    via delete+recreate even when mtime and size happen to be
+    identical to the prior signal.
+    """
+
+    def test_returns_mtime_size_ino_for_existing_file(self, tmp_path):
         """
-        Existing log file → tuple of (mtime, size) as floats/ints.
+        Existing log file → tuple of (mtime, size, ino).
 
         Tests:
-            (Test Case 1) After writing content to a log file, the
-                helper returns a tuple whose first value matches the
-                file's mtime and second value matches its byte size
-                (compared against the on-disk byte count to avoid
-                Windows CRLF line-ending differences).
+            (Test Case 1) ``_read_signals`` returns a 3-tuple.
+            (Test Case 2) mtime matches the file's mtime.
+            (Test Case 3) size matches the on-disk byte count.
+            (Test Case 4) inode matches ``os.stat(...).st_ino`` (may
+                be 0 on Windows + FAT/exFAT/some network shares;
+                the change-check in the poll loop tolerates that).
         """
         log = tmp_path / "rec.log"
         log.write_bytes(b"hello\nworld\n")
-        on_disk_size = log.stat().st_size
+        on_disk = log.stat()
         wd = LogInactivityWatchdog(
             log_path=log,
             popen=mock.Mock(spec=subprocess.Popen),
@@ -5045,11 +5051,13 @@ class TestLogInactivityWatchdogReadSignals:
         )
         signals = wd._read_signals()
         assert signals is not None
-        mtime, size = signals
+        mtime, size, ino = signals
         assert isinstance(mtime, float)
         assert isinstance(size, int)
-        assert size == on_disk_size
-        assert abs(mtime - log.stat().st_mtime) < 1e-6
+        assert isinstance(ino, int)
+        assert size == on_disk.st_size
+        assert abs(mtime - on_disk.st_mtime) < 1e-6
+        assert ino == on_disk.st_ino
 
     def test_returns_none_for_missing_file(self, tmp_path):
         """
@@ -7472,7 +7480,7 @@ class TestComputeInactivityTimeoutSEdges:
             max_s=None,
         )
         assert timeout < 0
-        with pytest.raises(ValueError, match="inactivity_s must be positive"):
+        with pytest.raises(ValueError, match="inactivity_s must be"):
             LogInactivityWatchdog(
                 log_path=tmp_path / "rec.log",
                 popen=mock.Mock(spec=subprocess.Popen),
@@ -13679,3 +13687,1233 @@ class TestRunPreflightNanThresholdGuard:
         # The message also references the field name for actionability.
         with pytest.raises(ValueError, match=field):
             run_preflight(cfg, [mock.Mock()], ["/inter"], ["/results"])
+
+
+class TestHostMemoryWatchdogNaNThresholds:
+    """``HostMemoryWatchdog.__init__`` rejects NaN threshold values.
+
+    The other four watchdogs (Disk, GPU, IOStall, Inactivity) explicitly
+    guard against NaN thresholds — the symmetric check for the host
+    memory watchdog falls out of the existing
+    ``0.0 < warn_pct < abort_pct <= 100.0`` chain comparison: any NaN
+    operand makes the chain False, so construction raises. Pin this
+    behaviour so a future refactor that decomposes the chain (e.g.
+    into separate ``warn_pct > 0`` / ``abort_pct <= 100`` checks)
+    cannot accidentally drop the implicit NaN rejection.
+    """
+
+    def test_nan_warn_pct_raises(self):
+        """
+        ``warn_pct=NaN`` makes the threshold chain comparison False,
+        triggering the construction ``ValueError``.
+
+        Tests:
+            (Test Case 1) ValueError raised.
+            (Test Case 2) Message references both threshold names so
+                callers can identify the misconfigured field.
+        """
+        with pytest.raises(ValueError, match="warn_pct"):
+            HostMemoryWatchdog(warn_pct=float("nan"))
+
+    def test_nan_abort_pct_raises(self):
+        """
+        ``abort_pct=NaN`` is rejected for the same reason as
+        ``warn_pct=NaN`` — the chain comparison short-circuits to
+        False.
+
+        Tests:
+            (Test Case 1) ValueError raised.
+            (Test Case 2) Message references ``abort_pct``.
+        """
+        with pytest.raises(ValueError, match="abort_pct"):
+            HostMemoryWatchdog(abort_pct=float("nan"))
+
+    def test_nan_both_thresholds_raises(self):
+        """
+        Both ``warn_pct`` and ``abort_pct`` set to NaN still raises;
+        the chain comparison is False regardless of which operand is
+        NaN.
+
+        Tests:
+            (Test Case 1) ValueError raised.
+        """
+        with pytest.raises(ValueError):
+            HostMemoryWatchdog(warn_pct=float("nan"), abort_pct=float("nan"))
+
+
+class TestRunPreflightDuckTypedIterables:
+    """``run_preflight`` documents its inputs as ``Sequence[Any]`` and
+    only iterates them. Pin two duck-typed cases that the type hint
+    alone does not pin down: tuples are accepted as drop-in
+    replacements for lists, and unequal-length intermediate/results
+    sequences do NOT trigger a length validation — each is iterated
+    independently. A future refactor that introduces a ``zip(...)``
+    over the two folder sequences would silently change semantics for
+    callers that rely on the current independent iteration; these
+    tests lock that contract in place.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _silence_v2_helpers(self, monkeypatch):
+        """Mute the FEAT-001..003 dispatchers and writable check so the
+        run completes without OS-side side effects on placeholder paths.
+        Mirrors the ``TestRunPreflight`` fixture so the new tests stay
+        hermetic on developer workstations.
+        """
+        monkeypatch.setattr(preflight_mod, "_check_sorter_dependencies", lambda c: [])
+        monkeypatch.setattr(preflight_mod, "_check_gpu_device_present", lambda c: None)
+        monkeypatch.setattr(
+            preflight_mod, "_check_recording_sample_rate", lambda c, recs: []
+        )
+        monkeypatch.setattr(
+            preflight_mod,
+            "_check_filesystem_writable",
+            lambda folders, *, label, code_prefix: [],
+        )
+
+    def test_tuple_recording_files_iterates_like_list(self, monkeypatch):
+        """
+        Passing ``recording_files`` as a tuple behaves identically to
+        passing it as a list. A non-empty tuple should not raise the
+        empty-sequence fail finding.
+
+        Tests:
+            (Test Case 1) Tuple of one mock is accepted (no
+                ``no_recordings`` finding).
+            (Test Case 2) Final findings list type is ``list``.
+        """
+        cfg = _make_config(sorter_name="kilosort2")
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+        findings = run_preflight(
+            cfg,
+            (mock.Mock(),),  # tuple, not list
+            ["/inter"],
+            ["/results"],
+        )
+        codes = [f.code for f in findings]
+        assert "no_recordings" not in codes
+        assert isinstance(findings, list)
+
+    def test_unequal_intermediate_and_results_iterate_independently(self, monkeypatch):
+        """
+        ``intermediate_folders`` and ``results_folders`` are iterated
+        independently — there is no length-equality validation and no
+        ``zip`` truncation. Each folder produces its own per-folder
+        finding without any cross-sequence pairing.
+
+        Tests:
+            (Test Case 1) Two intermediate folders both produce
+                ``low_disk_inter`` findings.
+            (Test Case 2) One results folder produces a single
+                ``low_disk_results`` finding (not truncated by the
+                shorter cross-list).
+            (Test Case 3) No ValueError is raised for the length
+                mismatch.
+        """
+        cfg = _make_config(sorter_name="kilosort2")
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 1.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+        findings = run_preflight(
+            cfg,
+            [mock.Mock()],
+            ["/inter_a", "/inter_b"],  # length 2
+            ["/results_a"],  # length 1
+        )
+        inter_findings = [f for f in findings if f.code == "low_disk_inter"]
+        results_findings = [f for f in findings if f.code == "low_disk_results"]
+        assert len(inter_findings) == 2
+        assert len(results_findings) == 1
+
+
+class TestComputeInactivityTimeoutSNaNBaseAndMax:
+    """``compute_inactivity_timeout_s`` strict NaN handling on config
+    parameters.
+
+    The source treats ``recording_duration_min`` as runtime metadata
+    (defensively coerced — NaN/None/numpy-NaN → 0.0) but treats
+    ``base_s``, ``per_min_s``, and ``max_s`` as config parameters
+    where NaN/Inf almost always indicates a configuration bug.
+    Config-param NaN raises :class:`ValueError` with a clear
+    "must be a finite number" message rather than silently producing
+    a NaN timeout (which would propagate through every downstream
+    comparison and disable the watchdog).
+
+    The ``recording_duration_min`` asymmetry is intentional: upstream
+    metadata is often malformed in ways the operator cannot control,
+    so defensive coercion is appropriate there. Config parameters
+    are caller-controlled — fail loudly on bogus input.
+    """
+
+    def test_base_s_nan_raises(self):
+        """
+        ``base_s=NaN`` raises :class:`ValueError` (config-param strict
+        guard).
+
+        Tests:
+            (Test Case 1) Call raises ``ValueError`` with
+                "base_s must be a finite number" substring.
+            (Test Case 2) The result is never silently a NaN float.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(ValueError, match="base_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=float("nan"),
+                per_min_s=30.0,
+                max_s=7200.0,
+            )
+
+    def test_max_s_nan_raises(self):
+        """
+        ``max_s=NaN`` raises :class:`ValueError` rather than silently
+        skipping the cap. (Pre-fix: ``min(timeout, NaN)`` on CPython
+        returned ``timeout`` and let the cap silently disappear.)
+
+        Tests:
+            (Test Case 1) Call raises ``ValueError`` with
+                "max_s must be a finite number" substring.
+            (Test Case 2) ``max_s=None`` still means "no cap" — that
+                sentinel remains the canonical way to disable the
+                cap; NaN is NOT a synonym.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(ValueError, match="max_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=600.0,
+                per_min_s=30.0,
+                max_s=float("nan"),
+            )
+        # Confirm None still means "no cap"
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=1000.0,
+            base_s=600.0,
+            per_min_s=30.0,
+            max_s=None,
+        )
+        assert result == 600.0 + 30.0 * 1000.0
+
+    def test_per_min_s_nan_raises(self):
+        """
+        ``per_min_s=NaN`` raises :class:`ValueError` (config-param
+        strict guard). Pre-fix this would propagate NaN through
+        ``per_min_s * duration``.
+
+        Tests:
+            (Test Case 1) Call raises ``ValueError`` with
+                "per_min_s must be a finite number" substring.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(ValueError, match="per_min_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0,
+                base_s=600.0,
+                per_min_s=float("nan"),
+                max_s=7200.0,
+            )
+
+    def test_config_inf_also_raises(self):
+        """
+        ``Inf`` config values raise too (same boundary-guard contract).
+
+        Tests:
+            (Test Case 1) ``base_s=inf`` raises.
+            (Test Case 2) ``max_s=inf`` raises (use ``None`` for "no cap").
+            (Test Case 3) ``per_min_s=-inf`` raises.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        with pytest.raises(ValueError, match="base_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, base_s=float("inf")
+            )
+        with pytest.raises(ValueError, match="max_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, max_s=float("inf")
+            )
+        with pytest.raises(ValueError, match="per_min_s must be a finite number"):
+            compute_inactivity_timeout_s(
+                recording_duration_min=10.0, per_min_s=float("-inf")
+            )
+
+    def test_recording_duration_min_nan_still_defensive(self):
+        """
+        ``recording_duration_min=NaN`` is asymmetric — it's runtime
+        metadata, not a config parameter, so defensive coercion
+        (NaN/None → 0.0) is preserved.
+
+        Tests:
+            (Test Case 1) ``recording_duration_min=float('nan')`` →
+                returns ``base_s`` (i.e. the duration coerced to 0).
+            (Test Case 2) ``recording_duration_min=None`` → same.
+        """
+        from spikelab.spike_sorting.guards._inactivity import (
+            compute_inactivity_timeout_s,
+        )
+
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=float("nan"),
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=None,
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
+
+
+class TestHostMemoryWatchdogDoubleEnter:
+    """``HostMemoryWatchdog`` raises ``RuntimeError`` when ``__enter__``
+    is called a second time while the watchdog is still active (i.e.
+    no intervening ``__exit__``). The class stores a single
+    ``self._token`` and is not designed to be reentrant; the guard
+    converts a silent ContextVar-leak hazard into an actionable error.
+
+    This pins the post-fix contract from the source guard (commit
+    that closes the "HostMemoryWatchdog double-enter leaks token"
+    oddity). After the first exit, re-entering is fine — the
+    watchdog is reusable, just not nestable.
+    """
+
+    def test_double_enter_raises_runtime_error(self):
+        """
+        Tests:
+            (Test Case 1) First ``__enter__`` succeeds and publishes
+                the watchdog.
+            (Test Case 2) A second ``__enter__`` without an
+                intervening exit raises ``RuntimeError`` with a
+                message mentioning "not reentrant".
+            (Test Case 3) The watchdog is still published after the
+                failed second enter (the first enter's token survives).
+            (Test Case 4) Exiting normally clears the ContextVar — a
+                single ``__exit__`` is sufficient because the second
+                enter never published a new token.
+        """
+        wd = HostMemoryWatchdog()
+        assert get_active_watchdog() is None
+        wd.__enter__()
+        first_token = wd._token
+        assert first_token is not None
+        assert get_active_watchdog() is wd
+        try:
+            with pytest.raises(RuntimeError, match="not reentrant"):
+                wd.__enter__()
+            # First token still present — the second enter raised
+            # before mutating ``self._token``.
+            assert wd._token is first_token
+            assert get_active_watchdog() is wd
+        finally:
+            wd.__exit__(None, None, None)
+            # Single exit cleanly clears the ContextVar.
+            assert get_active_watchdog() is None
+
+    def test_reuse_after_exit_is_allowed(self):
+        """
+        The "not reentrant" guard only rejects re-entering while the
+        watchdog is still active. Once it has been exited cleanly,
+        the same instance can be entered again — the watchdog is
+        reusable, just not nestable.
+
+        Tests:
+            (Test Case 1) After enter → exit → enter, the second
+                enter succeeds without raising.
+            (Test Case 2) ``get_active_watchdog()`` reflects the
+                re-published watchdog.
+        """
+        wd = HostMemoryWatchdog()
+        wd.__enter__()
+        wd.__exit__(None, None, None)
+        assert get_active_watchdog() is None
+        # Re-enter is fine now.
+        wd.__enter__()
+        try:
+            assert get_active_watchdog() is wd
+        finally:
+            wd.__exit__(None, None, None)
+        assert get_active_watchdog() is None
+
+
+class TestGpuMemoryWatchdogDoubleEnter:
+    """``GpuMemoryWatchdog.__enter__`` raises ``RuntimeError`` when
+    called a second time without an intervening ``__exit__`` —
+    symmetric with the HostMemoryWatchdog guard. Pre-fix, double-
+    enter overwrote ``self._token`` and leaked the active-watchdog
+    publication. Post-fix, the misuse is loud.
+    """
+
+    def test_double_enter_raises_runtime_error(self):
+        """
+        Tests:
+            (Test Case 1) First ``__enter__`` succeeds (low used-pct
+                keeps the watchdog quiescent).
+            (Test Case 2) Second ``__enter__`` raises ``RuntimeError``
+                with "GpuMemoryWatchdog is not reentrant" in the
+                message.
+            (Test Case 3) The first ``_token`` survives the failed
+                second enter (guard fires before mutating state).
+        """
+        from spikelab.spike_sorting.guards import _gpu_watchdog as gpu_mod
+
+        # Patch the GPU-memory reader so the daemon thread doesn't
+        # need a real CUDA device. 50% used is below the abort/warn
+        # threshold so the watchdog stays quiet during the test.
+        with mock.patch.object(gpu_mod, "read_gpu_memory", lambda i: (50.0, 24.0)):
+            wd = GpuMemoryWatchdog(
+                device_index=0, warn_pct=85, abort_pct=95, poll_interval_s=5.0
+            )
+            wd.__enter__()
+            first_token = wd._token
+            assert first_token is not None
+            try:
+                with pytest.raises(
+                    RuntimeError, match="GpuMemoryWatchdog is not reentrant"
+                ):
+                    wd.__enter__()
+                # Token survives — the guard fires before mutation.
+                assert wd._token is first_token
+            finally:
+                wd.__exit__(None, None, None)
+            assert wd._token is None
+
+    def test_reuse_after_exit_is_allowed(self):
+        """
+        Tests:
+            (Test Case 1) After clean enter → exit → enter, the
+                second enter succeeds and assigns a fresh token.
+        """
+        from spikelab.spike_sorting.guards import _gpu_watchdog as gpu_mod
+
+        with mock.patch.object(gpu_mod, "read_gpu_memory", lambda i: (50.0, 24.0)):
+            wd = GpuMemoryWatchdog(
+                device_index=0, warn_pct=85, abort_pct=95, poll_interval_s=5.0
+            )
+            wd.__enter__()
+            first_token = wd._token
+            wd.__exit__(None, None, None)
+            assert wd._token is None
+            # Re-enter is fine.
+            wd.__enter__()
+            try:
+                assert wd._token is not None
+                assert wd._token is not first_token
+            finally:
+                wd.__exit__(None, None, None)
+            assert wd._token is None
+
+
+class TestIOStallWatchdogDoubleEnter:
+    """``IOStallWatchdog.__enter__`` raises ``RuntimeError`` when
+    called a second time without an intervening ``__exit__`` —
+    symmetric with the HostMemoryWatchdog / GpuMemoryWatchdog guards.
+
+    Note: this test uses process-mode (``pids=...``) rather than
+    device-mode (``folder=...``) so the watchdog can be instantiated
+    without resolving a real block device — the device-mode path
+    short-circuits to disabled on systems where psutil cannot map
+    the path to a device (e.g. CI without /sys mounts).
+    """
+
+    def test_double_enter_raises_runtime_error(self):
+        """
+        Tests:
+            (Test Case 1) First ``__enter__`` succeeds (mocked PID
+                I/O counters keep the watchdog quiescent).
+            (Test Case 2) Second ``__enter__`` raises ``RuntimeError``
+                with "IOStallWatchdog is not reentrant".
+            (Test Case 3) The first ``_token`` survives the failed
+                second enter.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        # Mock the PID-mode counter probe so the watchdog enables.
+        # _read_io_bytes_for_pids returns (initial_counter, alive_count).
+        with mock.patch.object(iom, "_read_io_bytes_for_pids", return_value=(1000, 1)):
+            wd = IOStallWatchdog(pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0)
+            wd.__enter__()
+            first_token = wd._token
+            assert first_token is not None
+            try:
+                with pytest.raises(
+                    RuntimeError, match="IOStallWatchdog is not reentrant"
+                ):
+                    wd.__enter__()
+                assert wd._token is first_token
+            finally:
+                wd.__exit__(None, None, None)
+            assert wd._token is None
+
+    def test_reuse_after_exit_is_allowed(self):
+        """
+        Tests:
+            (Test Case 1) After clean enter → exit → enter, the
+                second enter succeeds and assigns a fresh token.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        with mock.patch.object(iom, "_read_io_bytes_for_pids", return_value=(1000, 1)):
+            wd = IOStallWatchdog(pids=[os.getpid()], stall_s=10.0, poll_interval_s=5.0)
+            wd.__enter__()
+            first_token = wd._token
+            wd.__exit__(None, None, None)
+            assert wd._token is None
+            wd.__enter__()
+            try:
+                assert wd._token is not None
+                assert wd._token is not first_token
+            finally:
+                wd.__exit__(None, None, None)
+            assert wd._token is None
+
+
+class TestIOStallWatchdogBlindReadTrip:
+    """``IOStallWatchdog`` blind-read trip contract (commit 6a74e16).
+
+    When ``_read_bytes`` returns ``None`` ("blind" — counters
+    unreadable), the poll loop must:
+
+    * Preserve ``last_change_t`` across the blind cycle so a real
+      stall that coincides with a transient psutil hiccup still
+      trips.
+    * Treat sustained blindness as a trip condition: warn once at
+      ``stall_s``, trip via :meth:`_on_trip_blind` at ``2 * stall_s``.
+    * Emit ``event="abort_blind"`` with ``blind_for_s`` and
+      ``tolerance_s = 2 * stall_s`` on the blind trip.
+    * Clear blind tracking state on a successful read so a later
+      blind episode is reported afresh.
+    * Respect the ``_stop_event``-set gate to skip
+      ``_thread.interrupt_main`` on tear-down — mirroring the
+      observed-stall ``_on_trip`` path.
+    """
+
+    def test_transient_blindness_preserves_timer(self, tmp_path, monkeypatch):
+        """
+        A transient ``None`` read between two equal byte values must
+        NOT reset ``last_change_t``. We drive the device-mode poll
+        loop with a sequence in which the counter is flat for the
+        whole window except for one ``None`` in the middle; the
+        watchdog must still trip on accumulated stall.
+
+        Sequence per poll: ``100, 100, 100, None, 100, 100, ...``
+        With ``stall_s=0.5`` and ``poll_interval_s=0.05`` the trip
+        window is short relative to the wallclock test budget; if
+        the blind read had reset ``last_change_t``, the post-blind
+        flat reads would only have accumulated a fraction of
+        stall_s by trip evaluation and the watchdog would not fire
+        within the test window.
+
+        Tests:
+            (Test Case 1) Flat counters interrupted by a single None
+                still trip the (non-blind) stall path within 3s.
+            (Test Case 2) ``tripped()`` is True and ``_stall_at_trip``
+                is at least ``stall_s`` (i.e. measured from the
+                original ``last_change_t``, not from the post-blind
+                recovery).
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        # One transient None embedded in an otherwise-flat counter.
+        # The leading 100 satisfies ``__enter__``'s baseline probe.
+        seq = iter([100, 100, 100, 100, None, 100, 100])
+
+        def _read(_dev):
+            try:
+                return next(seq)
+            except StopIteration:
+                return 100  # Stay flat after the seeded sequence.
+
+        kill_event = threading.Event()
+        with (
+            mock.patch.object(iom, "_resolve_device_for_path", return_value="sda1"),
+            mock.patch.object(iom, "_read_io_bytes", side_effect=_read),
+        ):
+            wd = IOStallWatchdog(
+                tmp_path,
+                stall_s=0.5,
+                poll_interval_s=0.05,
+                kill_grace_s=0.0,
+            )
+            wd.register_kill_callback(kill_event.set)
+            # ``_thread.interrupt_main`` from the daemon can land in
+            # the test thread as a KeyboardInterrupt; catch it.
+            try:
+                with wd:
+                    fired = kill_event.wait(timeout=3.0)
+            except KeyboardInterrupt:
+                fired = kill_event.is_set()
+
+        assert fired, (
+            "Watchdog should trip on flat counters even with a "
+            "transient blind read — last_change_t must be preserved."
+        )
+        assert wd.tripped() is True
+        # Tripped via the observed-stall path (not blind), so
+        # _stall_at_trip reflects accumulated stall_s.
+        assert wd._stall_at_trip is not None
+        assert wd._stall_at_trip >= wd.stall_s
+
+    def test_sustained_blindness_trips_after_two_stall_s(self, tmp_path, monkeypatch):
+        """
+        When ``_read_bytes`` returns ``None`` for ≥ ``2 * stall_s``
+        of poll cycles, the watchdog must invoke ``_on_trip_blind``,
+        mark ``_tripped = True``, and run registered kill callbacks.
+
+        Tests:
+            (Test Case 1) Patched ``_read_io_bytes`` returns 100 on
+                the ``__enter__`` probe (so the watchdog enables)
+                then ``None`` for every subsequent poll.
+            (Test Case 2) Kill callback fires within ``3 * stall_s``.
+            (Test Case 3) ``tripped()`` is True after the trip.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        call_count = {"n": 0}
+
+        def _read(_dev):
+            call_count["n"] += 1
+            # First call is ``__enter__``'s probe — must succeed.
+            if call_count["n"] == 1:
+                return 100
+            return None
+
+        kill_event = threading.Event()
+        with (
+            mock.patch.object(iom, "_resolve_device_for_path", return_value="sda1"),
+            mock.patch.object(iom, "_read_io_bytes", side_effect=_read),
+        ):
+            wd = IOStallWatchdog(
+                tmp_path,
+                stall_s=0.3,
+                poll_interval_s=0.05,
+                kill_grace_s=0.0,
+            )
+            wd.register_kill_callback(kill_event.set)
+            try:
+                with wd:
+                    # 3 * stall_s gives plenty of margin past
+                    # ``2 * stall_s`` for the blind trip to fire.
+                    fired = kill_event.wait(timeout=3.0)
+            except KeyboardInterrupt:
+                fired = kill_event.is_set()
+
+        assert fired, (
+            "Sustained blindness (None for >= 2 * stall_s) should "
+            "fire the blind trip path."
+        )
+        assert wd.tripped() is True
+
+    def test_abort_blind_audit_event_shape(self, tmp_path, monkeypatch):
+        """
+        ``_on_trip_blind`` writes an audit event with
+        ``event="abort_blind"`` carrying ``blind_for_s`` (NOT
+        ``stalled_for_s``) and ``tolerance_s = 2 * stall_s``, plus
+        ``mode``, ``device`` and (None-for-device-mode) ``pids``.
+
+        Tests:
+            (Test Case 1) Patched ``append_audit_event`` records the
+                event shape after a direct ``_on_trip_blind`` call.
+            (Test Case 2) ``_thread.interrupt_main`` is suppressed
+                via the documented ``_stop_event.set()`` gate so the
+                test thread does not receive a phantom interrupt.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        wd = IOStallWatchdog(tmp_path, stall_s=10.0, poll_interval_s=1.0)
+        wd._device = "sda1"
+        wd._stop_event.set()  # Suppress interrupt_main.
+
+        captured = []
+
+        def _fake_audit(**kwargs):
+            captured.append(kwargs)
+
+        monkeypatch.setattr(iom, "append_audit_event", _fake_audit)
+
+        wd._on_trip_blind(blind_for=25.0)
+
+        assert wd.tripped() is True
+        assert len(captured) == 1
+        evt = captured[0]
+        assert evt["watchdog"] == "io_stall"
+        assert evt["event"] == "abort_blind"
+        assert evt["mode"] == "device"
+        assert evt["device"] == "sda1"
+        assert evt["pids"] is None
+        assert evt["blind_for_s"] == 25.0
+        assert evt["tolerance_s"] == 2 * wd.stall_s
+        # The blind-trip path uses ``blind_for_s`` — not
+        # ``stalled_for_s`` — so consumers can distinguish abort
+        # causes.
+        assert "stalled_for_s" not in evt
+
+    def test_warn_blind_fires_once_before_trip(self, tmp_path, monkeypatch, caplog):
+        """
+        During sustained blindness, ``_warn_blind`` must emit
+        exactly one WARNING log record between ``stall_s`` and
+        ``2 * stall_s`` — NOT one per poll cycle.
+
+        Tests:
+            (Test Case 1) Patched ``_read_io_bytes`` returns 100 on
+                the probe then ``None`` indefinitely. With short
+                ``stall_s`` and tight ``poll_interval_s``, multiple
+                poll cycles fall inside the warn window.
+            (Test Case 2) Across the lifetime of the watchdog (which
+                will eventually trip via ``_on_trip_blind``), the
+                ``_warn_blind`` log message appears exactly once.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        call_count = {"n": 0}
+
+        def _read(_dev):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return 100
+            return None
+
+        # Silence audit-event side channel so caplog only sees
+        # the relevant log records.
+        monkeypatch.setattr(iom, "append_audit_event", lambda **_: None)
+
+        kill_event = threading.Event()
+        with (
+            mock.patch.object(iom, "_resolve_device_for_path", return_value="sda1"),
+            mock.patch.object(iom, "_read_io_bytes", side_effect=_read),
+        ):
+            wd = IOStallWatchdog(
+                tmp_path,
+                stall_s=0.3,
+                poll_interval_s=0.05,
+                kill_grace_s=0.0,
+            )
+            wd.register_kill_callback(kill_event.set)
+            with caplog.at_level(
+                logging.WARNING,
+                logger="spikelab.spike_sorting.guards._io_stall",
+            ):
+                try:
+                    with wd:
+                        # Wait past 2 * stall_s for the trip.
+                        kill_event.wait(timeout=3.0)
+                except KeyboardInterrupt:
+                    pass
+
+        blind_warn_records = [
+            r
+            for r in caplog.records
+            if "unreadable for" in r.getMessage() and "watchdog is" in r.getMessage()
+        ]
+        assert len(blind_warn_records) == 1, (
+            f"_warn_blind must fire exactly once between stall_s and "
+            f"2*stall_s, got {len(blind_warn_records)}: "
+            f"{[r.getMessage() for r in blind_warn_records]}"
+        )
+
+    def test_blind_trip_suppresses_interrupt_main_when_stopping(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        When ``_stop_event`` is already set at the moment
+        ``_on_trip_blind`` reaches its interrupt step, the watchdog
+        must log and return without calling
+        ``_thread.interrupt_main`` — mirroring the observed-stall
+        ``_on_trip`` suppression gate.
+
+        Tests:
+            (Test Case 1) Patched ``_thread.interrupt_main`` is
+                never called.
+            (Test Case 2) Kill callbacks still ran (the suppression
+                gate applies only to the interrupt delivery, not to
+                the full abort cascade).
+            (Test Case 3) ``_interrupt_main_failed`` remains False —
+                the suppression is intentional, not a delivery
+                failure.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        wd = IOStallWatchdog(tmp_path, stall_s=5.0, poll_interval_s=1.0)
+        wd._device = "sda1"
+        # Pre-set the stop event so the suppression gate fires.
+        wd._stop_event.set()
+
+        cb_called = {"n": 0}
+
+        def _cb():
+            cb_called["n"] += 1
+
+        wd.register_kill_callback(_cb)
+        monkeypatch.setattr(iom, "append_audit_event", lambda **_: None)
+
+        import _thread as _t
+
+        with mock.patch.object(_t, "interrupt_main") as mock_interrupt:
+            wd._on_trip_blind(blind_for=12.0)
+            mock_interrupt.assert_not_called()
+
+        assert cb_called["n"] == 1
+        assert wd.tripped() is True
+        assert wd.interrupt_delivery_failed() is False
+
+    def test_blind_recovery_clears_state(self, tmp_path, monkeypatch):
+        """
+        A successful read after a blind cycle must clear blind
+        tracking so a subsequent blind episode is reported afresh
+        (one new ``_warn_blind`` per fresh episode, no carry-over).
+
+        We exercise this by driving the loop through two blind
+        episodes separated by recoveries, each blind episode lasting
+        ~``stall_s`` (long enough that, if state carried over, the
+        second episode would trip immediately). Assert (a) the
+        watchdog does NOT trip while no episode individually exceeds
+        ``2 * stall_s``, and (b) the warn-blind log fires once per
+        episode (proving ``blind_warned`` was cleared on recovery).
+
+        Tests:
+            (Test Case 1) Sequence drives one blind-then-recover,
+                then a second blind-then-recover, never accumulating
+                ``2 * stall_s`` in any single blind run.
+            (Test Case 2) Watchdog does not trip within the test
+                window.
+            (Test Case 3) ``_warn_blind`` fires twice — once per
+                episode — confirming ``blind_warned`` was cleared on
+                recovery.
+        """
+        from spikelab.spike_sorting.guards import _io_stall as iom
+
+        # stall_s and poll_interval_s chosen so each blind run lasts
+        # ~1.2 * stall_s (long enough to fire warn, short enough not
+        # to trip), then recovers, then repeats.
+        stall_s = 0.3
+        poll_interval_s = 0.05
+
+        # Build a stub that returns None for ~stall_s + a few polls,
+        # then a fresh byte value, then None again for another
+        # stall_s + a few polls, then climbs forever.
+        # Approx polls per blind run: (stall_s * 1.2) / poll_interval_s = 7.
+        blind_polls_per_run = int((stall_s * 1.2) / poll_interval_s) + 1
+        sequence = (
+            [100]  # __enter__ probe
+            + [None] * blind_polls_per_run  # blind episode 1
+            + [200]  # recovery 1
+            + [None] * blind_polls_per_run  # blind episode 2
+            + [300]  # recovery 2
+        )
+        # After this, climb forever so the loop does not trip.
+        seq_iter = iter(sequence)
+        counter = {"v": 300}
+
+        def _read(_dev):
+            try:
+                return next(seq_iter)
+            except StopIteration:
+                counter["v"] += 1024
+                return counter["v"]
+
+        monkeypatch.setattr(iom, "append_audit_event", lambda **_: None)
+
+        warn_count = {"n": 0}
+        real_warn = IOStallWatchdog._warn_blind
+
+        def _counting_warn(self, blind_for):
+            warn_count["n"] += 1
+            return real_warn(self, blind_for)
+
+        monkeypatch.setattr(IOStallWatchdog, "_warn_blind", _counting_warn)
+
+        with (
+            mock.patch.object(iom, "_resolve_device_for_path", return_value="sda1"),
+            mock.patch.object(iom, "_read_io_bytes", side_effect=_read),
+        ):
+            wd = IOStallWatchdog(
+                tmp_path,
+                stall_s=stall_s,
+                poll_interval_s=poll_interval_s,
+                kill_grace_s=0.0,
+            )
+            # Total budget: 2 blind episodes (~1.2 * stall_s each)
+            # + recoveries + a small tail. With sleep precision
+            # being what it is on Windows, give it generous time.
+            try:
+                with wd:
+                    time.sleep((blind_polls_per_run * poll_interval_s) * 2 + 0.5)
+                    early_trip = wd.tripped()
+            except KeyboardInterrupt:
+                early_trip = wd.tripped()
+
+        assert not early_trip, (
+            "Watchdog must not trip while each blind episode "
+            "stays under 2 * stall_s — recovery should clear "
+            "blind_started_t."
+        )
+        # Two distinct blind episodes, each long enough to warn → two warns.
+        # If recovery did not clear blind_warned, the second episode would
+        # not re-warn.
+        assert warn_count["n"] == 2, (
+            "_warn_blind should fire once per blind episode (2 total); "
+            f"got {warn_count['n']} — blind_warned not cleared on recovery."
+        )
+
+
+# ============================================================================
+# _resolve_device_index — logging side. Existing TestResolveDeviceIndex pins
+# only return values; this class pins the operator-visibility contract
+# (the watchdog should *log* a warning whenever it falls back to device 0
+# silently, so a typo'd device string is debuggable).
+# ============================================================================
+
+
+class TestResolveDeviceIndexWarningSignal:
+    """``_resolve_device_index`` emits a ``_logger.warning`` whenever it
+    falls back to device 0 on an unparseable input. Valid inputs are
+    silent. Pinning the log side prevents a regression that would
+    silently route the watchdog to the wrong GPU.
+    """
+
+    def test_bad_suffix_after_colon_logs_could_not_parse(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``"cuda:abc"`` returns 0.
+            (Test Case 2) Exactly one ``WARNING`` is captured from the
+                ``spikelab.spike_sorting.guards._gpu_watchdog`` logger.
+            (Test Case 3) The message contains ``"could not parse
+                device index"`` and the offending string.
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index("cuda:abc") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert len(gpu_records) == 1
+        msg = gpu_records[0].getMessage()
+        assert "could not parse device index" in msg
+        assert "cuda:abc" in msg
+
+    def test_unrecognised_string_logs_unrecognised(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``"cpu0"`` (no colon, not all digits) returns 0.
+            (Test Case 2) Exactly one ``WARNING`` is captured.
+            (Test Case 3) The message contains ``"unrecognised device
+                string"`` and the offending value.
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index("cpu0") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert len(gpu_records) == 1
+        msg = gpu_records[0].getMessage()
+        assert "unrecognised device string" in msg
+        assert "cpu0" in msg
+
+    def test_valid_inputs_emit_no_warning(self, caplog):
+        """
+        Tests:
+            (Test Case 1) ``None`` is silent (returns 0, no log).
+            (Test Case 2) ``"cuda"`` is silent (returns 0).
+            (Test Case 3) ``"cuda:0"`` is silent (returns 0).
+            (Test Case 4) ``"cuda:1"`` is silent (returns 1).
+            (Test Case 5) ``"2"`` is silent (returns 2).
+            (Test Case 6) ``""`` is silent (returns 0 — empty is the
+                same as ``"cuda"``).
+        """
+        from spikelab.spike_sorting.guards._gpu_watchdog import (
+            _resolve_device_index,
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="spikelab.spike_sorting.guards._gpu_watchdog"
+        ):
+            assert _resolve_device_index(None) == 0
+            assert _resolve_device_index("cuda") == 0
+            assert _resolve_device_index("cuda:0") == 0
+            assert _resolve_device_index("cuda:1") == 1
+            assert _resolve_device_index("2") == 2
+            assert _resolve_device_index("") == 0
+
+        gpu_records = [
+            r
+            for r in caplog.records
+            if r.name == "spikelab.spike_sorting.guards._gpu_watchdog"
+            and r.levelno >= logging.WARNING
+        ]
+        assert gpu_records == []
+
+
+# ============================================================================
+# compute_inactivity_timeout_s — numpy scalar inputs. Existing tests cover
+# Python float NaN; the source comment specifically calls out that the
+# old isinstance(raw, float) check missed numpy scalars. This class pins
+# the new (math.isnan-based) contract against numpy types.
+# ============================================================================
+
+
+class TestComputeInactivityTimeoutSNumpyScalars:
+    """``compute_inactivity_timeout_s`` handles numpy scalar inputs
+    (``np.float64``, ``np.int64``) the same as their Python counterparts.
+    Non-numeric strings propagate ValueError from the underlying
+    ``float()`` cast (no special handling).
+    """
+
+    def test_numpy_float64_nan_collapses_to_base(self):
+        """
+        Pre-fix, the ``isinstance(raw, float)`` check missed numpy
+        scalars — ``np.float64('nan')`` slipped through and produced a
+        NaN timeout that silently disabled the watchdog. The current
+        implementation uses ``math.isnan`` (with a TypeError guard)
+        which accepts numpy scalars.
+
+        Tests:
+            (Test Case 1) ``np.float64('nan')`` collapses to ``base_s``
+                — same as ``float('nan')``.
+            (Test Case 2) Result is finite (not NaN).
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=np.float64("nan"),
+            base_s=600.0,
+            per_min_s=30.0,
+        )
+        assert result == 600.0
+        assert not math.isnan(result)
+
+    def test_numpy_int64_duration_computes_normally(self):
+        """
+        Numpy integer types pass through the ``math.isnan`` guard
+        (``math.isnan(np.int64)`` returns False) and reach
+        ``float(raw)`` which converts cleanly. The arithmetic produces
+        the same value as a Python int input.
+
+        Tests:
+            (Test Case 1) ``np.int64(60)`` produces
+                ``600 + 30 * 60 = 2400`` (matches Python int).
+            (Test Case 2) Result is a finite float.
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min=np.int64(60),
+            base_s=600.0,
+            per_min_s=30.0,
+            max_s=None,
+        )
+        assert result == 2400.0
+        assert isinstance(result, float)
+        assert not math.isnan(result)
+
+    def test_numeric_string_duration_works(self):
+        """
+        ``"60"`` is a non-NaN, non-None input; the function falls
+        through the NaN guard to ``float("60")`` which produces 60.0.
+
+        Tests:
+            (Test Case 1) ``"60"`` (numeric string) produces the same
+                result as the Python int 60.
+        """
+        result = compute_inactivity_timeout_s(
+            recording_duration_min="60",
+            base_s=600.0,
+            per_min_s=30.0,
+            max_s=None,
+        )
+        assert result == 2400.0
+
+    def test_non_numeric_string_propagates_value_error(self):
+        """
+        ``"abc"`` (non-numeric) doesn't satisfy ``math.isnan`` (the
+        TypeError-guard catches it), falls through to ``float("abc")``
+        which raises ``ValueError``. The error is NOT swallowed by
+        the function.
+
+        Tests:
+            (Test Case 1) Non-numeric string raises ValueError from
+                the float() cast.
+        """
+        with pytest.raises(ValueError):
+            compute_inactivity_timeout_s(
+                recording_duration_min="abc",
+                base_s=600.0,
+                per_min_s=30.0,
+            )
+
+
+class TestRunPreflightFolderCountMismatch:
+    """``run_preflight`` emits a ``folder_count_mismatch`` finding
+    (level=fail, category=environment) whenever the
+    ``intermediate_folders`` or ``results_folders`` sequence has a
+    different length than ``recording_files``. The check was added
+    so a future ``zip(...)``-based refactor of the disk-check loop
+    can't silently truncate work to the shortest list. The function
+    does not raise — caller escalates via ``preflight_strict``.
+    """
+
+    def test_intermediate_folders_shorter_emits_one_finding(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) 3 recording files + 2 intermediate folders →
+                exactly one ``folder_count_mismatch`` finding.
+            (Test Case 2) Finding level == "fail".
+            (Test Case 3) Finding category == "environment".
+            (Test Case 4) Message names both counts (2 and 3) and the
+                offending sequence ("intermediate_folders").
+            (Test Case 5) Finding has a non-empty remediation string.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        # Stub the disk / RAM / VRAM probes so the only findings come
+        # from the length check.
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]  # 3
+        inter = ["/inter1", "/inter2"]  # 2 — mismatch
+        results = ["/r1", "/r2", "/r3"]  # 3
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 1
+        f = mismatch[0]
+        assert f.level == "fail"
+        assert f.category == "environment"
+        assert "intermediate_folders" in f.message
+        assert "2 entries" in f.message
+        assert "3" in f.message
+        assert f.remediation
+
+    def test_results_folders_shorter_emits_one_finding(self, monkeypatch):
+        """
+        Symmetric coverage for the ``results_folders`` sequence.
+
+        Tests:
+            (Test Case 1) 3 recordings + 1 results folder → one
+                ``folder_count_mismatch`` finding naming
+                ``results_folders``.
+            (Test Case 2) Counts (1 and 3) in the message.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]
+        inter = ["/i1", "/i2", "/i3"]
+        results = ["/r1"]  # 1 — mismatch
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 1
+        assert mismatch[0].level == "fail"
+        assert "results_folders" in mismatch[0].message
+        assert "1 entries" in mismatch[0].message
+        assert "3" in mismatch[0].message
+
+    def test_both_sequences_mismatched_emits_two_findings(self, monkeypatch):
+        """
+        When both folder sequences are wrong, the function emits two
+        separate findings (one per sequence) so each issue can be
+        surfaced and remediated independently.
+
+        Tests:
+            (Test Case 1) Two ``folder_count_mismatch`` findings.
+            (Test Case 2) One names ``intermediate_folders``, the
+                other names ``results_folders``.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock()]  # 2
+        inter = ["/i1"]  # 1
+        results = ["/r1", "/r2", "/r3"]  # 3
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        mismatch = [f for f in findings if f.code == "folder_count_mismatch"]
+        assert len(mismatch) == 2
+        seqs_named = " ".join(f.message for f in mismatch)
+        assert "intermediate_folders" in seqs_named
+        assert "results_folders" in seqs_named
+
+    def test_equal_lengths_no_mismatch_finding(self, monkeypatch):
+        """
+        Matched lengths emit zero ``folder_count_mismatch`` findings.
+        Other findings (disk, RAM, etc.) may still appear — only the
+        count-mismatch ones are asserted absent.
+
+        Tests:
+            (Test Case 1) 3 / 3 / 3 sequences produce no
+                ``folder_count_mismatch`` finding.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock(), mock.Mock()]
+        inter = ["/i1", "/i2", "/i3"]
+        results = ["/r1", "/r2", "/r3"]
+
+        findings = run_preflight(cfg, rec_files, inter, results)
+        assert not any(f.code == "folder_count_mismatch" for f in findings)
+
+    def test_empty_folder_sequence_takes_other_finding_not_mismatch(self, monkeypatch):
+        """
+        Empty ``intermediate_folders`` produces a ``no_intermediate_folders``
+        finding (the pre-existing empty-sequence check) but NOT a
+        ``folder_count_mismatch`` — the mismatch check is guarded by
+        ``if intermediate_folders and ...``.
+
+        Tests:
+            (Test Case 1) Empty intermediate_folders → no
+                ``folder_count_mismatch`` finding for that sequence.
+        """
+        cfg = _make_config(sorter_name="kilosort2", use_docker=False)
+        monkeypatch.setattr(preflight_mod, "_disk_free_gb", lambda p: 500.0)
+        monkeypatch.setattr(preflight_mod, "_available_ram_gb", lambda: 64.0)
+        monkeypatch.setattr(preflight_mod, "_free_vram_gb", lambda: 12.0)
+        monkeypatch.delenv("HDF5_PLUGIN_PATH", raising=False)
+
+        rec_files = [mock.Mock(), mock.Mock()]
+        # Empty intermediate; matched-length results.
+        findings = run_preflight(cfg, rec_files, [], ["/r1", "/r2"])
+        codes = [f.code for f in findings]
+        # The empty-sequence check fires, but the length-mismatch
+        # check is guarded by ``if intermediate_folders``.
+        assert "folder_count_mismatch" not in codes

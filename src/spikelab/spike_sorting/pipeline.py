@@ -15,6 +15,7 @@ import os
 import pickle
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import shutil
@@ -72,18 +73,39 @@ def _get_noise_levels(
         noise_levels (np.ndarray): Per-channel spike-band noise, shape ``(channels,)``.
     """
     length = recording.get_num_samples()
-    rng = np.random.RandomState(seed=seed)
-    starts = rng.randint(0, length - chunk_size, size=num_chunks)
-    chunks = []
-    for s in starts:
-        chunks.append(
-            recording.get_traces(
-                start_frame=s,
-                end_frame=s + chunk_size,
-                return_scaled=return_scaled,
-            )
+    if length == 0:
+        raise ValueError("Cannot estimate noise levels on an empty recording")
+    if length <= chunk_size:
+        # Recording is shorter than the random-chunk size. Fall back to a
+        # single full-trace MAD estimate. Without this guard,
+        # ``rng.randint(0, length - chunk_size, ...)`` raises a cryptic
+        # ``ValueError: low >= high``. The pipeline's
+        # ``canary_min_recording_s`` gate (default 120 s) covers the main
+        # entry point, but ad-hoc callers can bypass it.
+        warnings.warn(
+            f"Recording is shorter than chunk_size ({length} <= "
+            f"{chunk_size} samples); falling back to a single full-trace "
+            "noise estimate instead of random chunk sampling. Noise "
+            "estimate quality may be reduced.",
+            UserWarning,
+            stacklevel=2,
         )
-    data = np.concatenate(chunks, axis=0)
+        data = recording.get_traces(
+            start_frame=0, end_frame=length, return_scaled=return_scaled
+        )
+    else:
+        rng = np.random.RandomState(seed=seed)
+        starts = rng.randint(0, length - chunk_size, size=num_chunks)
+        chunks = []
+        for s in starts:
+            chunks.append(
+                recording.get_traces(
+                    start_frame=s,
+                    end_frame=s + chunk_size,
+                    return_scaled=return_scaled,
+                )
+            )
+        data = np.concatenate(chunks, axis=0)
     med = np.median(data, axis=0, keepdims=True)
     return np.median(np.abs(data - med), axis=0) / 0.6745
 
@@ -376,16 +398,50 @@ class Compiler:
         self.recs_cache = []
 
     def add_recording(
-        self, rec_name: str, sd: Any, curation_history: Optional[dict] = None
+        self,
+        rec_name: str,
+        sd: Any,
+        curation_history: Optional[dict] = None,
+        *,
+        include_failed_units: bool = False,
     ) -> None:
         """Queue a recording for compilation.
 
         Parameters:
             rec_name (str): Short name for the recording.
-            sd (SpikeData): Curated SpikeData.
-            curation_history (dict or None): Curation history dict.
+            sd (SpikeData): SpikeData to compile.
+                - When ``include_failed_units=False`` (default): treated
+                  as a fully-curated SpikeData; every unit is recorded
+                  with ``is_curated=True`` and the compiled output
+                  contains only those units.
+                - When ``include_failed_units=True``: treated as the
+                  **pre-curation** SpikeData (all sorter-emitted units).
+                  Each unit's ``is_curated`` flag is computed from
+                  ``curation_history["curated_final"]``; failed units
+                  still appear in the compiled output and the
+                  templates figure with the failed styling.
+            curation_history (dict or None): Curation history dict as
+                produced by ``build_curation_history``. Required when
+                ``include_failed_units=True``.
+            include_failed_units (bool): See ``sd``. Default ``False``.
+
+        Raises:
+            ValueError: When ``include_failed_units=True`` but
+                ``curation_history`` is missing or lacks the
+                ``curated_final`` key.
         """
-        self.recs_cache.append((rec_name, sd, curation_history))
+        if include_failed_units and (
+            curation_history is None or "curated_final" not in curation_history
+        ):
+            raise ValueError(
+                "include_failed_units=True requires a curation_history "
+                "dict with a 'curated_final' key (as produced by "
+                "build_curation_history). Got "
+                f"curation_history={curation_history!r}."
+            )
+        self.recs_cache.append(
+            (rec_name, sd, curation_history, bool(include_failed_units))
+        )
 
     def save_results(self, folder: Any) -> None:
         """Compile and save results from all queued recordings.
@@ -414,7 +470,7 @@ class Compiler:
         scatter_std_norms = {}
         fig_fs_Hz = None
 
-        for rec_name, sd, curation_history in self.recs_cache:
+        for rec_name, sd, curation_history, include_failed_units in self.recs_cache:
             print(f"Adding recording: {rec_name}")
 
             fs_Hz = sd.metadata.get("fs_Hz", 30000.0)
@@ -426,11 +482,31 @@ class Compiler:
             if fig_fs_Hz is None:
                 fig_fs_Hz = fs_Hz
 
+            # Resolve the set of curated unit IDs once per recording so
+            # the per-unit ``is_curated`` flag below is a cheap lookup.
+            if include_failed_units:
+                curated_final_ids = {
+                    int(uid) for uid in curation_history["curated_final"]
+                }
+            else:
+                curated_final_ids = None  # unused — every unit is curated
+
             for i in range(sd.N):
                 attrs = sd.neuron_attributes[i] if sd.neuron_attributes else {}
-                all_units.append((attrs, True, rec_name))
+                if include_failed_units:
+                    uid = attrs.get("unit_id")
+                    is_curated = uid is not None and int(uid) in curated_final_ids
+                else:
+                    is_curated = True
+                all_units.append((attrs, is_curated, rec_name))
 
             if self.create_figures:
+                # bar_n_selected = number of curated units; bar_n_total =
+                # number of original sorter-emitted units. Under
+                # include_failed_units=True, ``sd`` already contains all
+                # original units, so ``sd.N == bar_n_total`` — but we
+                # still derive ``bar_n_selected`` from the curated set
+                # so the figure correctly shows what made it through.
                 curated_ids = set()
                 if sd.neuron_attributes is not None:
                     for attrs in sd.neuron_attributes:
@@ -438,9 +514,13 @@ class Compiler:
                 n_total = len(curated_ids)
                 if curation_history is not None:
                     n_total = len(curation_history.get("initial", curated_ids))
+                if include_failed_units and curation_history is not None:
+                    n_selected = len(curation_history.get("curated_final", []))
+                else:
+                    n_selected = sd.N
                 bar_rec_names.append(rec_name)
                 bar_n_total.append(n_total)
-                bar_n_selected.append(sd.N)
+                bar_n_selected.append(n_selected)
 
                 if self.create_std_scatter_plot and curation_history is not None:
                     scatter_n_spikes[rec_name] = curation_history.get(
@@ -719,7 +799,13 @@ def _process_recording_body(
             curation_first_folder,
             curation_second_folder,
             results_path,
-        ) = get_paths(rec_path, inter_path, results_path, exe)
+        ) = get_paths(
+            rec_path,
+            inter_path,
+            results_path,
+            exe,
+            sorter_name=config.sorter.sorter_name,
+        )
 
         # Load Recording
         try:
@@ -925,13 +1011,18 @@ def _process_recording_body(
                 generate_raster_overview = _fig["generate_raster_overview"]
                 generate_raster_overview(sd_curated, figures_dir)
 
-            # Compile results
+            # Compile results. When the user has opted in to
+            # ``include_failed_units``, pass the **pre-curation** ``sd``
+            # so the Compiler can mark each unit's ``is_curated`` flag
+            # from ``curation_history``. Otherwise (default) pass the
+            # curated SpikeData, matching the historical behaviour.
+            compile_sd = sd if comp.include_failed_units else sd_curated
             compile_results(
                 config,
                 rec_name,
                 rec_path,
                 results_path,
-                sd_curated,
+                compile_sd,
                 curation_history,
                 rec_chunks,
             )
@@ -988,26 +1079,46 @@ def _process_recording_body(
                 )
                 return err
             print(f"Recording failed in post-sort pipeline: {e!r}")
+            # Print the full traceback so the originating call site is
+            # diagnosable from the batch log. The previous handler only
+            # printed ``repr(e)`` — for a deeply-nested failure (typical
+            # for waveform extraction / curation errors) that leaves the
+            # operator with no way to find which call raised. The
+            # behaviour (return the error rather than re-raising so the
+            # batch loop continues) is preserved.
+            print(traceback.format_exc())
             print("Moving on to next recording")
             return e
 
 
 def compile_results(
-    config, rec_name, rec_path, results_path, sd, curation_history=None, rec_chunks=None
+    config,
+    rec_name,
+    rec_path,
+    results_path,
+    sd,
+    curation_history=None,
+    rec_chunks=None,
 ):
     """Compile and export sorting results for a single recording.
 
     Parameters:
-        config (SortingPipelineConfig): Pipeline configuration.
+        config (SortingPipelineConfig): Pipeline configuration. When
+            ``config.compilation.include_failed_units`` is True, ``sd``
+            must be the pre-curation SpikeData (all sorter-emitted
+            units) and ``curation_history`` must be provided.
         rec_name (str): Short name for the recording.
         rec_path (str or Path): Original recording file path.
         results_path (Path): Output directory.
-        sd (SpikeData): Curated SpikeData.
+        sd (SpikeData): Curated SpikeData by default; pre-curation
+            SpikeData when ``config.compilation.include_failed_units``
+            is True.
         curation_history (dict or None): Curation history dict.
         rec_chunks (list or None): Epoch frame boundaries.
     """
     comp = config.compilation
     exe = config.execution
+    include_failed_units = bool(getattr(comp, "include_failed_units", False))
 
     compile_stopwatch = Stopwatch("COMPILING RESULTS")
     print(f"For recording: {rec_path}")
@@ -1022,11 +1133,21 @@ def compile_results(
                 for c, sd_chunk in enumerate(epoch_sds):
                     print(f"Compiling chunk {c}")
                     compiler = Compiler(config)
-                    compiler.add_recording(rec_name, sd_chunk, curation_history)
+                    compiler.add_recording(
+                        rec_name,
+                        sd_chunk,
+                        curation_history,
+                        include_failed_units=include_failed_units,
+                    )
                     compiler.save_results(Path(results_path) / f"chunk{c}")
             else:
                 compiler = Compiler(config)
-                compiler.add_recording(rec_name, sd, curation_history)
+                compiler.add_recording(
+                    rec_name,
+                    sd,
+                    curation_history,
+                    include_failed_units=include_failed_units,
+                )
                 compiler.save_results(results_path)
                 compile_stopwatch.log_time("Done compiling results.")
         else:
@@ -2507,22 +2628,35 @@ def _atomic_write_pickle(
     tmp = final.with_suffix(final.suffix + ".tmp")
     final.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(tmp, "wb") as f:
-        if protocol is None:
-            _pkl.dump(obj, f)
-        else:
-            _pkl.dump(obj, f, protocol=protocol)
-        f.flush()
+    try:
+        with open(tmp, "wb") as f:
+            if protocol is None:
+                _pkl.dump(obj, f)
+            else:
+                _pkl.dump(obj, f, protocol=protocol)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                # fsync can fail on certain Windows file systems and
+                # raises AttributeError on some non-OS file objects
+                # (e.g. test-time wrappers). The replace below is still
+                # atomic; we just skip the durability hint.
+                pass
+        os.replace(tmp, final)
+    except BaseException:
+        # Remove the partial .tmp file on any failure (pickling errors
+        # from non-picklable objects, OSError on disk-full, KeyboardInterrupt
+        # from the inactivity watchdog mid-write, etc.) so it doesn't
+        # accumulate in the results folder. Use BaseException because we
+        # explicitly want to catch SystemExit and KeyboardInterrupt for
+        # cleanup, then re-raise. ``missing_ok=True`` covers the case
+        # where the open itself failed before the tmp file was created.
         try:
-            os.fsync(f.fileno())
-        except (OSError, AttributeError):
-            # fsync can fail on certain Windows file systems and
-            # raises AttributeError on some non-OS file objects
-            # (e.g. test-time wrappers). The replace below is still
-            # atomic; we just skip the durability hint.
+            tmp.unlink(missing_ok=True)
+        except OSError:
             pass
-
-    os.replace(tmp, final)
+        raise
 
 
 def sort_multistream(recording, stream_ids, config=None, sorter="kilosort2", **kwargs):

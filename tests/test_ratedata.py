@@ -69,7 +69,7 @@ class TestRateDataConstructor:
         rd = RateData(data, times)
         assert rd.N == 2
         assert rd.inst_Frate_data.shape == (2, 4)
-        assert np.array_equal(rd.times, times)
+        np.testing.assert_array_equal(rd.times, times)
 
         # Non-2D array raises ValueError.
         with pytest.raises(ValueError):
@@ -992,6 +992,26 @@ class TestRateDataFrames:
         with pytest.raises(ValueError, match="fewer than 2 time points"):
             rd.frames(length=1.0)
 
+    def test_frames_empty_times_raises(self):
+        """
+        frames() on an empty-times RateData raises ValueError —
+        with zero time points the bin step_size cannot be inferred
+        and the function falls through the same guard as T=1. A
+        regression that fell through this guard would land in
+        ``np.arange(t0, t_end - length + step_size, step)`` with a
+        nonsense ``step_size`` and produce empty or oversized
+        frames.
+
+        Tests:
+            (Test Case 1) RateData with T=0 raises ValueError naming
+                "fewer than 2 time points".
+        """
+        data = np.zeros((2, 0))
+        times = np.array([], dtype=float)
+        rd = RateData(data, times)
+        with pytest.raises(ValueError, match="fewer than 2 time points"):
+            rd.frames(length=1.0)
+
     def test_frames_non_uniform_times_raises(self):
         """
         frames() on a RateData with non-uniformly-spaced times raises
@@ -1859,3 +1879,170 @@ class TestRateDataFramesEmptyTimes:
         rd = RateData(np.zeros((1, 1)), np.asarray([0.0]))
         with pytest.raises(ValueError, match="fewer than 2 time points"):
             rd.frames(10.0)
+
+
+class TestRateDataConstructorNanTimes:
+    """``RateData(times=...)`` rejects non-finite ``times`` values
+    (NaN/inf) with a clear ValueError. Earlier versions accepted
+    them silently which downstream caused mask comparisons to drop
+    matching points. The constructor guard was added; this test
+    pins that contract.
+    """
+
+    def test_nan_times_raise_value_error(self):
+        """
+        Tests:
+            (Test Case 1) NaN in ``times`` raises ValueError
+                naming "non-finite" or "NaN".
+        """
+        data = np.ones((1, 3))
+        times = np.array([0.0, np.nan, 2.0])
+        with pytest.raises(ValueError, match="non-finite|NaN|all-finite"):
+            RateData(data, times)
+
+    def test_inf_times_raise_value_error(self):
+        """
+        Tests:
+            (Test Case 1) inf in ``times`` raises ValueError
+                naming "non-finite" or "inf".
+        """
+        data = np.ones((1, 3))
+        times = np.array([0.0, np.inf, 2.0])
+        with pytest.raises(ValueError, match="non-finite|inf|all-finite"):
+            RateData(data, times)
+
+
+class TestRateDataGetPairwiseFrCorrCompareFuncRaises:
+    """``get_pairwise_fr_corr`` with a ``compare_func`` that raises:
+    the exception propagates out of the underlying executor.
+    """
+
+    def test_compare_func_exception_propagates(self):
+        """
+        Tests:
+            (Test Case 1) A ``compare_func`` that always raises
+                ``RuntimeError`` causes ``get_pairwise_fr_corr``
+                to surface the exception.
+        """
+        data = np.ones((2, 10))
+        times = np.linspace(0.0, 9.0, 10)
+        rd = RateData(data, times)
+
+        def bad_compare(a, b, max_lag):
+            raise RuntimeError("compare_func intentional failure")
+
+        with pytest.raises(RuntimeError, match="compare_func intentional"):
+            rd.get_pairwise_fr_corr(compare_func=bad_compare, max_lag=1, n_jobs=1)
+
+
+# ============================================================================
+# Core review (2026-05-24) — RateData edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestRateDataConstructorNdimGuard:
+    """``RateData.__init__`` rejects ``times.ndim != 1`` at line 79-80.
+    Pin the guard so a regression that flattened or skipped the
+    dimensionality check would surface.
+    """
+
+    def test_2d_times_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``times`` of shape (2, 3) raises ValueError
+                naming ``1-D``.
+
+        Notes:
+            - ``data.shape[1]`` must match ``len(times)`` (= 2 for a
+              shape-(2,3) array) so the earlier column-count guard
+              passes and the ndim check fires.
+        """
+        data = np.zeros((1, 2))
+        times = np.zeros((2, 3))
+        with pytest.raises(ValueError, match="1-D"):
+            RateData(data, times)
+
+    def test_0d_times_raises_typeerror_via_len(self):
+        """
+        Tests:
+            (Test Case 1) Scalar ``times`` (ndim=0) raises ``TypeError``
+                from the upstream ``len(times)`` call at line 72.
+
+        Notes:
+            - The ndim guard at line 79 is unreachable for 0-d input
+              because the earlier ``len(times)`` call fails first.
+              Pin the ``TypeError`` as the actual current contract.
+        """
+        data = np.zeros((1, 1))
+        times = np.array(5.0)
+        with pytest.raises(TypeError):
+            RateData(data, times)
+
+
+class TestRateDataSubtimeNanEnd:
+    """Symmetric coverage of ``RateData.subtime`` with NaN bounds. The
+    existing tests cover ``start=NaN``; pin ``end=NaN`` to lock both
+    paths.
+    """
+
+    def test_end_nan_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime(0, NaN)`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=2, n_times=10, step=1.0, t0=0.0)
+        with pytest.raises(ValueError):
+            rd.subtime(0.0, np.nan)
+
+
+class TestRateDataSubtimeByIndexZeroBoundary:
+    """``subtime_by_index(0, 0)`` exercises the ``end_idx <= start_idx``
+    branch at line 282. Pin the boundary; the docstring requires
+    ``end_idx > start_idx`` for a non-empty window.
+    """
+
+    def test_subtime_by_index_zero_zero_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime_by_index(0, 0)`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=2, n_times=10, step=1.0, t0=0.0)
+        with pytest.raises(ValueError):
+            rd.subtime_by_index(0, 0)
+
+
+class TestRateDataGetManifoldErrorBranches:
+    """``get_manifold`` error paths: unknown method strings produce
+    ``ValueError`` from the trailing raise at line 508; ``n_components <= 0``
+    raises from the explicit guard at line 459-463.
+    """
+
+    def test_empty_method_string_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``method=''`` falls through PCA/UMAP branches
+                and raises the unknown-method ValueError.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="Unknown manifold method"):
+            rd.get_manifold(method="", n_components=2)
+
+    def test_unknown_method_pca_typo_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``method='ICA'`` raises with the documented
+                message.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="Unknown manifold method"):
+            rd.get_manifold(method="ICA", n_components=2)
+
+    def test_n_components_negative_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_components=-1`` raises ValueError.
+        """
+        rd = make_ratedata(n_units=3, n_times=20)
+        with pytest.raises(ValueError, match="n_components"):
+            rd.get_manifold(method="PCA", n_components=-1)

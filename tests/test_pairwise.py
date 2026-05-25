@@ -390,7 +390,7 @@ class TestPairwiseCompMatrixStackInit:
 
         # Mean calculation
         mean_pcm = stack.mean()
-        assert np.allclose(mean_pcm.matrix, np.mean(stack_data, axis=2))
+        np.testing.assert_allclose(mean_pcm.matrix, np.mean(stack_data, axis=2))
 
         # Mean with NaNs
         stack_data_nan = stack_data.copy()
@@ -464,18 +464,18 @@ class TestPairwiseCompMatrixStackSlicing:
         sub_stack = stack[0:3]
         assert isinstance(sub_stack, PairwiseCompMatrixStack)
         assert len(sub_stack) == 3
-        assert np.array_equal(sub_stack.stack, stack_data[:, :, 0:3])
+        np.testing.assert_array_equal(sub_stack.stack, stack_data[:, :, 0:3])
 
         # Slicing with step
         step_stack = stack[::2]
         assert len(step_stack) == 5  # 0, 2, 4, 6, 8
-        assert np.array_equal(step_stack.stack, stack_data[:, :, ::2])
+        np.testing.assert_array_equal(step_stack.stack, stack_data[:, :, ::2])
 
         # Iteration
         matrices = list(stack)
         assert len(matrices) == 10
         assert isinstance(matrices[0], PairwiseCompMatrix)
-        assert np.array_equal(matrices[0].matrix, stack_data[:, :, 0])
+        np.testing.assert_array_equal(matrices[0].matrix, stack_data[:, :, 0])
 
     def test_getitem_negative_index(self):
         """Negative indexing returns the last slice as a PairwiseCompMatrix.
@@ -562,10 +562,10 @@ class TestPairwiseCompMatrixStackSubslice:
         # Select specific slices
         sub = stack.subslice([0, 2, 5, 9])
         assert len(sub) == 4
-        assert np.array_equal(sub.stack[:, :, 0], stack_data[:, :, 0])
-        assert np.array_equal(sub.stack[:, :, 1], stack_data[:, :, 2])
-        assert np.array_equal(sub.stack[:, :, 2], stack_data[:, :, 5])
-        assert np.array_equal(sub.stack[:, :, 3], stack_data[:, :, 9])
+        np.testing.assert_array_equal(sub.stack[:, :, 0], stack_data[:, :, 0])
+        np.testing.assert_array_equal(sub.stack[:, :, 1], stack_data[:, :, 2])
+        np.testing.assert_array_equal(sub.stack[:, :, 2], stack_data[:, :, 5])
+        np.testing.assert_array_equal(sub.stack[:, :, 3], stack_data[:, :, 9])
 
         # Times should also be subsliced
         assert sub.times == [(0, 100), (200, 300), (500, 600), (900, 1000)]
@@ -2190,6 +2190,70 @@ class TestPairwiseCompMatrixNormalize:
         expected = np.array([[0.0, 1 / 3], [2 / 3, 1.0]])
         np.testing.assert_allclose(result, expected)
 
+    def test_normalize_all_nan_row_suppresses_runtime_warning(self):
+        """
+        ``_min_max_normalize`` and ``_z_score_normalize`` with an
+        all-NaN row (axis='row') must not emit ``RuntimeWarning`` (PR
+        #139 contract — scoped suppression around the NaN reductions).
+        The reductions themselves are correct (return NaN for the
+        all-NaN slice); the warning was pure log noise.
+
+        Other rows continue to normalize correctly — pin both the
+        warning suppression and the output correctness so a regression
+        that removes the suppression OR breaks the math is caught.
+
+        Tests:
+            (Test Case 1) No ``RuntimeWarning`` fires for ``axis='row'``
+                on a matrix whose first row is all-NaN.
+            (Test Case 2) The all-NaN row stays all-NaN in the output.
+            (Test Case 3) The non-NaN rows normalize to the expected
+                min-max [0, 1] range.
+            (Test Case 4) Same warning-suppression + output behaviour
+                for ``_z_score_normalize`` on an all-NaN column.
+        """
+        mat_row = np.array(
+            [
+                [np.nan, np.nan, np.nan],
+                [0.0, 5.0, 10.0],
+                [2.0, 4.0, 6.0],
+            ]
+        )
+
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            result = _min_max_normalize(mat_row, axis="row")
+        runtime_warnings = [w for w in rec if issubclass(w.category, RuntimeWarning)]
+        assert (
+            runtime_warnings == []
+        ), f"unexpected RuntimeWarning(s): {[str(w.message) for w in runtime_warnings]}"
+
+        assert np.all(np.isnan(result[0]))
+        np.testing.assert_allclose(result[1], [0.0, 0.5, 1.0])
+        np.testing.assert_allclose(result[2], [0.0, 0.5, 1.0])
+
+        # Same contract for _z_score_normalize on an all-NaN column.
+        mat_col = np.array(
+            [
+                [np.nan, 1.0, 4.0],
+                [np.nan, 2.0, 5.0],
+                [np.nan, 3.0, 6.0],
+            ]
+        )
+        with warnings.catch_warnings(record=True) as rec_z:
+            warnings.simplefilter("always")
+            result_z = _z_score_normalize(mat_col, axis="col")
+        runtime_warnings_z = [
+            w for w in rec_z if issubclass(w.category, RuntimeWarning)
+        ]
+        assert runtime_warnings_z == [], (
+            f"unexpected RuntimeWarning(s): "
+            f"{[str(w.message) for w in runtime_warnings_z]}"
+        )
+        assert np.all(np.isnan(result_z[:, 0]))
+        # Non-NaN columns: mean=2, std=sqrt(2/3); z = (x-mu)/std.
+        expected_col = (mat_col[:, 1] - mat_col[:, 1].mean()) / mat_col[:, 1].std()
+        np.testing.assert_allclose(result_z[:, 1], expected_col)
+
     def test_helper_z_score_normalize_directly(self):
         """Direct call to _z_score_normalize returns correct values.
 
@@ -2575,3 +2639,385 @@ class TestPairwiseCompMatrixStackTimesShapeMismatch:
             stack=stack, times=[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
         )
         assert ok.stack.shape == (4, 4, 3)
+
+
+class TestPairwiseToNetworkxThresholdNaN:
+    """``PairwiseCompMatrix.to_networkx(threshold=NaN | Inf)``: the
+    source now raises ``ValueError`` rather than silently producing
+    an edge-free graph (which was the prior behavior — ``abs(weight)
+    > NaN`` is always False so no edges were added).
+
+    A NaN/Inf threshold almost always indicates a config bug, so the
+    raise turns a silent corruption into an actionable error.
+    """
+
+    def test_threshold_nan_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold=NaN`` raises ValueError.
+            (Test Case 2) The error message mentions "finite number or
+                None" and the offending value.
+        """
+        mat = np.array([[1.0, 0.5, 0.3], [0.5, 1.0, 0.8], [0.3, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=np.nan)
+
+    def test_threshold_inf_raises_value_error(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold=+Inf`` raises ValueError (also
+                covered by the finite-check guard).
+            (Test Case 2) ``threshold=-Inf`` also raises.
+        """
+        mat = np.array([[1.0, 0.5], [0.5, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=np.inf)
+        with pytest.raises(ValueError, match="finite number or None"):
+            pcm.to_networkx(threshold=-np.inf)
+
+
+# ============================================================================
+# Parallel-session source: PairwiseCompMatrix(Stack).threshold(preserve_nan=True)
+# Commit 57c0d8a — pins the opt-in NaN-preservation contract.
+# ============================================================================
+
+
+class TestPairwiseCompMatrixThresholdPreserveNan:
+    """``PairwiseCompMatrix.threshold(preserve_nan=True)`` keeps NaN
+    positions in the binary output instead of coercing them to 0.
+    Non-NaN positions still binarize to 0 / 1 per the usual rule.
+    """
+
+    def test_preserve_nan_keeps_nan_positions(self):
+        """
+        Tests:
+            (Test Case 1) NaN cells in the input remain NaN in the
+                thresholded output.
+            (Test Case 2) Non-NaN cells above the threshold map to 1.0.
+            (Test Case 3) Non-NaN cells below the threshold map to 0.0.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        mat = np.array(
+            [
+                [1.0, 0.8, np.nan],
+                [0.8, 1.0, 0.2],
+                [np.nan, 0.2, 1.0],
+            ]
+        )
+        pcm = PairwiseCompMatrix(matrix=mat)
+        out = pcm.threshold(threshold=0.5, preserve_nan=True)
+
+        # NaN positions preserved.
+        assert np.isnan(out.matrix[0, 2])
+        assert np.isnan(out.matrix[2, 0])
+        # Above-threshold cells binarize to 1.
+        assert out.matrix[0, 0] == 1.0
+        assert out.matrix[0, 1] == 1.0
+        # Below-threshold cells binarize to 0.
+        assert out.matrix[1, 2] == 0.0
+        assert out.matrix[2, 1] == 0.0
+
+    def test_preserve_nan_false_default_coerces_nan_to_zero(self):
+        """Regression guard on the default behaviour (preserve_nan=False).
+
+        Tests:
+            (Test Case 1) Default keeps the historical contract: NaN
+                cells become 0 (not preserved).
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        mat = np.array([[1.0, np.nan], [np.nan, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        out = pcm.threshold(threshold=0.5)  # default preserve_nan=False
+        assert not np.isnan(out.matrix).any()
+        # NaN positions specifically resolve to 0 (abs(NaN) > 0.5 is False).
+        assert out.matrix[0, 1] == 0.0
+        assert out.matrix[1, 0] == 0.0
+
+
+class TestPairwiseCompMatrixStackThresholdPreserveNan:
+    """``PairwiseCompMatrixStack.threshold(preserve_nan=True)`` — same
+    contract as the per-matrix variant, applied across the stack axis.
+    """
+
+    def test_preserve_nan_keeps_nan_positions_in_stack(self):
+        """
+        Tests:
+            (Test Case 1) NaN positions in any slice remain NaN in the
+                same slice of the thresholded stack.
+            (Test Case 2) Non-NaN positions binarize per the usual rule.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        stack = np.stack(
+            [
+                np.array([[1.0, 0.8], [0.8, 1.0]]),
+                np.array([[1.0, np.nan], [np.nan, 1.0]]),
+            ],
+            axis=2,
+        )
+        s = PairwiseCompMatrixStack(stack=stack)
+        out = s.threshold(threshold=0.5, preserve_nan=True)
+
+        # Slice 0: no NaN, regular binarization.
+        assert out.stack[0, 0, 0] == 1.0
+        assert out.stack[0, 1, 0] == 1.0
+        # Slice 1: NaN preserved off-diagonal, diagonal 1.0 stays 1.0.
+        assert np.isnan(out.stack[0, 1, 1])
+        assert np.isnan(out.stack[1, 0, 1])
+        assert out.stack[0, 0, 1] == 1.0
+        assert out.stack[1, 1, 1] == 1.0
+
+    def test_preserve_nan_false_default_coerces_nan_to_zero_in_stack(self):
+        """
+        Tests:
+            (Test Case 1) Default preserve_nan=False coerces NaN to 0
+                across every slice of the stack.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrixStack
+
+        stack = np.array([[[np.nan]], [[np.nan]]]).reshape(1, 1, 2)
+        s = PairwiseCompMatrixStack(stack=stack)
+        out = s.threshold(threshold=0.5)
+        assert not np.isnan(out.stack).any()
+        assert (out.stack == 0.0).all()
+
+
+class TestPairwiseCompMatrixToNetworkxThresholdBoundary:
+    """``PairwiseCompMatrix.to_networkx`` threshold boundary cases:
+    ``threshold=0.0`` excludes zero-weight edges (the check is
+    ``abs(weight) > threshold``); ``threshold=inf`` always excludes.
+    """
+
+    def test_threshold_zero_excludes_zero_weight_edges(self):
+        """
+        Tests:
+            (Test Case 1) ``to_networkx(threshold=0.0)`` produces a
+                graph with no edges when all off-diagonal weights
+                are exactly zero.
+        """
+        pytest.importorskip("networkx")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.zeros((3, 3))
+        pcm = PairwiseCompMatrix(matrix=m)
+        g = pcm.to_networkx(threshold=0.0)
+        assert g.number_of_edges() == 0
+
+    def test_threshold_inf_raises_value_error(self):
+        """
+        ``to_networkx`` rejects non-finite thresholds with a clear
+        ``ValueError`` (recently hardened source). Pin the contract.
+
+        Tests:
+            (Test Case 1) ``threshold=inf`` raises ValueError naming
+                "finite".
+            (Test Case 2) ``threshold=NaN`` raises the same.
+        """
+        pytest.importorskip("networkx")
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.array([[0.0, 0.9, 0.5], [0.9, 0.0, 0.3], [0.5, 0.3, 0.0]])
+        pcm = PairwiseCompMatrix(matrix=m)
+        with pytest.raises(ValueError, match="finite"):
+            pcm.to_networkx(threshold=np.inf)
+        with pytest.raises(ValueError, match="finite"):
+            pcm.to_networkx(threshold=np.nan)
+
+
+class TestPairwiseCompMatrixThresholdInf:
+    """``PairwiseCompMatrix.threshold(threshold=inf)`` returns an
+    all-zero binary matrix (no entry's absolute value exceeds infinity).
+    """
+
+    def test_threshold_inf_returns_all_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(inf)`` returns a matrix of
+                all zeros, same shape as the input.
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        m = np.array([[0.0, 0.9], [0.9, 0.0]])
+        pcm = PairwiseCompMatrix(matrix=m)
+        out = pcm.threshold(threshold=np.inf)
+        assert out.matrix.shape == m.shape
+        assert (out.matrix == 0.0).all()
+
+
+class TestPairwiseCompMatrixExtractPairsByGroupSingleUnit:
+    """``extract_pairs_by_group`` with a single-unit (1, 1) matrix:
+    ``np.triu_indices(1, k=1)`` returns empty arrays, so the result
+    has no off-diagonal pairs to extract.
+    """
+
+    def test_single_unit_returns_empty_pairs(self):
+        """
+        Tests:
+            (Test Case 1) 1x1 PairwiseCompMatrix produces an empty
+                result (no off-diagonal pairs exist).
+        """
+        from spikelab.spikedata.pairwise import PairwiseCompMatrix
+
+        pcm = PairwiseCompMatrix(matrix=np.array([[0.0]]))
+        try:
+            result = pcm.extract_pairs_by_group(unit_labels=np.array(["A"]))
+            # Whatever shape it returns, the body should be empty.
+            if isinstance(result, dict):
+                empty = len(result) == 0 or all(
+                    (hasattr(v, "__len__") and len(v) == 0) for v in result.values()
+                )
+                assert empty
+            else:
+                # tuple of arrays / DataFrame — pin that it's empty.
+                arr = np.asarray(result, dtype=object)
+                assert arr.size == 0 or arr.shape[0] == 0
+        except (ValueError, IndexError):
+            pass  # Acceptable: 1-unit input rejected upstream
+
+
+# ============================================================================
+# Core review (2026-05-24) — Pairwise edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestPairwiseCompMatrixThresholdBoundaries:
+    """Boundary contracts for ``PairwiseCompMatrix.threshold``: NaN
+    thresholds silently produce an all-zero binary matrix (because
+    ``abs(x) > NaN`` is False for every finite x), and negative
+    thresholds turn every off-diagonal into 1. Unlike ``to_networkx``,
+    ``threshold`` does NOT reject NaN — pin the asymmetry.
+    """
+
+    def test_threshold_nan_produces_all_zero_when_preserve_false(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(NaN)`` on a finite-valued matrix
+                returns an all-zero binary matrix.
+            (Test Case 2) Shape preserved.
+        """
+        mat = np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(np.nan, preserve_nan=False)
+        assert binary.matrix.shape == (3, 3)
+        np.testing.assert_array_equal(binary.matrix, np.zeros((3, 3)))
+
+    def test_threshold_nan_with_preserve_nan_propagates_nan(self):
+        """
+        Tests:
+            (Test Case 1) Input NaN positions remain NaN in output
+                when ``preserve_nan=True``.
+        """
+        mat = np.array([[1.0, np.nan, 0.2], [np.nan, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(np.nan, preserve_nan=True)
+        # NaN positions preserved
+        assert np.isnan(binary.matrix[0, 1])
+        assert np.isnan(binary.matrix[1, 0])
+        # Finite positions become 0 (since abs(x) > NaN is False)
+        assert binary.matrix[0, 0] == 0.0
+
+    def test_threshold_negative_makes_all_off_diagonal_one(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(-1.0)`` produces an all-1 binary
+                matrix (since ``abs(x) > -1`` is True for every real x).
+        """
+        mat = np.array([[1.0, 0.5], [0.5, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        binary = pcm.threshold(-1.0)
+        np.testing.assert_array_equal(binary.matrix, np.ones((2, 2)))
+
+
+class TestPairwiseCompMatrixToNetworkxNegativeThreshold:
+    """``to_networkx(threshold=-1.0)`` is accepted (only NaN/Inf are
+    rejected) and produces a graph where every off-diagonal pair is an
+    edge. Pin the contract: negative thresholds are NOT rejected.
+    """
+
+    def test_negative_threshold_creates_all_edges(self):
+        """
+        Tests:
+            (Test Case 1) ``to_networkx(threshold=-1.0)`` returns a graph
+                with all N*(N-1)/2 off-diagonal edges.
+        """
+        mat = np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.8], [0.2, 0.8, 1.0]])
+        pcm = PairwiseCompMatrix(matrix=mat)
+        G = pcm.to_networkx(threshold=-1.0)
+        # 3 choose 2 = 3 edges expected
+        assert G.number_of_edges() == 3
+
+
+class TestPairwiseCompMatrixStackThresholdNan:
+    """``PairwiseCompMatrixStack.threshold(NaN)`` symmetric pin for the
+    stack variant. The single-matrix path is pinned by
+    ``TestPairwiseCompMatrixThresholdBoundaries`` above.
+    """
+
+    def test_stack_threshold_nan_produces_all_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``threshold(NaN)`` on a finite stack returns
+                an all-zero binary stack (shape preserved).
+        """
+        stack = np.random.rand(3, 3, 2)
+        # Symmetrize so it's a valid pairwise stack
+        for s in range(2):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        binary = pcms.threshold(np.nan, preserve_nan=False)
+        np.testing.assert_array_equal(binary.stack, np.zeros((3, 3, 2)))
+
+
+class TestPairwiseCompMatrixStackFancyEmptyIndex:
+    """``PairwiseCompMatrixStack[np.array([], dtype=int)]`` exercises
+    the fancy-index branch with an empty selector. Per the new line
+    580-584 in the source, this routes through ``np.asarray(times,
+    dtype=object)[[]]`` then back to ``list(...)`` (empty), and
+    ``self.stack[:, :, []]`` produces shape ``(N, N, 0)``. The stack
+    constructor accepts S=0, so this should succeed and yield a
+    zero-slice stack.
+    """
+
+    def test_empty_fancy_index_returns_zero_slice_stack(self):
+        """
+        Tests:
+            (Test Case 1) Indexing with an empty int array returns a
+                stack of shape (N, N, 0).
+        """
+        stack = np.random.rand(3, 3, 4)
+        for s in range(4):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(
+            stack=stack, times=[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
+        )
+        result = pcms[np.array([], dtype=int)]
+        assert isinstance(result, PairwiseCompMatrixStack)
+        assert result.stack.shape == (3, 3, 0)
+        # times list also empty
+        assert result.times is None or len(result.times) == 0
+
+
+class TestPairwiseCompMatrixStackSubsliceFloat:
+    """``PairwiseCompMatrixStack.subslice([0.0, 1.0])`` passes float
+    indices through to numpy fancy indexing. NumPy rejects non-integer
+    indices with an ``IndexError``. Pin the contract (which is
+    inherited from numpy's indexing semantics, not a SpikeLab guard).
+    """
+
+    def test_float_indices_raise_index_error(self):
+        """
+        Tests:
+            (Test Case 1) ``subslice([0.0, 1.0])`` raises ``IndexError``
+                (or ``TypeError`` on older numpy) from numpy.
+        """
+        stack = np.random.rand(3, 3, 4)
+        for s in range(4):
+            stack[:, :, s] = (stack[:, :, s] + stack[:, :, s].T) / 2
+        pcms = PairwiseCompMatrixStack(stack=stack)
+        with pytest.raises((IndexError, TypeError)):
+            pcms.subslice([0.0, 1.0])

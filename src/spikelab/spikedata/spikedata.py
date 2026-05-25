@@ -203,6 +203,9 @@ class SpikeData:
         filter: Union[dict, bool] = True,
         hysteresis=True,
         direction: Literal["both", "up", "down"] = "both",
+        *,
+        length: Optional[float] = None,
+        start_time: Optional[float] = None,
     ):
         """Create a SpikeData object by filtering and thresholding raw electrophysiological data.
 
@@ -217,6 +220,14 @@ class SpikeData:
             hysteresis (bool): Use hysteresis for thresholding.
             direction (str): Direction of thresholding ('both', 'up',
                 'down').
+            length (float or None): Recording length in ms. When
+                ``None``, the length is inferred from ``data.shape[1]``.
+                Pass an explicit value to honour trailing silence
+                recorded in a file-level ``length_ms`` attribute.
+            start_time (float or None): Recording start time in ms.
+                When ``None``, defaults to 0.0. Pass an explicit value
+                for event-centered data or to honour a file-level
+                ``start_time`` attribute.
 
         Returns:
             sd (SpikeData): Object with the given raw data.
@@ -257,9 +268,12 @@ class SpikeData:
             diff = np.diff(np.array(raster, dtype=int), axis=1) == 1
             raster = np.hstack([np.zeros((diff.shape[0], 1), dtype=bool), diff])
 
-        return SpikeData.from_raster(
-            raster, 1e3 / fs_Hz, raw_data=data, raw_time=fs_Hz / 1e3
-        )
+        kwargs: dict = {"raw_data": data, "raw_time": fs_Hz / 1e3}
+        if length is not None:
+            kwargs["length"] = length
+        if start_time is not None:
+            kwargs["start_time"] = start_time
+        return SpikeData.from_raster(raster, 1e3 / fs_Hz, **kwargs)
 
     def __init__(
         self,
@@ -329,6 +343,8 @@ class SpikeData:
             length = max_spike - self.start_time
         if np.isnan(length):
             raise ValueError("length must not be NaN")
+        if np.isinf(length):
+            raise ValueError(f"length must be finite, got {length}")
         if length < 0:
             raise ValueError(f"length must be non-negative, got {length}")
         self.length = length
@@ -581,6 +597,28 @@ class SpikeData:
 
         if kind not in ("spike", "rate"):
             raise ValueError(f"kind must be 'spike' or 'rate', got {kind!r}")
+
+        # Validate the bin-size / window relationship for rate slices.
+        # ``bin_size_ms`` larger than the per-event window (pre + post)
+        # silently produces degenerate ``(U, 1, 1)`` slices because the
+        # underlying resample grid has fewer than one point per slice.
+        # Reject at the boundary so the failure mode is visible to the
+        # caller rather than buried in a downstream "wrong shape"
+        # surprise.
+        if kind == "rate":
+            if bin_size_ms is None or bin_size_ms <= 0:
+                raise ValueError(
+                    f"bin_size_ms must be > 0 for kind='rate', got {bin_size_ms!r}."
+                )
+            window = pre_ms + post_ms
+            if bin_size_ms > window:
+                raise ValueError(
+                    f"bin_size_ms ({bin_size_ms}) exceeds the per-event "
+                    f"window pre_ms + post_ms ({window}). Each slice "
+                    "would collapse to a degenerate (U, 1, S) shape with "
+                    "fewer than one bin per event. Use a smaller "
+                    "bin_size_ms, a larger pre_ms/post_ms, or kind='spike'."
+                )
 
         # Resolve metadata key to array.
         if isinstance(events, str):
@@ -843,13 +881,39 @@ class SpikeData:
             values (single value or list): Single value (applied to all) or
                 list/array matching neuron_indices length for each neuron.
             neuron_indices (list): Neurons to update. If None, updates all.
+
+        Notes:
+            - Generator / iterator inputs are materialised via ``list()``
+              so the per-neuron values are stored individually. Without
+              this, the generator would be silently broadcast as a single
+              object across every neuron.
+            - 0-D numpy arrays (``np.array(5)``) are treated as scalars
+              even though they have ``__len__``-style attributes.
         """
         if not isinstance(key, str):
             raise TypeError(f"key must be a string, got {type(key).__name__}: {key!r}")
         if self.neuron_attributes is None:
             self.neuron_attributes = [{} for _ in range(self.N)]
         indices = range(self.N) if neuron_indices is None else neuron_indices
-        if hasattr(values, "__len__") and not isinstance(values, str):
+
+        # Materialise iterators/generators so each neuron gets a distinct
+        # value rather than the generator object itself.
+        if (
+            iter(values) is values
+            if hasattr(values, "__iter__") and not isinstance(values, (str, bytes))
+            else False
+        ):
+            values = list(values)
+
+        # 0-D ndarrays expose ``__len__`` indirectly but ``len(np.array(5))``
+        # raises. Treat them as scalar broadcasts.
+        is_zero_d_array = isinstance(values, np.ndarray) and values.ndim == 0
+
+        if (
+            not is_zero_d_array
+            and hasattr(values, "__len__")
+            and not isinstance(values, str)
+        ):
             indices = list(indices)
             if len(values) != len(indices):
                 raise ValueError(
@@ -858,8 +922,11 @@ class SpikeData:
             for i, val in zip(indices, values):
                 self.neuron_attributes[i][key] = val
         else:
+            # Unwrap 0-D arrays so the stored value is a Python scalar
+            # rather than a 0-D ndarray wrapper.
+            scalar = values.item() if is_zero_d_array else values
             for i in indices:
-                self.neuron_attributes[i][key] = values
+                self.neuron_attributes[i][key] = scalar
 
     def get_neuron_attribute(self, key: str, default=None):
         """Get an attribute across all neurons.
@@ -1201,8 +1268,12 @@ class SpikeData:
         length = self.length + spikeData.length + offset
 
         # neuron_attributes salvage: when only one operand has them,
-        # use the available set (with a warning) rather than silently
-        # dropping. Opt out with ``drop_neuron_attributes=True``.
+        # use the available set with a warning rather than silently
+        # dropping. The two single-sided cases warn symmetrically so
+        # the user sees the asymmetry from either direction. Opt out
+        # with ``drop_neuron_attributes=True``. The both-present case
+        # stays silent because it's the documented ``self``-wins-on-
+        # collision rule.
         if drop_neuron_attributes:
             new_neuron_attributes = None
         elif (
@@ -1213,6 +1284,14 @@ class SpikeData:
             # wins on collision, matching the metadata precedence rule).
             new_neuron_attributes = self.neuron_attributes
         elif self.neuron_attributes is not None:
+            warnings.warn(
+                "SpikeData.append: self has neuron_attributes but the "
+                "appended SpikeData does not. Using self's attributes "
+                "for the result. Pass drop_neuron_attributes=True to "
+                "suppress salvage.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             new_neuron_attributes = self.neuron_attributes
         elif spikeData.neuron_attributes is not None:
             warnings.warn(
@@ -1269,6 +1348,14 @@ class SpikeData:
         """
         if np.isnan(bin_size) or bin_size <= 0:
             raise ValueError(f"bin_size must be > 0, got {bin_size}.")
+        if not np.isfinite(time_offset):
+            raise ValueError(f"time_offset must be finite, got {time_offset}.")
+        if time_offset < -self.length:
+            raise ValueError(
+                f"time_offset ({time_offset}) cannot be less than -length "
+                f"({-self.length}); the resulting raster would have a negative "
+                f"number of bins."
+            )
         length = int(np.ceil((self.length + time_offset) / bin_size))
         # N==0 short-circuit: np.hstack on an empty list raises, so
         # build the empty (0, T) sparse matrix directly.
@@ -1975,6 +2062,34 @@ class SpikeData:
             backbone_units (numpy.ndarray): 1D array of the neuron/unit
                 indices that are backbone units.
         """
+        # Shape validation at the API boundary. ``edges`` must be 2-D
+        # with exactly two columns ``[start, end]``. The previous
+        # implementation silently ignored any 3rd+ columns (no error,
+        # no warning) which let callers leak per-burst metadata that
+        # would never be consulted. Also reject 1-D inputs explicitly
+        # rather than letting the per-burst loop produce IndexError
+        # mid-computation.
+        edges = np.asarray(edges)
+        if edges.ndim != 2 or (edges.size > 0 and edges.shape[1] != 2):
+            raise ValueError(
+                f"edges must be a 2-D array of shape (B, 2) "
+                f"containing [start, end] indices, got "
+                f"shape={edges.shape} ndim={edges.ndim}."
+            )
+
+        # Reject inverted edges (``start > end``). The per-burst loop
+        # below uses a ``>= start & <= end`` mask: inverted ranges
+        # produce an all-False mask and silently count zero spikes,
+        # making the affected bursts indistinguishable from genuinely
+        # quiet ones.
+        if edges.size > 0 and (edges[:, 0] > edges[:, 1]).any():
+            bad = int(np.argmax(edges[:, 0] > edges[:, 1]))
+            raise ValueError(
+                f"Inverted edge at row {bad}: "
+                f"start={int(edges[bad, 0])} > end={int(edges[bad, 1])}. "
+                "All edges must satisfy start <= end."
+            )
+
         t_spk_mat = self.sparse_raster(bin_size=bin_size).toarray()
 
         # Sanity check: edges must fit within the raster dimensions
@@ -2426,6 +2541,19 @@ class SpikeData:
             raise ValueError(f"gauss_sigma must be non-negative, got {gauss_sigma}")
         if square_width < 0:
             raise ValueError(f"square_width must be non-negative, got {square_width}")
+        if square_width > self.length:
+            raise ValueError(
+                f"square_width ({square_width} ms) cannot exceed recording length "
+                f"({self.length} ms); np.convolve(mode='same') would otherwise "
+                f"return an output sized to the kernel rather than the raster."
+            )
+        if 6 * gauss_sigma > self.length:
+            raise ValueError(
+                f"gauss_sigma ({gauss_sigma} ms) is too large for recording length "
+                f"({self.length} ms); the Gaussian kernel spans 6*sigma ms, which "
+                f"would exceed the raster and yield an output sized to the kernel "
+                f"rather than the raster."
+            )
 
         # Convert ms to bins
         square_width_bins = max(0, int(round(square_width / raster_bin_size_ms)))
@@ -2517,6 +2645,18 @@ class SpikeData:
             raise ValueError("window_ms must be at least 1.")
         if self.N < 2:
             raise ValueError("compute_spike_trig_pop_rate requires at least 2 units.")
+        if cut_outer < 0 or cut_outer >= window_ms:
+            raise ValueError(
+                f"cut_outer ({cut_outer}) must be in [0, window_ms={window_ms}); "
+                "a larger value would leave an empty trimmed array and the "
+                "downstream np.argmax would raise."
+            )
+        if not any(len(ts) > 0 for ts in self.train):
+            raise ValueError(
+                "compute_spike_trig_pop_rate requires at least one spike across all "
+                "units; got an all-empty spike matrix (the numba kernel cannot infer "
+                "types for a zero-spike input)."
+            )
 
         # Bin spike data to a spike matrix
         spike_matrix = self.sparse_raster(bin_size=bin_size).toarray()
@@ -2933,6 +3073,13 @@ class SpikeData:
                 "fit_gplvm requires 'poor_man_gplvm' and 'jax'. "
                 "Install with: pip install poor-man-gplvm jax jaxlib jaxopt optax"
             ) from e
+
+        if bin_size_ms > self.length:
+            raise ValueError(
+                f"bin_size_ms ({bin_size_ms}) cannot exceed recording length "
+                f"({self.length}); the resulting spike-count matrix would have "
+                f"zero or one bins, producing a degenerate GPLVM fit."
+            )
 
         if model_class is None:
             model_class = pmg.PoissonGPLVMJump1D
@@ -3581,6 +3728,24 @@ class SpikeData:
                 - ``metadata``: comparison settings
                 - For ``spike_times``: ``agreement``, ``frac_1``, ``frac_2``
                 - For ``waveforms``: ``similarity``
+
+        Notes:
+            **Channel numbering (``waveforms`` comparison only).** Both
+            ``self`` and ``other`` must use the same channel-ID scheme
+            for ``neuron_attributes["channel"]`` and
+            ``neuron_attributes["neighbor_channels"]`` (e.g. both
+            positional indices into the recording's channel list, OR
+            both physical electrode IDs — mixing the two silently
+            produces meaningless similarity values because footprints
+            are aligned by channel-row).
+
+            The footprint grid is auto-sized to
+            ``max(referenced_channels) + 1`` across both inputs. For
+            sparse high-index layouts (e.g. Maxwell recordings where
+            channel IDs are positions in a 26 400-electrode array)
+            this can produce mostly-zero footprints with a large row
+            count and corresponding memory cost. For dense probes
+            (0..N-1 channel IDs) the grid is compact.
 
         References:
             Buccino et al., "SpikeInterface, a unified framework for spike

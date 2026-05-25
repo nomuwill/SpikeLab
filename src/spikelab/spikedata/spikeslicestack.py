@@ -620,10 +620,18 @@ class SpikeSliceStack:
                 )
             z = z[:, bin_start:bin_end, :]
 
-        if aggregator == "mean":
-            agg = np.nanmean(z, axis=2)
-        else:
-            agg = np.nanmax(z, axis=2)
+        # Units with no baseline spikes across all slices produce all-NaN
+        # rows in ``z``; ``np.nanmean``/``np.nanmax`` then emit a
+        # ``RuntimeWarning: Mean of empty slice`` (or "All-NaN slice
+        # encountered"). The final ``np.any`` is still correct under
+        # ``errstate(invalid="ignore")``, so we suppress the noise here
+        # to match the pattern used by ``shuffle_z_score``.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if aggregator == "mean":
+                agg = np.nanmean(z, axis=2)
+            else:
+                agg = np.nanmax(z, axis=2)
         with np.errstate(invalid="ignore"):
             return np.any(agg > z_threshold, axis=1)
 

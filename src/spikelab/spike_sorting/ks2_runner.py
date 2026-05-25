@@ -13,15 +13,12 @@ import traceback
 from math import ceil
 from pathlib import Path
 from types import MethodType
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
-from natsort import natsorted
-from scipy.io import savemat
 
-from spikeinterface.core import BaseRecording, write_binary_recording
-from spikeinterface.extractors.extractor_classes import BinaryRecordingExtractor
-from spikeinterface.sorters import run_sorter
+if TYPE_CHECKING:
+    from spikeinterface.core import BaseRecording
 
 from ._classifier import classify_ks2_failure
 from ._exceptions import InsufficientActivityError, SpikeSortingClassifiedError
@@ -720,7 +717,12 @@ class ShellScript:
                 "the process has already been cleaned up."
             )
 
-        signals = [signal.SIGINT] * 10 + [signal.SIGTERM] * 10 + [signal.SIGKILL] * 10
+        # ``signal.SIGKILL`` only exists on POSIX. On Windows fall back
+        # to SIGTERM in the escalation loop; the final ``kill()`` path
+        # uses ``Popen.kill()`` which abstracts the OS-specific hard
+        # kill (TerminateProcess on Windows, SIGKILL on POSIX).
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        signals = [signal.SIGINT] * 10 + [signal.SIGTERM] * 10 + [sigkill] * 10
 
         for signal0 in signals:
             self._process.send_signal(signal0)
@@ -739,7 +741,11 @@ class ShellScript:
                 "ShellScript process is None — start() was not called or "
                 "the process has already been cleaned up."
             )
-        self._process.send_signal(signal.SIGKILL)
+        # ``Popen.kill()`` abstracts the OS-specific hard kill
+        # (TerminateProcess on Windows, SIGKILL on POSIX). Using
+        # ``signal.SIGKILL`` directly here would raise AttributeError
+        # on Windows.
+        self._process.kill()
         try:
             self._process.wait(timeout=1)
         except subprocess.TimeoutExpired:
@@ -826,7 +832,7 @@ class ShellScript:
 
 
 def write_recording(
-    recording_filtered: BaseRecording,
+    recording_filtered: "BaseRecording",
     recording_dat_path: Path,
     verbose: bool = True,
     *,
@@ -855,6 +861,16 @@ def write_recording(
             ``None``, falls back to the ``ExecutionConfig`` default
             (``True``).
     """
+    try:
+        from spikeinterface.extractors.extractor_classes import (
+            BinaryRecordingExtractor,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "spikeinterface is required for Kilosort2 sorting. "
+            "Install with: pip install spikeinterface"
+        ) from e
+
     if n_jobs is None or total_memory is None or use_parallel is None:
         from .config import ExecutionConfig
 
@@ -900,7 +916,7 @@ def write_recording(
 
 
 def _spike_sort_docker(
-    recording: BaseRecording,
+    recording: "BaseRecording",
     output_folder: Path,
     *,
     kilosort_params: Optional[Dict[str, Any]] = None,
@@ -932,6 +948,18 @@ def _spike_sort_docker(
         sorting (KilosortSortingExtractor): The sorting result loaded from the
             Docker output folder.
     """
+    try:
+        from spikeinterface.core import write_binary_recording
+        from spikeinterface.extractors.extractor_classes import (
+            BinaryRecordingExtractor,
+        )
+        from spikeinterface.sorters import run_sorter
+    except ImportError as e:
+        raise ImportError(
+            "spikeinterface is required for Kilosort2 sorting. "
+            "Install with: pip install spikeinterface"
+        ) from e
+
     if kilosort_params is None:
         from .backends.kilosort2 import DEFAULT_KILOSORT2_PARAMS
 
@@ -1020,7 +1048,7 @@ def _spike_sort_docker(
 
 
 def spike_sort(
-    rec_cache: BaseRecording,
+    rec_cache: "BaseRecording",
     rec_path: Any,
     recording_dat_path: Path,
     output_folder: Path,

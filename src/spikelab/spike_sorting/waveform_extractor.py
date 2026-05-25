@@ -1,6 +1,7 @@
 """Custom waveform extractor with per-spike peak centering, used by all Kilosort backends."""
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -12,7 +13,14 @@ import numpy as np
 from tqdm import tqdm
 
 from .config import SortingPipelineConfig, WaveformConfig
-from .sorting_utils import Stopwatch, create_folder, print_stage
+from .sorting_utils import (
+    Stopwatch,
+    _check_unit_id_density,
+    create_folder,
+    print_stage,
+)
+
+_logger = logging.getLogger(__name__)
 
 
 class WaveformExtractor:
@@ -70,7 +78,31 @@ class WaveformExtractor:
         # always contains these keys; the fallback to ``WaveformConfig``
         # defaults is defensive for JSON files written before
         # ``save_waveform_files`` was persisted.
+        #
+        # When the fallback fires, emit one ``_logger.warning`` per
+        # missing key so an operator reloading a pre-Phase-2.4
+        # extractor sees that defaults were substituted (the loaded
+        # extractor would otherwise look identical to one written
+        # with the same defaults). The warning includes the source
+        # folder so the operator can identify which extractor
+        # triggered it.
         _wf_defaults = WaveformConfig()
+        _legacy_fallback_keys = (
+            "pos_peak_thresh",
+            "max_waveforms_per_unit",
+            "save_waveform_files",
+        )
+        for _key in _legacy_fallback_keys:
+            if _key not in parameters:
+                _logger.warning(
+                    "extraction_parameters.json at %s is missing %r — "
+                    "substituting WaveformConfig default %r. Expected "
+                    "for waveform folders written before Phase-2.4; "
+                    "re-extract with current parameters to silence.",
+                    root_folder,
+                    _key,
+                    getattr(_wf_defaults, _key),
+                )
         self.pos_peak_thresh = parameters.get(
             "pos_peak_thresh", _wf_defaults.pos_peak_thresh
         )
@@ -235,15 +267,35 @@ class WaveformExtractor:
 
                 selected_spike_times[unit_id].append(spike_times_sel)
 
-        # Prepare memmap for waveforms
+        # Prepare memmap for waveforms.
+        # Use ``np.lib.format.open_memmap`` instead of
+        # ``np.zeros + np.save`` so the file is created via ``ftruncate``
+        # without materialising a ``(n_spikes, n_samples, n_channels)``
+        # zero array in RAM. For a typical Maxwell sort
+        # (200 units × ~1000 spikes × 370 KB/spike) the old pattern
+        # transiently allocated ~74 GB per recording — large enough
+        # to trip the host-memory watchdog on constrained boxes
+        # before any sort work began. The data section is sparse
+        # (zeros on read) so the worker-side semantics are
+        # unchanged: positions never written by any worker still
+        # return zero, just as with the explicit ``np.zeros`` fill.
         print("Preparing memory maps for waveforms")
         wfs_memmap = {}
         for unit_id in self.sorting.unit_ids:
             file_path = self.root_folder / "waveforms" / f"waveforms_{unit_id}.npy"
-            n_spikes = np.sum([e.size for e in selected_spike_times[unit_id]])
+            n_spikes = int(np.sum([e.size for e in selected_spike_times[unit_id]]))
             shape = (n_spikes, self.nsamples, num_chans)
-            wfs = np.zeros(shape, self.dtype)
-            np.save(str(file_path), wfs)
+            mm = np.lib.format.open_memmap(
+                str(file_path),
+                mode="w+",
+                dtype=self.dtype,
+                shape=shape,
+            )
+            # Release the parent's mmap immediately so we don't hold
+            # 200+ open file handles concurrently while still
+            # populating ``wfs_memmap``. Workers reopen the file via
+            # ``np.load(..., mmap_mode="r+")`` when they need it.
+            del mm
             wfs_memmap[unit_id] = file_path
 
         # Run extract waveforms
@@ -335,6 +387,7 @@ class WaveformExtractor:
 
         # Pre-allocate template_cache so templates can be streamed in
         # per unit as we go (same layout as compute_templates()).
+        _check_unit_id_density(unit_ids, self.nsamples, num_chans, dtype=self.dtype)
         templates_shape = (max(unit_ids) + 1, self.nsamples, num_chans)
         for mode in ("average", "std"):
             self.template_cache[mode] = np.zeros(templates_shape, dtype=self.dtype)
@@ -650,6 +703,20 @@ class WaveformExtractor:
                         st_trace - nbefore : st_trace + nafter, :
                     ]  # Python slices with [start, end), so waveform is in format (nbefore + spike_location + nafter-1, n_channels)
                     wfs[pos, :, :] = wf
+                # Force this unit's mmap writes to disk before moving
+                # on to the next unit. Two reasons:
+                #   1. Durability — without an explicit flush the OS
+                #      may hold dirty pages indefinitely; if the worker
+                #      exits abnormally (watchdog kill, OOM, etc.) those
+                #      writes are lost even though the file looks the
+                #      right size on disk.
+                #   2. IOStallWatchdog visibility — its byte-counter
+                #      delta detection only credits flushed writes, so
+                #      without this call the watchdog can decide the
+                #      worker is stalled when it's actually batching
+                #      writes in the OS page cache. The 2*stall_s blind
+                #      trip added in commit 6a74e16 would compound this.
+                wfs.flush()
         return spike_times_centered
 
     @staticmethod
@@ -845,6 +912,7 @@ class WaveformExtractor:
 
         num_chans = self.recording.get_num_channels()
 
+        _check_unit_id_density(unit_ids, self.nsamples, num_chans, dtype=self.dtype)
         for mode in modes:
             # With max(unit_ids)+1 instead of len(unit_ids), the template of unit_id can be retrieved by template[unit_id]
             # Instead of first converting unit_id to an index
@@ -1187,7 +1255,15 @@ class Utils:
 
     @staticmethod
     def read_python(path):
-        """Parses python scripts in a dictionary
+        """Parses a Phy/Kilosort ``params.py`` file into a dictionary.
+
+        Only top-level assignments of literal values (numbers, strings,
+        tuples, lists, dicts, sets, bools, ``None``) are accepted, plus
+        the legacy ``range(...)`` form expanded to a list. Any other
+        construct (function calls, imports, attribute access, etc.)
+        raises ``ValueError``. This is a hardened replacement for the
+        previous ``exec``-based parser, which would execute arbitrary
+        code embedded in ``params.py``.
 
         Parameters
         ----------
@@ -1200,16 +1276,50 @@ class Utils:
             dictionary containing parsed file
 
         """
-        import re
+        import ast
 
         path = Path(path).absolute()
         if not path.is_file():
             raise FileNotFoundError(f"Kilosort2 parameter file not found: {path}")
         with path.open("r") as f:
             contents = f.read()
-        contents = re.sub(r"range\(([\d,]*)\)", r"list(range(\1))", contents)
+
+        tree = ast.parse(contents, filename=str(path))
         metadata = {}
-        exec(contents, {}, metadata)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                raise ValueError(
+                    f"{path}: only single-target literal assignments are "
+                    f"allowed in params.py, got {ast.dump(node)}"
+                )
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                raise ValueError(
+                    f"{path}: assignment target must be a simple name, "
+                    f"got {ast.dump(target)}"
+                )
+            value_node = node.value
+            # Legacy compat: accept ``range(a, b, ...)`` with literal
+            # int args and materialize as a list, matching the prior
+            # ``re.sub(range -> list(range))`` behaviour.
+            if (
+                isinstance(value_node, ast.Call)
+                and isinstance(value_node.func, ast.Name)
+                and value_node.func.id == "range"
+                and all(isinstance(a, ast.Constant) for a in value_node.args)
+            ):
+                args = [a.value for a in value_node.args]
+                value = list(range(*args))
+            else:
+                try:
+                    value = ast.literal_eval(value_node)
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: value for {target.id!r} must be a literal "
+                        f"(or range() with literal int args), got "
+                        f"{ast.dump(value_node)}"
+                    ) from e
+            metadata[target.id] = value
         metadata = {k.lower(): v for (k, v) in metadata.items()}
         return metadata
 

@@ -252,11 +252,17 @@ async def compute_spike_time_tiling(
     neuron_j: int,
     delt: float = 20.0,
 ) -> Dict[str, Any]:
-    """Compute spike time tiling coefficient for a neuron pair and store to workspace."""
+    """Compute spike time tiling coefficient for a neuron pair and store to workspace.
+
+    The STTC value is stored as a plain ``float`` (not a length-1
+    array) — consistent with other scalar-producing tools and avoids
+    forcing every consumer to remember to index ``[0]`` to read the
+    value.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
     sttc = sd.spike_time_tiling(neuron_i, neuron_j, delt=delt)
-    ws.store(namespace, key, np.array([sttc]))
+    ws.store(namespace, key, float(sttc))
     return {
         "workspace_id": workspace_id,
         "namespace": namespace,
@@ -264,6 +270,7 @@ async def compute_spike_time_tiling(
         "neuron_i": neuron_i,
         "neuron_j": neuron_j,
         "delt": delt,
+        "value": float(sttc),
         "info": ws.get_info(namespace, key),
     }
 
@@ -452,10 +459,47 @@ async def get_bursts(
     raster_bin_size_ms: float = 1.0,
     peak_to_trough: bool = True,
     pop_rms_override: Optional[float] = None,
+    pop_rate_key: Optional[str] = None,
+    pop_rate_acc_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Detect population bursts and store burst times, edges, and amplitudes to workspace."""
+    """Detect population bursts and store burst times, edges, and amplitudes.
+
+    When ``pop_rate_key`` is given, the pre-computed rate at
+    ``(namespace, pop_rate_key)`` is used directly and the
+    ``square_width`` / ``gauss_sigma`` smoothing args are ignored —
+    this is the recommended way to keep the rate plotted by
+    ``get_pop_rate`` and the bursts detected here mathematically
+    consistent. Same for ``pop_rate_acc_key`` /
+    ``acc_square_width`` / ``acc_gauss_sigma``. When the keys are
+    omitted, the rate is recomputed internally from SpikeData using
+    the smoothing args — backwards-compatible but silently
+    inconsistent with any previously plotted rate.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
+
+    pop_rate = None
+    if pop_rate_key is not None:
+        pop_rate_obj = ws.get(namespace, pop_rate_key)
+        if not isinstance(pop_rate_obj, np.ndarray) or pop_rate_obj.ndim != 1:
+            raise ValueError(
+                f"pop_rate at ({namespace!r}, {pop_rate_key!r}) must be a 1-D "
+                f"ndarray, got {type(pop_rate_obj).__name__} with shape "
+                f"{getattr(pop_rate_obj, 'shape', 'N/A')}."
+            )
+        pop_rate = pop_rate_obj
+
+    pop_rate_acc = None
+    if pop_rate_acc_key is not None:
+        pop_rate_acc_obj = ws.get(namespace, pop_rate_acc_key)
+        if not isinstance(pop_rate_acc_obj, np.ndarray) or pop_rate_acc_obj.ndim != 1:
+            raise ValueError(
+                f"pop_rate_acc at ({namespace!r}, {pop_rate_acc_key!r}) must be "
+                f"a 1-D ndarray, got {type(pop_rate_acc_obj).__name__} with "
+                f"shape {getattr(pop_rate_acc_obj, 'shape', 'N/A')}."
+            )
+        pop_rate_acc = pop_rate_acc_obj
+
     tburst, edges, peak_amp = sd.get_bursts(
         thr_burst,
         min_burst_diff,
@@ -466,6 +510,8 @@ async def get_bursts(
         acc_gauss_sigma=acc_gauss_sigma,
         raster_bin_size_ms=raster_bin_size_ms,
         peak_to_trough=peak_to_trough,
+        pop_rate=pop_rate,
+        pop_rate_acc=pop_rate_acc,
         pop_rms_override=pop_rms_override,
     )
     ws.store(namespace, key_tburst, np.asarray(tburst, dtype=np.float64))
@@ -683,12 +729,19 @@ async def subtime(
     namespace: str,
     start: float,
     end: float,
+    shift_to: Optional[float] = None,
     out_namespace: str = "",
 ) -> Dict[str, Any]:
-    """Extract a time-windowed SpikeData subset and store to workspace."""
+    """Extract a time-windowed SpikeData subset and store to workspace.
+
+    By default the result's spike times are shifted so the new
+    start_time is 0 (matching ``SpikeData.subtime``'s default
+    ``shift_to=start`` behaviour). Pass ``shift_to=0`` to preserve
+    absolute times, or any other event time for event-centered output.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    new_sd = sd.subtime(start, end)
+    new_sd = sd.subtime(start, end, shift_to=shift_to)
     target_ns = out_namespace if out_namespace else namespace
     ws.store(target_ns, _SPIKEDATA_KEY, new_sd)
     return {
@@ -746,18 +799,36 @@ async def concatenate_units(
     workspace_id: str,
     namespace_a: str,
     namespace_b: str,
+    out_namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Concatenate units from two SpikeData objects and store to workspace."""
+    """Concatenate units from two SpikeData objects and store to workspace.
+
+    By default (``out_namespace=None``) the combined SpikeData overwrites
+    the SpikeData slot at ``namespace_a`` — historical behaviour, kept
+    for backwards compatibility. Pass an explicit ``out_namespace`` to
+    write the result to a separate slot, preserving both inputs. This
+    matches the explicit-destination pattern used by other MCP tools
+    in this file (``compute_pairwise_fr_corr``, ``curate_spikedata``,
+    etc.).
+
+    The combined SpikeData inherits ``namespace_a``'s time range,
+    ``raw_data`` / ``raw_time``, and (on metadata key conflicts)
+    metadata — so the choice of ``namespace_a`` vs ``namespace_b``
+    is structurally significant, not just a destination selector.
+    Swapping the two arguments produces a different combined
+    SpikeData (units in reversed order, different inherited fields).
+    """
     ws = _get_workspace(workspace_id)
     sd_a = _get_spikedata(ws, namespace_a)
     sd_b = _get_spikedata(ws, namespace_b)
     sd_combined = sd_a.concatenate_spike_data(sd_b)
-    ws.store(namespace_a, _SPIKEDATA_KEY, sd_combined)
+    target = out_namespace if out_namespace is not None else namespace_a
+    ws.store(target, _SPIKEDATA_KEY, sd_combined)
     return {
         "workspace_id": workspace_id,
-        "namespace": namespace_a,
+        "namespace": target,
         "workspace_key": _SPIKEDATA_KEY,
-        "info": ws.get_info(namespace_a, _SPIKEDATA_KEY),
+        "info": ws.get_info(target, _SPIKEDATA_KEY),
     }
 
 
@@ -2506,17 +2577,26 @@ async def compute_waveform_metrics(
     namespace: str,
     ms_before: float = 1.0,
     ms_after: float = 2.0,
+    out_namespace: str = "",
 ) -> Dict[str, Any]:
-    """Compute SNR and normalized STD from raw waveforms and store in neuron_attributes."""
+    """Compute SNR and normalized STD from raw waveforms and store in neuron_attributes.
+
+    When ``out_namespace`` is empty (default), the enriched SpikeData
+    overwrites the input at ``(namespace, 'spikedata')`` — matches the
+    in-place behaviour of the other ``compute_*`` tools that modify
+    SpikeData. Pass ``out_namespace`` to write to a separate namespace
+    when you want to keep the unaugmented SpikeData intact.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
     sd_new, metrics = sd.compute_waveform_metrics(
         ms_before=ms_before, ms_after=ms_after
     )
-    ws.store(namespace, _SPIKEDATA_KEY, sd_new)
+    target_ns = out_namespace if out_namespace else namespace
+    ws.store(target_ns, _SPIKEDATA_KEY, sd_new)
     return {
         "workspace_id": workspace_id,
-        "namespace": namespace,
+        "namespace": target_ns,
         "workspace_key": _SPIKEDATA_KEY,
         "snr_summary": {
             "mean": float(np.nanmean(metrics["snr"])),
@@ -2744,12 +2824,32 @@ async def pcm_stack_threshold(
     namespace: str,
     key: str,
     threshold: float,
-    out_key: str = "",
+    out_key: Optional[str] = None,
+    preserve_nan: bool = False,
 ) -> Dict[str, Any]:
-    """Apply a binary threshold to a PairwiseCompMatrixStack and store to workspace."""
+    """Apply a binary threshold to a PairwiseCompMatrixStack and store to workspace.
+
+    By default (``out_key=None`` or omitted) the binary {0, 1}
+    thresholded stack **overwrites** the original float-valued stack
+    at ``(namespace, key)``. The original float values are
+    unrecoverable from the workspace after this call — any subsequent
+    analysis that expects the source stack to be float-valued will
+    silently fail or produce wrong results. Pass an explicit
+    ``out_key`` to write the result to a separate slot and keep the
+    source intact.
+
+    The empty string ``""`` is also accepted in place of ``None`` for
+    backwards compatibility with callers using the previous default,
+    and is treated identically (use input ``key``).
+
+    By default NaN values in the source stack are treated as below
+    threshold and become 0 in the binary output. Pass
+    ``preserve_nan=True`` to keep NaN in the output (useful when
+    "missing" must remain distinguishable from "below threshold").
+    """
     ws = _get_workspace(workspace_id)
     stack = _get_pcm_stack(ws, namespace, key)
-    new_stack = stack.threshold(threshold)
+    new_stack = stack.threshold(threshold, preserve_nan=preserve_nan)
     target_key = out_key if out_key else key
     ws.store(namespace, target_key, new_stack)
     return {

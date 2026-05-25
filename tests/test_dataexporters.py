@@ -111,7 +111,7 @@ class TestHDF5Exporters:
             spike_times_unit="s",
         )
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_export_hdf5_group_roundtrip_samples(self, tmp_path):
         """
@@ -150,7 +150,7 @@ class TestHDF5Exporters:
             return samp / 1000.0 * 1e3
 
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(q(a), b)
+            np.testing.assert_allclose(q(a), b)
 
     def test_export_hdf5_paired_roundtrip_ms(self, tmp_path):
         """
@@ -180,7 +180,7 @@ class TestHDF5Exporters:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_export_hdf5_raster(self, tmp_path):
         """
@@ -201,7 +201,7 @@ class TestHDF5Exporters:
         )
         with h5py.File(path, "r") as f:  # type: ignore
             raster = np.asarray(f["raster"])
-        assert np.array_equal(raster, sd.raster(5.0))
+        np.testing.assert_array_equal(raster, sd.raster(5.0))
 
     def test_export_hdf5_with_raw(self, tmp_path):
         """
@@ -216,7 +216,7 @@ class TestHDF5Exporters:
         - Validates that continuous raw data (like voltage traces) can be exported alongside spike times.
         """
         sd = make_sd()
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(2).standard_normal((2, 10))
         sd = SpikeData(sd.train, length=sd.length, raw_data=raw, raw_time=np.arange(10))
         path = str(tmp_path / "test.h5")
 
@@ -229,7 +229,7 @@ class TestHDF5Exporters:
             raw_time_unit="s",
         )
         with h5py.File(path, "r") as f:  # type: ignore
-            assert np.allclose(np.asarray(f["raw_time"]), sd.raw_time / 1e3)
+            np.testing.assert_allclose(np.asarray(f["raw_time"]), sd.raw_time / 1e3)
 
     def test_export_hdf5_all_empty_trains_ragged(self, tmp_path):
         """
@@ -386,6 +386,38 @@ class TestHDF5Exporters:
         # inferred from ``max(spike) - start_time``.
         assert loaded.length == pytest.approx(200.0)
 
+    def test_explicit_length_ms_beats_file_attribute_ragged(self, tmp_path):
+        """
+        Caller-supplied ``length_ms`` to ``load_spikedata_from_hdf5``
+        takes precedence over the persisted ``length_ms`` file
+        attribute written by the exporter (PR #139 contract).
+
+        Distinct from the inferred-vs-file precedence: this pins that
+        when the file *has* a ``length_ms`` attr (200), an explicit
+        caller override (100) still wins. Catches a regression that
+        would let the file attribute silently override user intent.
+
+        Tests:
+            (Test Case 1) Exported length is 200 ms; reloading with
+                explicit ``length_ms=100.0`` yields ``loaded.length ==
+                100.0`` (caller wins over file attr).
+            (Test Case 2) Spike times are unchanged by the override.
+        """
+        trains = [np.array([50.0])]
+        sd = SpikeData(trains, length=200.0, start_time=0.0)
+        path = str(tmp_path / "length_caller_override.h5")
+
+        exporters.export_spikedata_to_hdf5(sd, path, style="ragged")
+
+        loaded = loaders.load_spikedata_from_hdf5(
+            path,
+            spike_times_dataset="spike_times",
+            spike_times_index_dataset="spike_times_index",
+            length_ms=100.0,
+        )
+        assert loaded.length == pytest.approx(100.0)
+        np.testing.assert_allclose(loaded.train[0], [50.0])
+
     def test_nonzero_start_time_roundtrip_paired(self, tmp_path):
         """
         Non-zero start_time is preserved through a paired-style export/load round-trip.
@@ -502,7 +534,7 @@ class TestHDF5Exporters:
             (Test Case 1) fs_Hz=None with raw_time_unit='samples' raises ValueError.
             (Test Case 2) fs_Hz=0 with raw_time_unit='samples' raises ValueError.
         """
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(3).standard_normal((2, 10))
         sd = SpikeData(
             [np.array([5.0])], length=20.0, raw_data=raw, raw_time=np.arange(10.0)
         )
@@ -537,7 +569,7 @@ class TestHDF5Exporters:
         Tests:
             (Test Case 1) raw_time_unit='invalid' raises ValueError.
         """
-        raw = np.random.randn(2, 10)
+        raw = np.random.default_rng(4).standard_normal((2, 10))
         sd = SpikeData(
             [np.array([5.0])], length=20.0, raw_data=raw, raw_time=np.arange(10.0)
         )
@@ -609,7 +641,7 @@ class TestNWBExporters:
         sd.to_nwb(path)
         sd2 = loaders.load_spikedata_from_nwb(path, prefer_pynwb=False)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     def test_nwb_electrode_roundtrip(self, tmp_path):
         """
@@ -658,15 +690,22 @@ class TestNWBExporters:
             st = np.asarray(f["units/spike_times"])
             assert len(st) == 3  # 2 + 1 spikes total
 
-    def test_nonzero_start_time_warning(self, tmp_path):
+    def test_nonzero_start_time_roundtrips(self, tmp_path):
         """
-        NWB export with non-zero start_time issues a UserWarning.
+        NWB export now round-trips ``start_time`` through the file
+        attributes (commit 609aa09) instead of warning that it would
+        be lost. Reload the file and assert ``loaded.start_time``
+        equals the source value.
 
         Tests:
-            (Test Case 1) start_time=-100 triggers a UserWarning about
-                NWB not preserving start_time.
+            (Test Case 1) start_time=-100 round-trips losslessly.
+            (Test Case 2) No "start_time" UserWarning is emitted
+                during export (regression guard against the old
+                warn-on-nonzero contract).
         """
         import warnings
+
+        from spikelab.data_loaders import data_loaders as loaders
 
         trains = [np.array([-50.0, 0.0, 50.0])]
         sd = SpikeData(trains, length=200.0, start_time=-100.0)
@@ -675,8 +714,16 @@ class TestNWBExporters:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             exporters.export_spikedata_to_nwb(sd, path)
-            user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
-            assert any("start_time" in str(x.message) for x in user_warnings)
+            user_warnings = [
+                x
+                for x in w
+                if issubclass(x.category, UserWarning)
+                and "start_time" in str(x.message)
+            ]
+            assert user_warnings == []
+
+        loaded = loaders.load_spikedata_from_nwb(path)
+        assert loaded.start_time == -100.0
 
     def test_z_coordinates_roundtrip(self, tmp_path):
         """
@@ -860,7 +907,7 @@ class TestKiloSortExporters:
             return samp / 1000.0 * 1e3
 
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(q(a), b)
+            np.testing.assert_allclose(q(a), b)
 
     def test_export_kilosort_custom_cluster_ids(self, tmp_path):
         """
@@ -1153,7 +1200,7 @@ class TestPickleExporters:
         exporters.export_to_pickle(sd, path)
         sd2 = loaders.load_spikedata_from_pickle(path)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
         assert sd.metadata == sd2.metadata
 
     def test_export_pickle_protocol(self, tmp_path):
@@ -1169,7 +1216,7 @@ class TestPickleExporters:
         exporters.export_to_pickle(sd, path, protocol=2)
         sd2 = loaders.load_spikedata_from_pickle(path)
         for a, b in zip(sd.train, sd2.train):
-            assert np.allclose(a, b)
+            np.testing.assert_allclose(a, b)
 
     @patch("spikelab.data_loaders.s3_utils.upload_to_s3")
     def test_export_pickle_s3_upload(self, mock_upload):
@@ -1423,19 +1470,32 @@ class TestScan:
                     0,
                 ), f"Unit {i} should be empty, got shape {ds.shape}"
 
-    def test_nwb_export_event_centered_warns(self, tmp_path):
-        """Tests: NWB export with event-centered SpikeData emits start_time warning.
-        (Test Case 4)
+    def test_nwb_export_event_centered_roundtrips_start_time(self, tmp_path):
+        """Tests: NWB export with event-centered SpikeData now round-trips
+        ``start_time`` through the file (commit 609aa09) instead of
+        warning that it would be lost. (Test Case 4)
         """
+        import warnings
+
+        from spikelab.data_loaders import data_loaders as loaders
+
         sd = SpikeData(
             [np.array([-150.0, -50.0, 100.0]), np.array([-80.0])],
             length=400.0,
             start_time=-200.0,
         )
         filepath = str(tmp_path / "event_centered.nwb")
-        with pytest.warns(UserWarning, match="start_time"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             exporters.export_spikedata_to_nwb(sd, filepath)
+            assert not any(
+                "start_time" in str(x.message)
+                for x in w
+                if issubclass(x.category, UserWarning)
+            )
         assert os.path.isfile(filepath)
+        loaded = loaders.load_spikedata_from_nwb(filepath)
+        assert loaded.start_time == -200.0
 
     def test_kilosort_export_event_centered_warns(self, tmp_path):
         """Tests: KiloSort export with event-centered SpikeData emits start_time warning.
@@ -1825,3 +1885,131 @@ class TestExportHdf5FailFastFsHzValidation:
             f"{path.name} was created despite fail-fast contract; "
             "user is left with a half-written file."
         )
+
+
+# ============================================================================
+# I/O review (2026-05-24) — data_exporters edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestExportHDF5RasterBinSizeNaN:
+    """``export_spikedata_to_hdf5`` with ``raster_bin_size_ms=NaN``
+    slips past the ``<= 0`` guard (NaN <= 0 is False), then the
+    downstream ``sd.raster(NaN)`` call inside the exporter raises.
+    Pin the deferred-failure contract.
+    """
+
+    def test_raster_bin_size_nan_raises_via_inner(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``raster_bin_size_ms=NaN`` causes some
+                ValueError to propagate from the inner raster call.
+
+        Notes:
+            - The exact error message depends on which inner guard
+              fires first; pin only that *some* ValueError surfaces
+              so the caller is not silently handed a corrupt file.
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        path = tmp_path / "nan_bin.h5"
+        with pytest.raises(ValueError):
+            exporters.export_spikedata_to_hdf5(
+                sd, str(path), style="raster", raster_bin_size_ms=float("nan")
+            )
+
+
+class TestExportKilosortFolderIsExistingFile:
+    """``export_spikedata_to_kilosort`` calls ``os.makedirs(folder,
+    exist_ok=True)`` which raises ``FileExistsError`` when ``folder``
+    points to an existing regular file (not a directory). Pin the
+    failure mode so a future stricter pre-check would surface.
+    """
+
+    def test_existing_file_folder_raises(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``folder`` pointing to an existing regular
+                file raises ``FileExistsError`` (or generic OSError).
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([5.0])], length=100.0)
+        existing = tmp_path / "not_a_dir"
+        existing.write_text("hello")
+
+        with pytest.raises((FileExistsError, OSError, NotADirectoryError)):
+            exporters.export_spikedata_to_kilosort(sd, str(existing), fs_Hz=30_000.0)
+
+
+class TestExportNWBDropsMetadataSilently:
+    """``export_spikedata_to_nwb`` does NOT persist
+    ``SpikeData.metadata``: NWB has no canonical field for arbitrary
+    metadata, and the exporter quietly omits it. Pin the documented
+    no-persistence contract so a round-trip caller cannot assume
+    metadata survives.
+    """
+
+    def test_metadata_does_not_round_trip(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Export a SpikeData with non-trivial metadata;
+                the reloaded SpikeData has no matching metadata entries.
+            (Test Case 2) Reload does not raise.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_exporters import export_spikedata_to_nwb
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        sd.metadata["session_id"] = "fixture_001"
+        sd.metadata["experimenter"] = "tjits"
+
+        path = tmp_path / "no_metadata.nwb"
+        export_spikedata_to_nwb(sd, str(path))
+        sd2 = load_spikedata_from_nwb(str(path), prefer_pynwb=False)
+        assert sd2.N == 1
+        # Metadata silently dropped: the keys we set do not survive.
+        assert "session_id" not in sd2.metadata
+        assert "experimenter" not in sd2.metadata
+
+
+class TestExportNegativeFsHzSlipsPastGuard:
+    """``export_spikedata_to_hdf5`` ragged/group/paired styles validate
+    ``fs_Hz`` with ``not fs_Hz`` (source lines 129, 134, 139). Python
+    treats negative numbers as truthy, so ``not -1000`` is False and
+    the validation passes — the failure then surfaces deeper, possibly
+    after a partial file has been written. Pin the BUG (deferred to
+    /developer per REVIEW.md Bugs Confirmed list).
+
+    This test documents the *current* behaviour: the call eventually
+    raises (somewhere) but the failure is not the clean upfront
+    ValueError the docstring promises.
+    """
+
+    @pytest.mark.parametrize("style", ["ragged", "group", "paired"])
+    def test_negative_fs_hz_eventually_raises(self, tmp_path, style):
+        """
+        Tests:
+            (Test Case 1) ``fs_Hz=-1000`` with ``spike_times_unit='samples'``
+                raises *some* error (currently via deferred validation).
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        path = tmp_path / f"neg_fs_{style}.h5"
+
+        # Pick the right kwarg name per style.
+        if style == "group":
+            kwargs = {"style": style, "group_time_unit": "samples"}
+        elif style == "paired":
+            kwargs = {"style": style, "times_unit": "samples"}
+        else:
+            kwargs = {"style": style, "spike_times_unit": "samples"}
+
+        with pytest.raises((ValueError, Exception)):
+            exporters.export_spikedata_to_hdf5(sd, str(path), fs_Hz=-1000.0, **kwargs)

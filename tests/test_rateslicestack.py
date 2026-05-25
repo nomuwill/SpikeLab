@@ -2580,3 +2580,162 @@ class TestRateSliceStackUnitCorrConstantRate:
             np.testing.assert_allclose(sub, np.ones_like(sub), atol=1e-9)
         # Average per-unit correlation across the lower triangle is 1.0.
         np.testing.assert_allclose(av_corr, np.ones(2), atol=1e-9)
+
+
+class TestRateSliceStackSubsliceEmpty:
+    """``RateSliceStack.subslice(slices=[])`` now raises ``ValueError``
+    via the symmetric T=0/S=0 guard in ``__init__``. The S=0 case was
+    silently accepted previously, producing a ``(U, T, 0)`` stack that
+    downstream slice-aware methods weren't designed to handle.
+    Callers that want a "no slices" sentinel should use ``None``
+    rather than a degenerate stack.
+    """
+
+    def test_empty_slice_list_raises(self):
+        """
+        ``subslice(slices=[])`` propagates ``ValueError`` from the
+        ``__init__`` S=0 guard.
+
+        Tests:
+            (Test Case 1) ``ValueError`` raised.
+            (Test Case 2) Message identifies S=0 as the issue and
+                points the caller at the ``None`` alternative.
+        """
+        mat = make_event_matrix(n_units=2, n_times=5, n_slices=3)
+        rss = RateSliceStack(event_matrix=mat, step_size=2.0)
+        with pytest.raises(ValueError, match="zero slices"):
+            rss.subslice(slices=[])
+
+    def test_zero_s_event_matrix_raises(self):
+        """
+        Constructing a RateSliceStack directly with ``S=0`` also
+        raises (symmetric with the existing T=0 guard).
+
+        Tests:
+            (Test Case 1) Construction with ``(U, T, 0)`` event_matrix
+                raises ValueError with "zero slices" in the message.
+        """
+        with pytest.raises(ValueError, match="zero slices"):
+            RateSliceStack(
+                event_matrix=np.zeros((2, 5, 0)),
+                times_start_to_end=[],
+                step_size=1.0,
+            )
+
+
+# ============================================================================
+# Core review (2026-05-24) — RateSliceStack edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestRateSliceStackSubsliceEmpty:
+    """``RateSliceStack.subslice([])`` indirectly triggers the new S=0
+    reject in ``__init__``. Pin the propagation so the contract is
+    visible as a single-step error rather than a side-effect of slicing.
+    """
+
+    def test_subslice_empty_list_raises_via_s_zero_guard(self):
+        """
+        Tests:
+            (Test Case 1) ``subslice([])`` raises ValueError with a
+                message mentioning "zero slices".
+        """
+        rss = RateSliceStack(
+            event_matrix=make_event_matrix(n_units=2, n_times=5, n_slices=3),
+            times_start_to_end=[(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)],
+            step_size=1.0,
+        )
+        with pytest.raises(ValueError, match="zero slices"):
+            rss.subslice([])
+
+
+class TestRateSliceStackInitSigmaZero:
+    """``sigma_ms=0`` is accepted (only negative is rejected at line
+    86-87) and routes through ``resampled_isi`` with no Gaussian
+    smoothing. Pin the contract so a regression that started rejecting
+    ``sigma_ms=0`` would surface.
+    """
+
+    def test_sigma_ms_zero_with_spikedata_input(self):
+        """
+        Tests:
+            (Test Case 1) ``RateSliceStack(data_obj=sd, sigma_ms=0)``
+                constructs successfully.
+            (Test Case 2) Resulting event_stack has expected shape.
+        """
+        sd = make_spikedata(n_units=2, length_ms=50.0)
+        rss = RateSliceStack(
+            data_obj=sd,
+            sigma_ms=0,
+            times_start_to_end=[(0.0, 25.0), (25.0, 50.0)],
+        )
+        # event_stack should be (U=2, T, S=2)
+        assert rss.event_stack.shape[0] == 2
+        assert rss.event_stack.shape[2] == 2
+
+
+class TestRateSliceStackSubtimeByIndexZeroBoundary:
+    """``RateSliceStack.subtime_by_index(0, 0)`` should raise via the
+    ``end_idx <= start_idx`` guard (mirrors the RateData boundary).
+    """
+
+    def test_zero_zero_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``subtime_by_index(0, 0)`` raises ValueError.
+        """
+        rss = RateSliceStack(
+            event_matrix=make_event_matrix(n_units=2, n_times=5, n_slices=3),
+            times_start_to_end=[(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)],
+            step_size=1.0,
+        )
+        with pytest.raises(ValueError):
+            rss.subtime_by_index(0, 0)
+
+
+class TestRateSliceStackUnitToUnitCorrelationBoundaries:
+    """``unit_to_unit_correlation`` single-slice + ``max_lag=None``
+    boundary tests. Single-unit early-returns NaN with a RuntimeWarning;
+    ``max_lag=None`` should route to the cross-correlation function
+    which treats it as zero-lag.
+    """
+
+    def test_single_unit_returns_nan_warning(self):
+        """
+        Tests:
+            (Test Case 1) U=1 stack emits a RuntimeWarning.
+            (Test Case 2) Returned PCM stack is all-NaN.
+        """
+        rss = RateSliceStack(
+            event_matrix=make_event_matrix(n_units=1, n_times=10, n_slices=2),
+            times_start_to_end=[(0.0, 10.0), (10.0, 20.0)],
+            step_size=1.0,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            corr_stack, lag_stack, av_corr, av_lag = rss.unit_to_unit_correlation(
+                max_lag=2
+            )
+        assert any("fewer than" in str(w.message).lower() for w in caught)
+        assert np.all(np.isnan(corr_stack.stack))
+        assert np.all(np.isnan(av_corr))
+
+    def test_max_lag_none_treated_as_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``max_lag=None`` produces a finite-shape result
+                without raising.
+        """
+        rss = RateSliceStack(
+            event_matrix=make_event_matrix(n_units=2, n_times=10, n_slices=2),
+            times_start_to_end=[(0.0, 10.0), (10.0, 20.0)],
+            step_size=1.0,
+        )
+        # Default compare_func handles max_lag=None as zero-lag.
+        corr_stack, lag_stack, av_corr, av_lag = rss.unit_to_unit_correlation(
+            max_lag=None, n_jobs=1
+        )
+        assert corr_stack.stack.shape == (2, 2, 2)
+        # Lag stack must be all-zero when max_lag is treated as 0.
+        np.testing.assert_array_equal(lag_stack.stack, np.zeros_like(lag_stack.stack))

@@ -237,8 +237,11 @@ async def _list_tools() -> list[types.Tool]:
             types.Tool(
                 name="load_from_kilosort",
                 description=(
-                    "Load spike data from KiloSort/Phy output folder. Stores "
-                    "SpikeData at (namespace, 'spikedata') in the workspace."
+                    "Load spike data from a LOCAL KiloSort/Phy output folder. "
+                    "Stores SpikeData at (namespace, 'spikedata') in the "
+                    "workspace. S3 folder paths are not yet supported and "
+                    "raise NotImplementedError — download the folder locally "
+                    "first."
                 ),
                 inputSchema={
                     "type": "object",
@@ -863,7 +866,13 @@ async def _list_tools() -> list[types.Tool]:
                 description=(
                     "Detect bursts from the population firing rate using thresholded "
                     "peak finding. Stores burst times at key_tburst, burst edges at "
-                    "key_edges (B, 2), and peak amplitudes at key_amp."
+                    "key_edges (B, 2), and peak amplitudes at key_amp. "
+                    "To keep the rate consistent with a previously computed "
+                    "get_pop_rate, pass pop_rate_key (and pop_rate_acc_key for "
+                    "the edge-detection rate). When the keys are omitted the "
+                    "rates are recomputed internally from SpikeData using "
+                    "square_width/gauss_sigma — silently inconsistent with any "
+                    "rate plotted by a separate get_pop_rate call."
                 ),
                 inputSchema={
                     "type": "object",
@@ -893,15 +902,51 @@ async def _list_tools() -> list[types.Tool]:
                             "type": "number",
                             "description": "Multiplier for burst edge detection threshold",
                         },
-                        "square_width": {"type": "integer", "default": 20},
-                        "gauss_sigma": {"type": "integer", "default": 100},
-                        "acc_square_width": {"type": "integer", "default": 8},
-                        "acc_gauss_sigma": {"type": "integer", "default": 8},
+                        "square_width": {
+                            "type": "integer",
+                            "default": 20,
+                            "description": "Ignored when pop_rate_key is set.",
+                        },
+                        "gauss_sigma": {
+                            "type": "integer",
+                            "default": 100,
+                            "description": "Ignored when pop_rate_key is set.",
+                        },
+                        "acc_square_width": {
+                            "type": "integer",
+                            "default": 8,
+                            "description": "Ignored when pop_rate_acc_key is set.",
+                        },
+                        "acc_gauss_sigma": {
+                            "type": "integer",
+                            "default": 8,
+                            "description": "Ignored when pop_rate_acc_key is set.",
+                        },
                         "raster_bin_size_ms": {"type": "number", "default": 1.0},
                         "peak_to_trough": {"type": "boolean", "default": True},
                         "pop_rms_override": {
                             "type": "number",
                             "description": "Override baseline RMS for cross-dataset normalization",
+                        },
+                        "pop_rate_key": {
+                            "type": ["string", "null"],
+                            "default": None,
+                            "description": (
+                                "Optional workspace key for a precomputed 1-D "
+                                "population rate (from get_pop_rate). When set, "
+                                "square_width/gauss_sigma are ignored and the "
+                                "stored rate is used directly — keeps the rate "
+                                "and burst edges mathematically consistent."
+                            ),
+                        },
+                        "pop_rate_acc_key": {
+                            "type": ["string", "null"],
+                            "default": None,
+                            "description": (
+                                "Optional workspace key for a precomputed 1-D "
+                                "edge-detection population rate. When set, "
+                                "acc_square_width/acc_gauss_sigma are ignored."
+                            ),
                         },
                     },
                     "required": [
@@ -1107,11 +1152,21 @@ async def _list_tools() -> list[types.Tool]:
                             "description": "Attribute name to set",
                         },
                         "values": {
+                            "type": [
+                                "string",
+                                "number",
+                                "integer",
+                                "boolean",
+                                "array",
+                                "object",
+                                "null",
+                            ],
                             "description": "Single value (applied to all) or list matching neuron_indices length",
                         },
                         "neuron_indices": {
-                            "type": "array",
+                            "type": ["array", "null"],
                             "items": {"type": "integer"},
+                            "default": None,
                             "description": "Neuron indices to update. If null, updates all.",
                         },
                     },
@@ -1150,7 +1205,12 @@ async def _list_tools() -> list[types.Tool]:
                     "Extract a time window from SpikeData. Loads from "
                     "(namespace, 'spikedata') and stores the result at "
                     "(out_namespace, 'spikedata'). If out_namespace is empty, "
-                    "overwrites in place."
+                    "overwrites in place. NOTE: by default the result's "
+                    "spike times are shifted so the new start_time is 0 "
+                    "(i.e. spikes in [start, end) become [0, end-start)). "
+                    "Pass shift_to=0 to preserve absolute times — useful "
+                    "when downstream tools (e.g. align_to_events) rely on "
+                    "the original time origin."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1158,6 +1218,17 @@ async def _list_tools() -> list[types.Tool]:
                         **_WS_PROPS,
                         "start": {"type": "number", "description": "Start time in ms"},
                         "end": {"type": "number", "description": "End time in ms"},
+                        "shift_to": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Time value that becomes t=0 in the output. "
+                                "Null (default) maps to ``start``, i.e. spikes "
+                                "are shifted so the new start_time is 0. Pass "
+                                "0 to preserve absolute times; pass an event "
+                                "time for event-centered output."
+                            ),
+                            "default": None,
+                        },
                         "out_namespace": {
                             "type": "string",
                             "description": "Namespace to store result. If empty, overwrites the input namespace.",
@@ -1234,8 +1305,10 @@ async def _list_tools() -> list[types.Tool]:
                 name="concatenate_units",
                 description=(
                     "Add all units from a second SpikeData into the first (both must "
-                    "have the same length). Modifies and re-stores (namespace_a, 'spikedata') "
-                    "in place."
+                    "have the same length). By default re-stores the combined result "
+                    "at (namespace_a, 'spikedata'), overwriting that slot. Pass "
+                    "``out_namespace`` to write the result to a separate namespace "
+                    "and preserve both inputs."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1243,11 +1316,24 @@ async def _list_tools() -> list[types.Tool]:
                         "workspace_id": {"type": "string"},
                         "namespace_a": {
                             "type": "string",
-                            "description": "Namespace to add units into (modified in place)",
+                            "description": (
+                                "Namespace of the first SpikeData. The combined "
+                                "result inherits its time range, raw_data, and "
+                                "(on metadata-key conflicts) metadata."
+                            ),
                         },
                         "namespace_b": {
                             "type": "string",
                             "description": "Namespace whose units are added",
+                        },
+                        "out_namespace": {
+                            "type": "string",
+                            "description": (
+                                "Namespace to write the combined SpikeData into. "
+                                "Default (omitted or null) overwrites namespace_a, "
+                                "matching legacy behaviour. Pass an explicit value "
+                                "to preserve both inputs."
+                            ),
                         },
                     },
                     "required": ["workspace_id", "namespace_a", "namespace_b"],
@@ -1765,6 +1851,10 @@ async def _list_tools() -> list[types.Tool]:
                             "description": "Output workspace key for the slice stack",
                         },
                         "events": {
+                            "oneOf": [
+                                {"type": "array", "items": {"type": "number"}},
+                                {"type": "string"},
+                            ],
                             "description": "List of event times in ms, or a string metadata key (e.g. 'stim_on_times')",
                         },
                         "pre_ms": {
@@ -1940,6 +2030,7 @@ async def _list_tools() -> list[types.Tool]:
                         },
                         "agg_func": {
                             "type": "string",
+                            "enum": ["median", "mean"],
                             "default": "median",
                             "description": "Aggregation function across slices ('median' or 'mean')",
                         },
@@ -2249,6 +2340,7 @@ async def _list_tools() -> list[types.Tool]:
                         },
                         "agg_func": {
                             "type": "string",
+                            "enum": ["median", "mean"],
                             "default": "median",
                             "description": "Aggregation across slices: 'median' or 'mean'",
                         },
@@ -3294,6 +3386,17 @@ async def _list_tools() -> list[types.Tool]:
                             "description": "Waveform extraction window after spike (ms)",
                             "default": 2.0,
                         },
+                        "out_namespace": {
+                            "type": "string",
+                            "default": "",
+                            "description": (
+                                "Optional target namespace. When empty, "
+                                "the enriched SpikeData overwrites the "
+                                "input at (namespace, 'spikedata'). Set "
+                                "to a different name to keep the "
+                                "unaugmented SpikeData intact."
+                            ),
+                        },
                     },
                     "required": ["workspace_id", "namespace"],
                 },
@@ -3552,7 +3655,11 @@ async def _list_tools() -> list[types.Tool]:
                 name="pcm_stack_threshold",
                 description=(
                     "Apply a binary threshold to a PairwiseCompMatrixStack. "
-                    "Values become 1 where |v| > threshold, else 0."
+                    "Values become 1 where |v| > threshold, else 0. By "
+                    "default (no out_key) the binary result OVERWRITES the "
+                    "original float-valued stack at (namespace, key); the "
+                    "original float values are unrecoverable. Pass an "
+                    "explicit out_key to preserve the source."
                 ),
                 inputSchema={
                     "type": "object",
@@ -3568,7 +3675,23 @@ async def _list_tools() -> list[types.Tool]:
                         },
                         "out_key": {
                             "type": "string",
-                            "description": "Output key. Defaults to input key.",
+                            "description": (
+                                "Output key. Default (omitted or null) "
+                                "OVERWRITES the source stack with the "
+                                "binary thresholded result, destroying "
+                                "the float values. Pass an explicit value "
+                                "to preserve the source."
+                            ),
+                        },
+                        "preserve_nan": {
+                            "type": "boolean",
+                            "description": (
+                                "When false (default), NaN values become "
+                                "0 in the binary output. When true, NaN "
+                                "propagates so 'missing' stays "
+                                "distinguishable from 'below threshold'."
+                            ),
+                            "default": False,
                         },
                     },
                     "required": ["workspace_id", "namespace", "key", "threshold"],
@@ -4141,25 +4264,124 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
     ]
 
 
-def _sanitize_for_json(obj: Any) -> Any:
-    """Recursively replace NaN / Inf floats with None for RFC-8259 JSON.
+#: Soft cap on the number of elements in a numpy array that the MCP
+#: result sanitiser will inline into the JSON response. Arrays whose
+#: ``.size`` exceeds this raise a :class:`ValueError` from
+#: :func:`_sanitize_for_json` rather than being silently materialised
+#: into a Python list (which can blow up the JSON payload and slow
+#: the protocol layer to a crawl). Adjustable at runtime by writing
+#: to ``spikelab.mcp_server.server.MAX_INLINE_ARRAY_SIZE`` after
+#: import — e.g. for embedded callers that know the protocol can
+#: handle larger payloads, or for tests that want to exercise the
+#: threshold branch with a small cap.
+MAX_INLINE_ARRAY_SIZE = 10_000
 
-    ``json.dumps(..., allow_nan=False)`` rejects non-finite floats — but those
-    floats arise legitimately from many statistical tools on degenerate input
-    (empty arrays, zero-variance signals, all-NaN slices). Replacing them with
-    ``None`` at the serialisation boundary lets clients distinguish "no value"
-    from a parse error.
+MAX_SANITIZE_DEPTH = 64
+
+
+def _sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
+    """Recursively prepare an MCP tool result for ``json.dumps``.
+
+    Four responsibilities:
+
+      1. Replace non-finite floats (``NaN`` / ``Inf``) with ``None``
+         so ``json.dumps(..., allow_nan=False)`` succeeds. These
+         arise legitimately from statistical tools on degenerate
+         input (empty arrays, zero-variance signals, all-NaN
+         slices).
+      2. Coerce numpy scalars (``np.float32`` / ``np.int64`` /
+         ``np.bool_`` / etc.) to native Python types so
+         ``json.dumps`` doesn't reject them with
+         ``TypeError: Object of type np.float32 is not JSON
+         serializable``.
+      3. Inline small numpy arrays as nested Python lists; raise
+         :class:`ValueError` on arrays whose ``.size`` exceeds
+         :data:`MAX_INLINE_ARRAY_SIZE`, pointing the user at the
+         workspace-store-by-reference pattern (an MCP tool that
+         needs to return a large array should write it to the
+         workspace and return ``{"namespace": ..., "key": ...}``).
+      4. Reject pathologically nested inputs whose dict/list/tuple
+         nesting exceeds :data:`MAX_SANITIZE_DEPTH` rather than
+         blowing the Python recursion limit with a ``RecursionError``
+         deep inside the call stack.
+
+    Parameters:
+        obj (Any): The MCP tool return value to sanitize.
+        _depth (int): Internal recursion-depth counter. Callers
+            should not pass this argument.
     """
     import math as _math
+
+    if _depth > MAX_SANITIZE_DEPTH:
+        raise ValueError(
+            f"MCP tool result nesting depth exceeded "
+            f"MAX_SANITIZE_DEPTH={MAX_SANITIZE_DEPTH}. Restructure the "
+            "result to be flatter, or store the deep object in the "
+            "workspace and return a (namespace, key) reference."
+        )
+
+    # Numpy branch first: ``np.float64`` happens to be a ``float``
+    # subclass on modern numpy and would route through the float
+    # branch below correctly, but ``np.float32`` is not — and
+    # ``np.ndarray`` / ``np.int64`` / ``np.bool_`` never were. Catch
+    # all of them up-front via the numpy hierarchy so the float
+    # branch only has to handle Python ``float``.
+    try:
+        import numpy as _np
+
+        if isinstance(obj, _np.ndarray):
+            if obj.size > MAX_INLINE_ARRAY_SIZE:
+                # Degrade gracefully instead of raising. Tools that
+                # store their actual result in the workspace and only
+                # *embed* the array in the response dict (e.g.
+                # fetch_workspace_item for a large slice-stack's
+                # ``times``) would otherwise propagate a ValueError
+                # after the workspace store had already succeeded —
+                # the agent sees an error and does not realise the
+                # result is queryable via fetch_workspace_item. By
+                # returning a summary marker instead, the response
+                # parses successfully and the agent can decide
+                # whether to fetch the array via a follow-up call.
+                return {
+                    "__elided_ndarray__": True,
+                    "reason": (
+                        f"size {obj.size} exceeds inline JSON cap of "
+                        f"{MAX_INLINE_ARRAY_SIZE}"
+                    ),
+                    "shape": list(obj.shape),
+                    "dtype": str(obj.dtype),
+                    "size": int(obj.size),
+                    "hint": (
+                        "Fetch via fetch_workspace_item if a workspace "
+                        "key was returned, or raise "
+                        "spikelab.mcp_server.server.MAX_INLINE_ARRAY_SIZE "
+                        "before invoking the tool."
+                    ),
+                }
+            if obj.ndim == 0:
+                # 0-D array: ``.tolist()`` returns a Python scalar (not
+                # a list), so the list comprehension below would raise
+                # ``TypeError: 'float' object is not iterable``. Route
+                # through the scalar branch instead so NaN/Inf
+                # propagate to None and numpy-scalar types coerce.
+                return _sanitize_for_json(obj.item(), _depth + 1)
+            return [_sanitize_for_json(v, _depth + 1) for v in obj.tolist()]
+        if isinstance(obj, _np.generic):
+            # Numpy scalar — convert to Python equivalent so the float
+            # NaN/Inf branch (or the dict/list/passthrough branches)
+            # below can take over uniformly.
+            return _sanitize_for_json(obj.item(), _depth + 1)
+    except ImportError:
+        pass  # numpy not available — skip numpy-specific handling
 
     if isinstance(obj, float):
         if _math.isnan(obj) or _math.isinf(obj):
             return None
         return obj
     if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+        return {k: _sanitize_for_json(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
+        return [_sanitize_for_json(v, _depth + 1) for v in obj]
     return obj
 
 

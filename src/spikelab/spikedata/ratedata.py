@@ -351,16 +351,24 @@ class RateData:
                 "uniform grid before framing."
             )
 
-        upper = t_end - length + step_size + 1e-9
-        times = [
-            (float(start), float(start) + length)
-            for start in np.arange(t0, upper, step)
-        ]
-        if not times:
+        # The downstream RateSliceStack's recording range is
+        # ``(times[0], times[-1] + step_size)``, so the effective
+        # ``end_time`` for framing is ``t_end + step_size`` (one bin
+        # past the last sample). Count frames explicitly instead of
+        # padding the ``np.arange`` stop with a magic ``+1e-9`` and
+        # hoping the ULPs land favourably — the explicit form is
+        # deterministic and doesn't drift past the strict bounds
+        # check in ``_validate_time_start_to_end``.
+        effective_end = t_end + step_size
+        slot_span = effective_end - length - t0
+        if slot_span < 0:
             raise ValueError(
                 f"Recording length ({t_end - t0 + step_size:.1f} ms) is shorter "
                 f"than frame length ({length} ms)"
             )
+        n_frames = int(np.floor(slot_span / step)) + 1
+        starts = t0 + np.arange(n_frames) * step
+        times = [(float(s), float(s) + length) for s in starts]
         return RateSliceStack(self, times_start_to_end=times)
 
     def get_pairwise_fr_corr(

@@ -552,14 +552,22 @@ class SpikeData:
         if step <= 0:
             raise ValueError("overlap must be less than length")
         end_time = self.start_time + self.length
-        times = [
-            (float(start), float(start) + length)
-            for start in np.arange(self.start_time, end_time - length + 1e-9, step)
-        ]
-        if not times:
+        # Count frames explicitly instead of relying on
+        # ``np.arange(stop=end_time - length + 1e-9, ...)`` and praying
+        # the float-arithmetic ULPs land favourably. The previous form
+        # emitted a window-end one ULP past ``end_time`` for inputs
+        # where ``(end_time - length - start_time) / step`` is very
+        # close to an integer, then the strict ``>`` check inside
+        # ``_validate_time_start_to_end`` rejected the otherwise-valid
+        # frame. ``floor + 1`` makes the frame count deterministic.
+        slot_span = end_time - length - self.start_time
+        if slot_span < 0:
             raise ValueError(
                 f"Recording length ({self.length} ms) is shorter than frame length ({length} ms)"
             )
+        n_frames = int(np.floor(slot_span / step)) + 1
+        starts = self.start_time + np.arange(n_frames) * step
+        times = [(float(s), float(s) + length) for s in starts]
         return SpikeSliceStack(self, times_start_to_end=times)
 
     def align_to_events(

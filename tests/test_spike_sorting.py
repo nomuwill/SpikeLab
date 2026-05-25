@@ -13275,3 +13275,403 @@ class TestResolveInactivityTimeoutSNanDuration:
         rec = self._make_recording(20000, float("nan"))
         result = backend._resolve_inactivity_timeout_s(rec)
         assert result == 900.0
+
+
+# ============================================================================
+# Spike sorting review (2026-05-24) — pin tests for new public API and
+# boundary contracts surfaced by the /complete_review pass.
+# ============================================================================
+
+
+@skip_no_spikeinterface
+class TestLoadMaxwellWithFallback:
+    """``load_maxwell_with_fallback`` was extracted from
+    ``recording_io.load_single_recording`` (commit a83bf26) with the
+    dispatch contract: try MaxwellRecordingExtractor; on
+    ``ValueError`` containing "do not have unique ids" fall back to
+    ``load_maxwell_native``; on any other ValueError, re-raise
+    unchanged.
+    """
+
+    def test_unique_ids_value_error_routes_to_native_loader(self):
+        """
+        Tests:
+            (Test Case 1) A ValueError with "do not have unique ids" in
+                its message triggers the ``load_maxwell_native``
+                fallback.
+            (Test Case 2) The fallback receives ``well_id=stream_id``.
+        """
+        from spikelab.spike_sorting import maxwell_io as mio
+
+        def _raise_unique_ids(*args, **kwargs):
+            raise ValueError("Channels do not have unique ids in mapping.")
+
+        sentinel = MagicMock(name="native_recording")
+        with (
+            patch.object(
+                mio, "load_maxwell_native", return_value=sentinel
+            ) as mock_native,
+            patch(
+                "spikeinterface.extractors.extractor_classes."
+                "MaxwellRecordingExtractor",
+                side_effect=_raise_unique_ids,
+            ),
+        ):
+            result = mio.load_maxwell_with_fallback(
+                "/fake/file.h5", stream_id="well003"
+            )
+
+        assert result is sentinel
+        mock_native.assert_called_once()
+        call_kwargs = mock_native.call_args.kwargs
+        # Fallback resolves to the stream_id when supplied.
+        assert call_kwargs.get("well_id") == "well003"
+
+    def test_unrelated_value_error_propagates_unchanged(self):
+        """
+        Tests:
+            (Test Case 1) A ValueError with an unrelated message
+                ("stream_id 'well007' not found") propagates without
+                being routed to the native loader.
+        """
+        from spikelab.spike_sorting import maxwell_io as mio
+
+        def _raise_unrelated(*args, **kwargs):
+            raise ValueError("stream_id 'well007' not found")
+
+        with (
+            patch.object(mio, "load_maxwell_native") as mock_native,
+            patch(
+                "spikeinterface.extractors.extractor_classes."
+                "MaxwellRecordingExtractor",
+                side_effect=_raise_unrelated,
+            ),
+        ):
+            with pytest.raises(ValueError, match="stream_id"):
+                mio.load_maxwell_with_fallback("/fake/file.h5", stream_id="well007")
+            # Native loader must not be invoked for unrelated errors.
+            mock_native.assert_not_called()
+
+    def test_no_stream_id_resolves_to_well000(self):
+        """
+        Tests:
+            (Test Case 1) When ``stream_id=None`` and the extractor
+                raises the unique-ids error, the fallback defaults to
+                ``well_id="well000"``.
+
+        Notes:
+            - Pins the documented default. A multi-well file without
+              well000 would still attempt this path and surface a
+              clearer error from the native loader.
+        """
+        from spikelab.spike_sorting import maxwell_io as mio
+
+        def _raise_unique_ids(*args, **kwargs):
+            raise ValueError("do not have unique ids")
+
+        with (
+            patch.object(
+                mio, "load_maxwell_native", return_value=MagicMock()
+            ) as mock_native,
+            patch(
+                "spikeinterface.extractors.extractor_classes."
+                "MaxwellRecordingExtractor",
+                side_effect=_raise_unique_ids,
+            ),
+        ):
+            mio.load_maxwell_with_fallback("/fake/file.h5", stream_id=None)
+
+        call_kwargs = mock_native.call_args.kwargs
+        assert call_kwargs.get("well_id") == "well000"
+
+
+@skip_no_spikeinterface
+@pytest.mark.skipif(not _has_pandas, reason="pandas not installed")
+class TestKilosortSortingExtractorClusterIdCoercion:
+    """``KilosortSortingExtractor.__init__`` added an explicit int
+    coercion + try/except at source lines 109-116 (commit fb37ca2).
+    A TSV writing IDs as float (``1.0``) or string-padded (``"001"``)
+    should produce a clear ValueError naming the column dtype.
+    """
+
+    @staticmethod
+    def _make_minimal_phy_dir(tmp_path, cluster_id_values):
+        """Build a minimal Phy/Kilosort output directory using the
+        module-level ``_make_kilosort_folder`` helper."""
+        path = tmp_path / "phy"
+        spike_times = np.arange(8, dtype=np.int64)
+        spike_clusters = np.tile(np.arange(len(cluster_id_values)), 4)[:8].astype(
+            np.int64
+        )
+        tsv_data = {
+            "cluster_id": list(cluster_id_values),
+            "group": ["good"] * len(cluster_id_values),
+        }
+        _write_ks_folder(
+            path,
+            spike_times,
+            spike_clusters,
+            sample_rate=20000.0,
+            tsv_data=tsv_data,
+            write_templates=True,
+        )
+        return path
+
+    def test_non_numeric_cluster_id_raises_with_clear_message(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``cluster_id=["unit_a", "unit_b"]`` (non-numeric
+                strings) raises ValueError mentioning "non-integer".
+
+        Notes:
+            - Pandas' ``astype(int)`` accepts numeric strings like
+              ``"001"`` (parses as 1), so the test uses genuinely
+              non-numeric strings that cannot be coerced.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+
+        path = self._make_minimal_phy_dir(tmp_path, ["unit_a", "unit_b"])
+        with pytest.raises(ValueError, match="non-integer|cluster_id"):
+            KilosortSortingExtractor(folder_path=str(path))
+
+    def test_integer_cluster_id_passes_through(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Integer cluster_id values construct
+                successfully without raising.
+        """
+        from spikelab.spike_sorting.sorting_extractor import KilosortSortingExtractor
+
+        path = self._make_minimal_phy_dir(tmp_path, [0, 1])
+        ext = KilosortSortingExtractor(folder_path=str(path))
+        # cluster_ids round-trip as ints in the extractor's unit list.
+        assert all(isinstance(int(uid), int) for uid in ext.unit_ids)
+
+
+class TestLogInactivityWatchdogInfTimeout:
+    """``LogInactivityWatchdog.__init__`` validates ``inactivity_s``
+    with ``np.isnan(inactivity_s) or inactivity_s <= 0.0`` at source
+    line 374. ``np.inf <= 0.0`` is False and ``np.isnan(np.inf)`` is
+    False, so an Inf inactivity tolerance slips past the guard and the
+    watchdog silently never trips. Pin the BUG (deferred to /developer).
+    """
+
+    def test_inactivity_inf_currently_accepted(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``inactivity_s=np.inf`` is currently accepted
+                (no ValueError raised), pinning the BUG.
+
+        Notes:
+            - When /developer adds an `np.isfinite` check, this test
+              should be updated to assert the new ValueError.
+        """
+        from spikelab.spike_sorting.guards._inactivity import LogInactivityWatchdog
+
+        log_path = tmp_path / "log.txt"
+        log_path.write_text("hello")
+        # BUG: inf silently accepted, the watchdog will never trip on stall.
+        wd = LogInactivityWatchdog(
+            log_path=str(log_path), popen=None, inactivity_s=np.inf, sorter="ks2"
+        )
+        assert wd.inactivity_s == float("inf")
+
+
+class TestSignalReachedBaselineBoundaries:
+    """``_signal_reached_baseline`` vectorised path (commit 0a48e93)
+    has three boundary branches: ``window_samples <= 0`` (returns
+    True), ``start >= n_samples`` (returns False), and short-trace
+    ``below.size < window_samples`` (returns False). The first two
+    are pinned in `test_stim_sorting.py`; pin the short-trace branch
+    plus a few edge contracts the REVIEW.md flagged.
+    """
+
+    def test_short_trace_below_window_returns_false(self):
+        """
+        Tests:
+            (Test Case 1) A trace of length 5 starting at 0 with
+                ``window_samples=10`` returns ``(False, n_samples)``
+                via the size short-circuit.
+        """
+        from spikelab.spike_sorting.stim_sorting.artifact_removal import (
+            _signal_reached_baseline,
+        )
+
+        trace = np.zeros(5)  # all below threshold but too short
+        at_baseline, end_idx = _signal_reached_baseline(
+            trace, start=0, baseline_threshold=1.0, window_samples=10, n_samples=5
+        )
+        assert at_baseline is False
+        assert end_idx == 5
+
+    def test_window_samples_negative_returns_true(self):
+        """
+        Tests:
+            (Test Case 1) ``window_samples=-1`` falls into the
+                ``<= 0`` branch and returns ``(True, start)``.
+
+        Notes:
+            - The new vectorised function differs from the prior loop:
+              the loop returned False for negative window, the new
+              function returns True. Pin the new contract.
+        """
+        from spikelab.spike_sorting.stim_sorting.artifact_removal import (
+            _signal_reached_baseline,
+        )
+
+        trace = np.ones(20)  # above threshold but window_samples<=0
+        at_baseline, end_idx = _signal_reached_baseline(
+            trace, start=3, baseline_threshold=0.5, window_samples=-1, n_samples=20
+        )
+        assert at_baseline is True
+        assert end_idx == 3
+
+    def test_baseline_threshold_zero_never_at_baseline(self):
+        """
+        Tests:
+            (Test Case 1) ``baseline_threshold=0`` makes every finite
+                sample "above threshold" (``np.abs(x) < 0`` is False)
+                so the function returns False regardless of trace
+                content.
+        """
+        from spikelab.spike_sorting.stim_sorting.artifact_removal import (
+            _signal_reached_baseline,
+        )
+
+        trace = np.zeros(20)
+        at_baseline, end_idx = _signal_reached_baseline(
+            trace, start=0, baseline_threshold=0.0, window_samples=5, n_samples=20
+        )
+        assert at_baseline is False
+        assert end_idx == 20
+
+    def test_nan_samples_count_as_above_threshold(self):
+        """
+        Tests:
+            (Test Case 1) A trace with NaN samples interspersed never
+                reaches baseline in the NaN regions (``np.abs(NaN) < t``
+                is False).
+        """
+        from spikelab.spike_sorting.stim_sorting.artifact_removal import (
+            _signal_reached_baseline,
+        )
+
+        trace = np.full(20, np.nan)
+        at_baseline, end_idx = _signal_reached_baseline(
+            trace, start=0, baseline_threshold=1.0, window_samples=3, n_samples=20
+        )
+        assert at_baseline is False
+        assert end_idx == 20
+
+
+class TestBuildReferenceTraceBoundaries:
+    """``_build_reference_trace`` rejects ``ndim != 2`` at source
+    line 51. The existing tests pin 1-D rejection; pin 3-D and the
+    negative-n_reference clamp.
+    """
+
+    def test_3d_input_rejected(self):
+        """
+        Tests:
+            (Test Case 1) A 3-D ``traces`` array raises ValueError
+                mentioning 2-D / shape.
+        """
+        from spikelab.spike_sorting.stim_sorting.recentering import (
+            _build_reference_trace,
+        )
+
+        traces = np.zeros((4, 100, 1))
+        with pytest.raises(ValueError, match="2-D|2D|shape|ndim"):
+            _build_reference_trace(traces, n_reference_channels=2)
+
+    def test_negative_n_reference_channels_clamped_to_one(self):
+        """
+        Tests:
+            (Test Case 1) ``n_reference_channels=-5`` is clamped to 1
+                (via ``max(1, min(int(n), n_channels))``), producing
+                a single-channel reference trace.
+        """
+        from spikelab.spike_sorting.stim_sorting.recentering import (
+            _build_reference_trace,
+        )
+
+        traces = np.random.RandomState(0).randn(4, 50)
+        ref = _build_reference_trace(traces, n_reference_channels=-5)
+        # Reference shape matches the time axis.
+        assert ref.shape == (50,)
+
+
+class TestCompilerEmptyCuratedFinal:
+    """``Compiler.add_recording(include_failed_units=True)`` with an
+    empty ``curation_history["curated_final"]`` list: every unit's
+    ``is_curated`` flag is False but the recording is still queued.
+    Pin the boundary so a regression that rejected the empty-curation
+    case would surface.
+    """
+
+    def test_empty_curated_final_accepted(self):
+        """
+        Tests:
+            (Test Case 1) ``curated_final=[]`` with ``include_failed_units=True``
+                queues the recording without raising.
+        """
+        from spikelab.spike_sorting.pipeline import Compiler
+
+        cfg = SimpleNamespace(
+            figures=SimpleNamespace(create_figures=False),
+            compilation=SimpleNamespace(
+                compile_to_mat=False, compile_to_npz=False, save_electrodes=False
+            ),
+            curation=SimpleNamespace(
+                curate_second=False, spikes_min_second=None, std_norm_max=None
+            ),
+        )
+        compiler = Compiler(cfg)
+        sd = MagicMock(name="sd")
+        compiler.add_recording(
+            "rec1",
+            sd,
+            curation_history={"curated_final": []},
+            include_failed_units=True,
+        )
+        assert len(compiler.recs_cache) == 1
+        # Returned tuple shape: (rec_name, sd, history, include_failed_units).
+        rec_name, recorded_sd, hist, include = compiler.recs_cache[0]
+        assert hist["curated_final"] == []
+        assert include is True
+
+    def test_include_failed_units_without_curation_history_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``include_failed_units=True`` with
+                ``curation_history=None`` raises ValueError mentioning
+                ``curated_final``.
+            (Test Case 2) Same with a dict missing the
+                ``curated_final`` key.
+        """
+        from spikelab.spike_sorting.pipeline import Compiler
+
+        cfg = SimpleNamespace(
+            figures=SimpleNamespace(create_figures=False),
+            compilation=SimpleNamespace(
+                compile_to_mat=False, compile_to_npz=False, save_electrodes=False
+            ),
+            curation=SimpleNamespace(
+                curate_second=False, spikes_min_second=None, std_norm_max=None
+            ),
+        )
+        compiler = Compiler(cfg)
+        sd = MagicMock(name="sd")
+
+        with pytest.raises(ValueError, match="curated_final"):
+            compiler.add_recording(
+                "rec1", sd, curation_history=None, include_failed_units=True
+            )
+
+        with pytest.raises(ValueError, match="curated_final"):
+            compiler.add_recording(
+                "rec1",
+                sd,
+                curation_history={"other_key": []},
+                include_failed_units=True,
+            )

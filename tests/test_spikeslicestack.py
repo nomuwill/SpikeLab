@@ -4564,9 +4564,7 @@ class TestSpikeSliceStackResponsiveUnitsThresholdBoundary:
         """
         # Two slices, baseline = (0, 50ms), full-slice response
         sd = make_spikedata(n_units=3, length_ms=400.0, seed=7)
-        sss = SpikeSliceStack(
-            sd, times_start_to_end=[(0.0, 200.0), (200.0, 400.0)]
-        )
+        sss = SpikeSliceStack(sd, times_start_to_end=[(0.0, 200.0), (200.0, 400.0)])
         mask = sss.responsive_units(
             bin_size=10.0,
             baseline_window_ms=(0.0, 50.0),

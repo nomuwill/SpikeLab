@@ -624,10 +624,25 @@ def _dump_neuron_attributes(grp, neuron_attributes: list) -> None:
         use_string = any(isinstance(v, str) for v in non_none)
 
         if use_array:
+            # Infer dtype from the first non-None array value rather
+            # than always coercing to float64. Two reasons:
+            #   (1) Integer-valued attributes (per-unit channel-index
+            #       arrays, template indices) silently widened to
+            #       float64 on every save/load round-trip.
+            #   (2) NaN can't serve as a missing-entry sentinel for
+            #       integer dtypes, and for float dtypes it collides
+            #       with legitimate NaN inside the stored array (e.g.
+            #       a NaN waveform sample would be indistinguishable
+            #       from "this unit had no value for this attribute"
+            #       on reload).
+            # We store missing units in a ``__missing_unit_indices__``
+            # HDF5 attribute on the dataset, so the dtype-preserving
+            # buffer's fill value never has to encode missingness.
             sample = np.asarray(
                 next(v for v in non_none if isinstance(v, (np.ndarray, list, tuple)))
             )
             arr_shape = sample.shape
+            arr_dtype = sample.dtype
             for v in non_none:
                 if isinstance(v, (np.ndarray, list, tuple)):
                     v_shape = np.asarray(v).shape
@@ -638,11 +653,28 @@ def _dump_neuron_attributes(grp, neuron_attributes: list) -> None:
                             f"All units must have the same array shape for "
                             f"a given attribute."
                         )
-            stacked = np.full((N, *arr_shape), np.nan, dtype=np.float64)
+            if np.issubdtype(arr_dtype, np.floating):
+                fill: Any = np.nan
+            elif np.issubdtype(arr_dtype, np.bool_):
+                fill = False
+            else:
+                # integer, complex, etc. — fill with 0 cast to the
+                # target dtype. The ``__missing_unit_indices__`` attr
+                # is authoritative, so the actual fill value is only
+                # cosmetic.
+                fill = 0
+            stacked = np.full((N, *arr_shape), fill, dtype=arr_dtype)
+            missing_indices = []
             for i, v in enumerate(values):
-                if v is not None:
-                    stacked[i] = np.asarray(v, dtype=np.float64)
-            na_grp.create_dataset(attr_key, data=stacked)
+                if v is None:
+                    missing_indices.append(i)
+                else:
+                    stacked[i] = np.asarray(v, dtype=arr_dtype)
+            ds = na_grp.create_dataset(attr_key, data=stacked)
+            if missing_indices:
+                ds.attrs["__missing_unit_indices__"] = np.asarray(
+                    missing_indices, dtype=np.int64
+                )
         elif use_string:
             str_values = [str(v) if v is not None else "" for v in values]
             dt = h5py.string_dtype()
@@ -670,10 +702,26 @@ def _dump_neuron_attributes(grp, neuron_attributes: list) -> None:
                     UserWarning,
                     stacklevel=2,
                 )
+            # Infer the scalar Python kind from the first non-None
+            # value so the load path can restore the original type.
+            # Previously every scalar attribute round-tripped as
+            # Python ``float``, silently changing the type of
+            # integer-valued attributes like ``electrode = 47`` to
+            # ``47.0`` — downstream ``isinstance(v, int)`` checks
+            # would then break.
+            sample_scalar = non_none[0]
+            if isinstance(sample_scalar, (bool, np.bool_)):
+                scalar_kind = "bool"
+            elif isinstance(sample_scalar, (int, np.integer)):
+                scalar_kind = "int"
+            else:
+                scalar_kind = "float"
             float_values = [float(v) if v is not None else np.nan for v in values]
-            na_grp.create_dataset(
+            ds = na_grp.create_dataset(
                 attr_key, data=np.array(float_values, dtype=np.float64)
             )
+            if scalar_kind != "float":
+                ds.attrs["__scalar_kind__"] = scalar_kind
 
 
 def _load_neuron_attributes(grp) -> Optional[list]:
@@ -698,7 +746,8 @@ def _load_neuron_attributes(grp) -> Optional[list]:
     result = [{} for _ in range(N)]
 
     for attr_key in na_grp.keys():
-        raw = na_grp[attr_key][:]
+        ds = na_grp[attr_key]
+        raw = ds[:]
         if raw.dtype.kind in ("S", "O"):
             for i, v in enumerate(raw):
                 decoded = v.decode("utf-8") if isinstance(v, bytes) else str(v)
@@ -706,17 +755,47 @@ def _load_neuron_attributes(grp) -> Optional[list]:
                     result[i][attr_key] = decoded
         elif raw.ndim > 1:
             # Array-valued attribute: each row is one unit's array.
-            # All-NaN rows are sentinels for missing entries.
-            for i in range(len(raw)):
-                row = raw[i]
-                if np.all(np.isnan(row)):
-                    continue
-                result[i][attr_key] = row.copy()
+            # Modern format records missing entries in the
+            # ``__missing_unit_indices__`` HDF5 attr (preserves dtype
+            # and disambiguates from legitimate NaN inside the data).
+            # Legacy format (pre-dtype-preservation) used all-NaN rows
+            # as the missing sentinel.
+            missing_attr = ds.attrs.get("__missing_unit_indices__")
+            if missing_attr is not None:
+                missing_set = {int(i) for i in np.asarray(missing_attr).ravel()}
+                for i in range(len(raw)):
+                    if i in missing_set:
+                        continue
+                    result[i][attr_key] = raw[i].copy()
+            else:
+                # Legacy fallback: all-NaN row marks a missing entry.
+                # Only meaningful for float dtypes — integer/bool
+                # arrays never used this path (those were silently
+                # widened to float64 by the old writer, so they will
+                # still load as float64 from legacy files).
+                for i in range(len(raw)):
+                    row = raw[i]
+                    if np.issubdtype(row.dtype, np.floating) and np.all(np.isnan(row)):
+                        continue
+                    result[i][attr_key] = row.copy()
         else:
+            # Scalar attribute. Modern format records the original
+            # Python kind in ``__scalar_kind__`` ("int" or "bool")
+            # so integer-valued attributes like ``electrode = 47``
+            # don't silently round-trip as ``47.0``. Legacy files
+            # without the attr load as float, matching the
+            # pre-2026-05 contract.
+            scalar_kind = ds.attrs.get("__scalar_kind__")
+            if scalar_kind is not None and isinstance(scalar_kind, bytes):
+                scalar_kind = scalar_kind.decode("utf-8")
             for i, v in enumerate(raw.tolist()):
                 # Skip NaN sentinels used for missing float values
                 if isinstance(v, float) and np.isnan(v):
                     continue
+                if scalar_kind == "int":
+                    v = int(v)
+                elif scalar_kind == "bool":
+                    v = bool(v)
                 result[i][attr_key] = v
 
     if all(len(d) == 0 for d in result):

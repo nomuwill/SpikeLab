@@ -9925,9 +9925,7 @@ class TestSpikeDataCompareSorterBoundaries:
         template = np.asarray(template, dtype=float)
         return {
             "template": template,
-            "neighbor_templates": np.vstack(
-                [np.zeros_like(template), 0.5 * template]
-            ),
+            "neighbor_templates": np.vstack([np.zeros_like(template), 0.5 * template]),
             "channel": int(channel),
             "neighbor_channels": np.array([channel, neighbor_channel], dtype=int),
         }

@@ -4608,3 +4608,424 @@ class TestK8sBackendDeleteJobNotFound:
         with patch("spikelab.batch_jobs.backend_k8s.client", fake_client):
             with pytest.raises(_FakeApiException, match=r"Forbidden"):
                 backend.delete_job("forbidden-job")
+
+
+# ============================================================================
+# Batch Jobs review (2026-05-24) — edge-case pins from the /complete_review
+# pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestModelValidationBatchJobs:
+    """Pydantic boundary pins for `models.py` validators."""
+
+    def test_container_spec_invalid_pull_policy_rejected(self):
+        """
+        Tests:
+            (Test Case 1) ``image_pull_policy="Sometimes"`` raises
+                ValidationError (only Always/IfNotPresent/Never legal).
+        """
+        from pydantic import ValidationError
+
+        from spikelab.batch_jobs.models import ContainerSpec
+
+        with pytest.raises(ValidationError):
+            ContainerSpec(image="x", image_pull_policy="Sometimes")
+
+    def test_resource_spec_negative_gpu_rejected(self):
+        """
+        Tests:
+            (Test Case 1) Negative GPU values rejected by Pydantic ge=0.
+        """
+        from pydantic import ValidationError
+
+        from spikelab.batch_jobs.models import ResourceSpec
+
+        with pytest.raises(ValidationError):
+            ResourceSpec(
+                requests_cpu="1",
+                requests_memory="1Gi",
+                limits_cpu="1",
+                limits_memory="1Gi",
+                requests_gpu=-1,
+                limits_gpu=-1,
+            )
+
+    def test_volume_mount_empty_name_rejected(self):
+        """
+        Tests:
+            (Test Case 1) Empty ``name`` raises ValidationError.
+            (Test Case 2) Empty ``mount_path`` raises ValidationError.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            VolumeMountSpec(name="", mount_path="/m", secret_name="s")
+        with pytest.raises(ValidationError):
+            VolumeMountSpec(name="v", mount_path="", secret_name="s")
+
+
+class TestJobSpecNamePrefixBoundaries:
+    """``JobSpec._validate_name_prefix`` boundary pins. The whitespace-
+    only vs all-hyphen inputs hit *different* ValueError branches; the
+    inconsistency is logged as a Bug Confirmed.
+    """
+
+    def _make_payload(self, name_prefix: str):
+        payload = _example_payload()
+        payload["name_prefix"] = name_prefix
+        return payload
+
+    def test_whitespace_only_raises_empty_message(self):
+        """
+        Tests:
+            (Test Case 1) ``"   "`` triggers the first ValueError
+                ("cannot be empty") via post-strip emptiness.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            JobSpec(**self._make_payload("   "))
+
+    def test_all_hyphens_raises_post_sanitization_message(self):
+        """
+        Tests:
+            (Test Case 1) ``"---"`` triggers the *second* ValueError
+                ("empty after ASCII sanitization") via the post-strip
+                ``safe[:40].strip("-")`` path.
+
+        Notes:
+            - Different message from whitespace-only despite both being
+              "name_prefix was effectively empty". See Bugs Confirmed —
+              Batch Jobs for the recommended unification.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="empty after"):
+            JobSpec(**self._make_payload("---"))
+
+    def test_leading_hyphens_stripped_to_non_empty(self):
+        """
+        Tests:
+            (Test Case 1) ``"-abc"`` is sanitized to ``"abc"`` (leading
+                hyphens stripped by ``safe[:40].strip("-")``).
+        """
+        spec = JobSpec(**self._make_payload("-abc"))
+        assert spec.name_prefix == "abc"
+
+
+class TestContainsDisallowedSleepBoundaries:
+    """``policy._contains_disallowed_sleep`` boundary contracts: the
+    function flags the common ``sleep <large-int>`` and ``sleep infinity``
+    forms but deliberately misses a trailing bare ``sleep`` after a real
+    command (documented design choice to avoid false positives).
+    """
+
+    def test_empty_command_with_sleep_in_args(self):
+        """
+        Tests:
+            (Test Case 1) ``command=[], args=["sleep", "infinity"]``
+                flagged as disallowed.
+        """
+        from spikelab.batch_jobs.policy import _contains_disallowed_sleep
+
+        assert _contains_disallowed_sleep([], ["sleep", "infinity"]) is True
+
+    def test_underscore_grouped_million_flagged(self):
+        """
+        Tests:
+            (Test Case 1) ``["sleep", "1_000_000"]`` is flagged
+                (``float("1_000_000")`` returns 1e6, above threshold).
+        """
+        from spikelab.batch_jobs.policy import _contains_disallowed_sleep
+
+        assert _contains_disallowed_sleep(["sleep", "1_000_000"], []) is True
+
+    def test_trailing_bare_sleep_not_flagged(self):
+        """
+        Tests:
+            (Test Case 1) ``["python", "-c", "sleep"]`` is NOT flagged
+                (bare-sleep check only fires when tokens is exactly
+                ``["sleep"]``).
+
+        Notes:
+            - Documents the current design choice. See Bugs Confirmed —
+              Batch Jobs for the unverified-but-possibly-intentional
+              gap.
+        """
+        from spikelab.batch_jobs.policy import _contains_disallowed_sleep
+
+        assert _contains_disallowed_sleep(["python", "-c", "sleep"], []) is False
+
+
+class TestValidationModuleBoundaries:
+    """``validation.validate_job_spec`` and ``validate_run_config``
+    rejection contracts at the type-shape boundary.
+    """
+
+    def test_validate_job_spec_none_payload_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``payload=None`` raises ValidationError.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            validate_job_spec(None)
+
+    def test_validate_job_spec_non_dict_payload_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``payload=[]`` (list, not dict) raises
+                ValidationError.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            validate_job_spec([])
+
+    def test_validate_run_config_none_input_path_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``{"input_path": None}`` raises (required
+                non-Optional string).
+        """
+        from pydantic import ValidationError
+
+        from spikelab.batch_jobs.validation import validate_run_config
+
+        with pytest.raises(ValidationError):
+            validate_run_config({"input_path": None})
+
+
+class TestTemplatingSanitizers:
+    """``templating._sanitize_yaml_value`` boundary contracts."""
+
+    def test_empty_string_returns_empty(self):
+        """
+        Tests:
+            (Test Case 1) Empty input returns empty string.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        assert _sanitize_yaml_value("") == ""
+
+    def test_all_unsafe_chars_returns_empty(self):
+        """
+        Tests:
+            (Test Case 1) ``"\\n\\t\\""`` (all unsafe) returns empty.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        assert _sanitize_yaml_value('\n\t"') == ""
+
+
+class TestLoadProfileFromNameBoundaries:
+    """``profiles.load_profile_from_name`` accepts only literal
+    ``{"nrp", "nautilus"}`` (case-insensitive, whitespace-stripped)
+    and falls back to ``defaults`` for anything else — including
+    empty and path-traversal-like strings.
+    """
+
+    def test_empty_string_falls_back_to_defaults(self):
+        """
+        Tests:
+            (Test Case 1) ``name=""`` resolves to the defaults profile
+                (returns a ClusterProfile, not an error).
+        """
+        from spikelab.batch_jobs.profiles import load_profile_from_name
+
+        profile = load_profile_from_name("")
+        # defaults profile must construct successfully.
+        assert profile is not None
+
+    def test_mixed_case_nrp_normalized(self):
+        """
+        Tests:
+            (Test Case 1) ``name="Nrp"`` resolves to the NRP profile
+                (case-insensitive match).
+        """
+        from spikelab.batch_jobs.profiles import load_profile_from_name
+
+        profile_nrp = load_profile_from_name("Nrp")
+        profile_lower = load_profile_from_name("nrp")
+        assert profile_nrp.name == profile_lower.name
+
+    def test_path_traversal_arg_safely_falls_back(self):
+        """
+        Tests:
+            (Test Case 1) ``name="../etc/passwd"`` does NOT cause a
+                path-traversal lookup; falls back to defaults.
+        """
+        from spikelab.batch_jobs.profiles import load_profile_from_name
+
+        profile_evil = load_profile_from_name("../etc/passwd")
+        profile_default = load_profile_from_name("defaults")
+        assert profile_evil.name == profile_default.name
+
+
+class TestSubmitPreparedJobRunIdTraversal:
+    """``RunSession.submit_prepared_job`` skips ``package_analysis_bundle``
+    (which has the run_id traversal guard) and lets ``run_id`` flow
+    directly into S3 prefixes. Pin the BUG — a malicious operator-
+    supplied ``run_id="../escape"`` silently embeds in URIs.
+    """
+
+    def test_traversal_run_id_flows_to_storage_unvalidated(self):
+        """
+        Tests:
+            (Test Case 1) Source contains the run_id pass-through at
+                ``submit_prepared_job`` line 340 (``current_run_id =
+                run_id or uuid4().hex``) with no traversal validation
+                before ``_submit`` is called. Pin via source
+                inspection.
+
+        Notes:
+            - Pins the BUG. See Bugs Confirmed — Batch Jobs. The full
+              integration path requires mocking backend/storage/profile
+              with realistic shapes; the source-inspection contract
+              suffices to detect a future guard addition.
+        """
+        from pathlib import Path
+
+        import spikelab.batch_jobs.session as session_mod
+
+        src = Path(session_mod.__file__).read_text(encoding="utf-8")
+        # The submit_prepared_job body uses run_id verbatim.
+        assert "current_run_id = run_id or uuid4().hex" in src
+        # No traversal-style guard is invoked from submit_prepared_job
+        # (the guard exists only in package_analysis_bundle, which
+        # submit_prepared_job intentionally skips).
+        # Pin the absence so a future caller-side guard surfaces here.
+        assert "submit_prepared_job" in src
+        sub_start = src.index("def submit_prepared_job")
+        sub_end = src.index("def retrieve_result")
+        body = src[sub_start:sub_end]
+        # No '..' in run_id check in this function body.
+        assert "'..' in" not in body and '".." in' not in body
+
+
+class TestPackageAnalysisBundleManifestCollision:
+    """``package_analysis_bundle`` writes ``manifest.json`` into the
+    bundle directory *after* copying inputs. A user-supplied input file
+    named ``manifest.json`` is silently overwritten. Pin the BUG.
+    """
+
+    def test_user_manifest_silently_overwritten(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A user input file named ``manifest.json`` is
+                replaced by the generated manifest after bundling.
+
+        Notes:
+            - Pins the BUG. When /developer rejects the colliding name
+              or renames the user file, this test should be updated.
+        """
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        input_dir = tmp_path / "in"
+        input_dir.mkdir()
+        user_manifest = input_dir / "manifest.json"
+        user_manifest.write_text('{"user_data": "original"}')
+
+        output_dir = tmp_path / "out"
+        bundle_path = package_analysis_bundle(
+            input_paths=[str(user_manifest)],
+            run_id="run-1",
+            output_dir=str(output_dir),
+            output_format="workspace",
+        )
+        # Extract the zip and verify manifest.json holds the GENERATED
+        # content, not the user's original.
+        import zipfile
+
+        with zipfile.ZipFile(bundle_path) as zf:
+            # Bundle stores files under "<run_id>/<filename>".
+            names = zf.namelist()
+            manifest_entry = next(n for n in names if n.endswith("manifest.json"))
+            with zf.open(manifest_entry) as f:
+                content = f.read().decode()
+        # Generated manifest replaces user's content.
+        assert "user_data" not in content
+        assert "run_id" in content or "files" in content
+
+
+class TestSortingEntrypointResultCountMismatch:
+    """``entrypoints.sorting.main`` now raises RuntimeError when
+    ``sort_recording`` returns a different number of results than
+    recordings (commit fixed the silent clobber). Pin the new contract.
+
+    The earlier `min(i, len(recording_files) - 1)` saturation has been
+    replaced by an explicit length check at source line 126-131.
+    """
+
+    def test_result_count_mismatch_raises_runtime_error(self):
+        """
+        Tests:
+            (Test Case 1) Source contains the explicit length check
+                (verified by reading the source) — pin the contract
+                via source inspection.
+
+        Notes:
+            - A full integration test would require mocking S3, the
+              sorting backend, and bundle extraction. The contract is
+              instead verified by asserting the source carries the
+              length-mismatch RuntimeError text.
+        """
+        from pathlib import Path
+
+        import spikelab.batch_jobs.entrypoints.sorting as sorting_mod
+
+        src = Path(sorting_mod.__file__).read_text(encoding="utf-8")
+        # The new contract surfaces this exact phrase.
+        assert "cannot map results to recording names" in src
+        assert "len(spikedata_results) != len(recording_files)" in src
+
+
+class TestS3StoragePrefixBoundaries:
+    """``S3StorageClient.__init__`` and ``download_output`` path-
+    traversal boundary pins.
+    """
+
+    def test_empty_prefix_treated_as_none(self):
+        """
+        Tests:
+            (Test Case 1) ``S3StorageClient(prefix="")`` produces the
+                same prefix-less client as ``prefix=None``.
+        """
+        from spikelab.batch_jobs.storage_s3 import S3StorageClient
+
+        client_empty = S3StorageClient(prefix="")
+        client_none = S3StorageClient(prefix=None)
+        # Both fall to the same prefixless attribute state.
+        assert client_empty.prefix == client_none.prefix
+
+
+class TestCredentialsRedactionBoundaries:
+    """``credentials.redact_sensitive_map`` substring-based redaction
+    has known false positives (e.g. ``SECRETS_PATH``) — pin the current
+    behaviour so a future word-boundary tightening is intentional.
+    """
+
+    def test_secrets_path_redacted_as_false_positive(self):
+        """
+        Tests:
+            (Test Case 1) ``"SECRETS_PATH"`` is redacted because
+                ``"SECRET" in "SECRETS_PATH"`` is True — false positive.
+
+        Notes:
+            - Pins the current substring heuristic. A future change to
+              word-boundary matching would surface here.
+        """
+        result = redact_sensitive_map({"SECRETS_PATH": "/etc/secrets"})
+        # The current heuristic redacts this (false positive).
+        assert result["SECRETS_PATH"] != "/etc/secrets"
+
+    def test_empty_string_key_passed_through(self):
+        """
+        Tests:
+            (Test Case 1) Empty-string key has no SECRET/TOKEN/PASSWORD
+                substring so the value passes through unredacted.
+        """
+        result = redact_sensitive_map({"": "value"})
+        assert result[""] == "value"

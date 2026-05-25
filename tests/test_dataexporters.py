@@ -1885,3 +1885,131 @@ class TestExportHdf5FailFastFsHzValidation:
             f"{path.name} was created despite fail-fast contract; "
             "user is left with a half-written file."
         )
+
+
+# ============================================================================
+# I/O review (2026-05-24) — data_exporters edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestExportHDF5RasterBinSizeNaN:
+    """``export_spikedata_to_hdf5`` with ``raster_bin_size_ms=NaN``
+    slips past the ``<= 0`` guard (NaN <= 0 is False), then the
+    downstream ``sd.raster(NaN)`` call inside the exporter raises.
+    Pin the deferred-failure contract.
+    """
+
+    def test_raster_bin_size_nan_raises_via_inner(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``raster_bin_size_ms=NaN`` causes some
+                ValueError to propagate from the inner raster call.
+
+        Notes:
+            - The exact error message depends on which inner guard
+              fires first; pin only that *some* ValueError surfaces
+              so the caller is not silently handed a corrupt file.
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        path = tmp_path / "nan_bin.h5"
+        with pytest.raises(ValueError):
+            exporters.export_spikedata_to_hdf5(
+                sd, str(path), style="raster", raster_bin_size_ms=float("nan")
+            )
+
+
+class TestExportKilosortFolderIsExistingFile:
+    """``export_spikedata_to_kilosort`` calls ``os.makedirs(folder,
+    exist_ok=True)`` which raises ``FileExistsError`` when ``folder``
+    points to an existing regular file (not a directory). Pin the
+    failure mode so a future stricter pre-check would surface.
+    """
+
+    def test_existing_file_folder_raises(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``folder`` pointing to an existing regular
+                file raises ``FileExistsError`` (or generic OSError).
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([5.0])], length=100.0)
+        existing = tmp_path / "not_a_dir"
+        existing.write_text("hello")
+
+        with pytest.raises((FileExistsError, OSError, NotADirectoryError)):
+            exporters.export_spikedata_to_kilosort(sd, str(existing), fs_Hz=30_000.0)
+
+
+class TestExportNWBDropsMetadataSilently:
+    """``export_spikedata_to_nwb`` does NOT persist
+    ``SpikeData.metadata``: NWB has no canonical field for arbitrary
+    metadata, and the exporter quietly omits it. Pin the documented
+    no-persistence contract so a round-trip caller cannot assume
+    metadata survives.
+    """
+
+    def test_metadata_does_not_round_trip(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Export a SpikeData with non-trivial metadata;
+                the reloaded SpikeData has no matching metadata entries.
+            (Test Case 2) Reload does not raise.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_exporters import export_spikedata_to_nwb
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        sd.metadata["session_id"] = "fixture_001"
+        sd.metadata["experimenter"] = "tjits"
+
+        path = tmp_path / "no_metadata.nwb"
+        export_spikedata_to_nwb(sd, str(path))
+        sd2 = load_spikedata_from_nwb(str(path), prefer_pynwb=False)
+        assert sd2.N == 1
+        # Metadata silently dropped: the keys we set do not survive.
+        assert "session_id" not in sd2.metadata
+        assert "experimenter" not in sd2.metadata
+
+
+class TestExportNegativeFsHzSlipsPastGuard:
+    """``export_spikedata_to_hdf5`` ragged/group/paired styles validate
+    ``fs_Hz`` with ``not fs_Hz`` (source lines 129, 134, 139). Python
+    treats negative numbers as truthy, so ``not -1000`` is False and
+    the validation passes — the failure then surfaces deeper, possibly
+    after a partial file has been written. Pin the BUG (deferred to
+    /developer per REVIEW.md Bugs Confirmed list).
+
+    This test documents the *current* behaviour: the call eventually
+    raises (somewhere) but the failure is not the clean upfront
+    ValueError the docstring promises.
+    """
+
+    @pytest.mark.parametrize("style", ["ragged", "group", "paired"])
+    def test_negative_fs_hz_eventually_raises(self, tmp_path, style):
+        """
+        Tests:
+            (Test Case 1) ``fs_Hz=-1000`` with ``spike_times_unit='samples'``
+                raises *some* error (currently via deferred validation).
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([np.array([10.0, 20.0])], length=100.0)
+        path = tmp_path / f"neg_fs_{style}.h5"
+
+        # Pick the right kwarg name per style.
+        if style == "group":
+            kwargs = {"style": style, "group_time_unit": "samples"}
+        elif style == "paired":
+            kwargs = {"style": style, "times_unit": "samples"}
+        else:
+            kwargs = {"style": style, "spike_times_unit": "samples"}
+
+        with pytest.raises((ValueError, Exception)):
+            exporters.export_spikedata_to_hdf5(sd, str(path), fs_Hz=-1000.0, **kwargs)

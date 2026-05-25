@@ -2738,6 +2738,4 @@ class TestRateSliceStackUnitToUnitCorrelationBoundaries:
         )
         assert corr_stack.stack.shape == (2, 2, 2)
         # Lag stack must be all-zero when max_lag is treated as 0.
-        np.testing.assert_array_equal(
-            lag_stack.stack, np.zeros_like(lag_stack.stack)
-        )
+        np.testing.assert_array_equal(lag_stack.stack, np.zeros_like(lag_stack.stack))

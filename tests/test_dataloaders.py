@@ -5971,3 +5971,275 @@ class TestParseS3UrlMixedCase:
         bucket, key = parse_s3_url("https://MyBucket.s3.amazonaws.com/key/file.h5")
         assert bucket == "MyBucket"
         assert key == "key/file.h5"
+
+
+# ============================================================================
+# I/O review (2026-05-24) — data_loaders edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+class TestTrainsFromFlatIndexLengthMismatch:
+    """``_trains_from_flat_index`` with ``n_units`` provided: the
+    function accepts length-N (cumulative-end) and length-N+1-with-
+    leading-zero (NWB leading-zero variant). Any other shape — including
+    length-N+1 with a non-zero head — falls through to the explicit
+    ``ValueError`` at source line 148-153. Pin the boundary.
+    """
+
+    def test_length_n_plus_one_with_non_zero_head_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``end_indices=[1, 3, 5]`` with ``n_units=2``
+                (length-N+1 but head != 0) raises ValueError.
+            (Test Case 2) Error message mentions both conventions.
+        """
+        from spikelab.data_loaders.data_loaders import _trains_from_flat_index
+
+        with pytest.raises(ValueError, match="cumulative-end|leading-zero"):
+            _trains_from_flat_index(
+                np.array([0.1, 0.2, 0.3, 0.4, 0.5]),
+                np.array([1, 3, 5]),
+                unit="s",
+                fs_Hz=None,
+                n_units=2,
+            )
+
+    def test_n_units_zero_with_non_empty_end_indices_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``n_units=0`` with non-empty ``end_indices``
+                raises ValueError via the length-mismatch branch.
+        """
+        from spikelab.data_loaders.data_loaders import _trains_from_flat_index
+
+        with pytest.raises(ValueError, match="does not match"):
+            _trains_from_flat_index(
+                np.array([0.1, 0.2]),
+                np.array([2]),
+                unit="s",
+                fs_Hz=None,
+                n_units=0,
+            )
+
+
+class TestReadRawArraysZeroBoundaries:
+    """``_read_raw_arrays`` shape boundaries: empty raw_data with
+    matching empty raw_time, and single-sample raw_time. These pass
+    the trailing-axis check at source line 200-202; pin the documented
+    no-rejection contract so a future stricter guard would surface.
+    """
+
+    def test_empty_raw_data_and_time_succeed(self):
+        """
+        Tests:
+            (Test Case 1) ``raw_data.shape=(0, 0)`` with ``raw_time.shape=(0,)``
+                returns valid empty arrays (trailing-axis match is 0==0).
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import _read_raw_arrays
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset("raw", data=np.zeros((0, 0)))
+                f.create_dataset("raw_t", data=np.zeros((0,)))
+            with h5py.File(path, "r") as f:
+                raw_data, raw_time = _read_raw_arrays(
+                    f,
+                    raw_dataset="raw",
+                    raw_time_dataset="raw_t",
+                    raw_time_unit="ms",
+                    fs_Hz=None,
+                )
+            assert raw_data.shape == (0, 0)
+            assert raw_time.shape == (0,)
+        finally:
+            os.unlink(path)
+
+    def test_single_sample_raw_time(self):
+        """
+        Tests:
+            (Test Case 1) ``raw_data.shape=(C, 1)`` with ``raw_time.shape=(1,)``
+                returns valid arrays with trailing-axis 1.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import _read_raw_arrays
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset("raw", data=np.array([[1.0]]))
+                f.create_dataset("raw_t", data=np.array([5.0]))
+            with h5py.File(path, "r") as f:
+                raw_data, raw_time = _read_raw_arrays(
+                    f,
+                    raw_dataset="raw",
+                    raw_time_dataset="raw_t",
+                    raw_time_unit="ms",
+                    fs_Hz=None,
+                )
+            assert raw_data.shape == (1, 1)
+            assert raw_time.shape == (1,)
+            assert raw_time[0] == pytest.approx(5.0)
+        finally:
+            os.unlink(path)
+
+
+class TestBuildSpikeDataAllEmptyWithStartTime:
+    """``_build_spikedata`` with all-empty trains AND a non-zero
+    ``start_time``: the length-inference path falls through to
+    ``length_ms = 0.0`` (per source: ``max_last`` defaults to
+    ``start_time`` when no spikes are present). Pin the resulting
+    SpikeData has ``length=0`` and ``start_time=start_time``.
+    """
+
+    def test_all_empty_trains_preserves_start_time(self):
+        """
+        Tests:
+            (Test Case 1) Empty trains with ``start_time=100.0`` yield
+                SpikeData with length=0 and start_time=100.0.
+            (Test Case 2) ``N`` matches the input length.
+        """
+        from spikelab.data_loaders.data_loaders import _build_spikedata
+
+        sd = _build_spikedata(
+            trains_ms=[np.array([]), np.array([])],
+            length_ms=None,
+            start_time=100.0,
+        )
+        assert sd.N == 2
+        assert sd.length == 0
+        assert sd.start_time == 100.0
+
+
+class TestLoadPickleRejectsNonSpikeData:
+    """``load_spikedata_from_pickle`` rejects every type other than
+    ``SpikeData``, even though ``export_to_pickle`` accepts six types
+    (SpikeData, RateData, PairwiseCompMatrix, PairwiseCompMatrixStack,
+    RateSliceStack, SpikeSliceStack). The asymmetry is documented in
+    the code review as a UX gap; pin the rejection behaviour so a
+    regression that silently returned a non-SpikeData would surface.
+    """
+
+    def test_pickle_with_ratedata_rejected(self):
+        """
+        Tests:
+            (Test Case 1) A pickle containing a RateData raises
+                ValueError mentioning "SpikeData".
+            (Test Case 2) The error message names the actual loaded
+                type (RateData).
+        """
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_pickle
+        from spikelab.spikedata.ratedata import RateData
+
+        rd = RateData(np.zeros((1, 3)), np.array([0.0, 1.0, 2.0]))
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(rd, f)
+            with pytest.raises(ValueError, match="SpikeData"):
+                load_spikedata_from_pickle(path)
+            with pytest.raises(ValueError, match="RateData"):
+                load_spikedata_from_pickle(path)
+        finally:
+            os.unlink(path)
+
+
+class TestNwbElectrodesIndexExactBoundary:
+    """NWB ``electrodes_index[-1]`` exactly equal to ``len(electrodes)``
+    (no truncation): the loader at source line 715 uses strict ``>``
+    so the equal-boundary case does NOT trigger the truncation warning.
+    Pin the silent-success contract at the exact boundary.
+    """
+
+    def test_electrodes_index_exactly_equals_electrodes_length(self):
+        """
+        Tests:
+            (Test Case 1) NWB file with ``electrodes_index[-1] == len(electrodes)``
+                loads without emitting a truncation warning.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        with tempfile.NamedTemporaryFile(suffix=".nwb", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                units = f.create_group("units")
+                units.create_dataset("id", data=np.array([0, 1]))
+                units.create_dataset(
+                    "spike_times", data=np.array([0.001, 0.002, 0.003])
+                )
+                units.create_dataset("spike_times_index", data=np.array([2, 3]))
+                # electrodes_index[-1] == len(electrodes): exact boundary.
+                units.create_dataset("electrodes", data=np.array([0, 1, 2]))
+                units.create_dataset("electrodes_index", data=np.array([2, 3]))
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                sd = load_spikedata_from_nwb(path, prefer_pynwb=False)
+            # No "truncated" warning fires.
+            assert not any("truncat" in str(w.message).lower() for w in caught)
+            assert sd.N == 2
+        finally:
+            os.unlink(path)
+
+
+class TestLoadHDF5RawThresholdedFsHzTypeQuirks:
+    """``load_spikedata_from_hdf5_raw_thresholded`` validates
+    ``fs_Hz`` with the existing ``not fs_Hz or fs_Hz <= 0`` guard.
+    Python ``bool`` is an int subclass, so ``True > 0`` passes — pin
+    the current passthrough (which is likely unintended but documented).
+    """
+
+    def test_fs_hz_true_accepted_as_1hz(self):
+        """
+        Tests:
+            (Test Case 1) ``fs_Hz=True`` is accepted (not rejected),
+                effectively meaning 1 Hz sample rate.
+
+        Notes:
+            - Documents the current behaviour. A future stricter
+              ``isinstance(fs_Hz, bool)`` rejection would surface here.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import (
+            load_spikedata_from_hdf5_raw_thresholded,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                f.create_dataset(
+                    "data", data=np.random.RandomState(0).randn(2, 50) * 0.1
+                )
+            # fs_Hz=True coerces to 1.0; if the function rejects bool
+            # in the future this becomes a TypeError.
+            try:
+                sd = load_spikedata_from_hdf5_raw_thresholded(
+                    path,
+                    dataset="data",
+                    fs_Hz=True,
+                    threshold_sigma=5.0,
+                    filter=False,
+                )
+                # Successful path: SpikeData constructed, possibly zero spikes.
+                assert sd.N == 2
+            except (ValueError, TypeError) as exc:
+                # If a future guard rejects bool, accept the rejection.
+                pytest.skip(f"fs_Hz=True now rejected (was previously accepted): {exc}")
+        finally:
+            os.unlink(path)

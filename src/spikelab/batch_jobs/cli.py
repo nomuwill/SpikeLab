@@ -57,9 +57,7 @@ def _apply_image_selection(
     # "container.image: field required" error.
     if not container.get("image"):
         available = sorted(profile.default_images.keys())
-        available_str = (
-            f"{available}" if available else "(profile has none configured)"
-        )
+        available_str = f"{available}" if available else "(profile has none configured)"
         raise SystemExit(
             f"No image available: profile {profile.name!r} has no "
             f"default_images[{selected_profile!r}] entry. "

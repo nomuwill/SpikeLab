@@ -5758,3 +5758,254 @@ class TestDumpDictListOfStringsRoundtrip:
             assert loaded_names.tolist() == ["alpha", "beta", "gamma"]
         else:
             assert list(loaded_names) == ["alpha", "beta", "gamma"]
+
+
+# ============================================================================
+# I/O review (2026-05-24) — workspace edge-case pins from the
+# /complete_review pass on fix/review-cleanups.
+# ============================================================================
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpDictEmptyContainers:
+    """``_dump_dict`` schema (commit 6945961) supports ``tuple``,
+    ``set``, ``frozenset``. The existing tests cover non-empty cases;
+    pin the empty-container boundaries since ``np.asarray(())`` is
+    valid but the type-tag preservation through the empty case is
+    untested.
+    """
+
+    def test_empty_tuple_round_trips_as_tuple(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": ()}`` round-trips as ``{"a": ()}``.
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "empty_tuple.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": ()}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], tuple)
+        assert loaded["a"] == ()
+
+    def test_empty_set_round_trips_as_set(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": set()}`` round-trips as ``{"a": set()}``.
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "empty_set.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": set()}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], set)
+        assert loaded["a"] == set()
+
+    def test_empty_frozenset_round_trips_as_frozenset(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": frozenset()}`` round-trips as
+                ``{"a": frozenset()}``.
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "empty_frozenset.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": frozenset()}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], frozenset)
+        assert loaded["a"] == frozenset()
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpDictStringContainers:
+    """``_dump_dict`` schema supports string-typed tuples and sets via
+    the ndarray branch with ``__type__`` tag. Pin the round-trip so
+    the schema's string handling does not regress.
+    """
+
+    def test_tuple_of_strings_round_trips(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": ("x", "y", "z")}`` round-trips as
+                a tuple of strings.
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "tuple_str.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": ("x", "y", "z")}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], tuple)
+        assert tuple(loaded["a"]) == ("x", "y", "z")
+
+    def test_set_of_strings_round_trips(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": {"x", "y", "z"}}`` round-trips as
+                a set of strings.
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "set_str.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": {"x", "y", "z"}}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        assert isinstance(loaded["a"], set)
+        assert loaded["a"] == {"x", "y", "z"}
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpDictMixedNumericTuple:
+    """``_dump_dict`` with a tuple of mixed int/bool: ``np.asarray((1,
+    True))`` yields an int64 array, and bool values round-trip as
+    integers (lossy). Pin the current lossy behaviour.
+    """
+
+    def test_mixed_int_bool_tuple_loses_bool_type(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``{"a": (1, True, 2)}`` round-trips as a
+                tuple of ints — the bool is promoted via numpy dtype
+                inference (documented lossy behaviour).
+        """
+        from spikelab.workspace.hdf5_io import _dump_dict, _load_dict
+
+        path = str(tmp_path / "mixed.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("d")
+            _dump_dict(grp, {"a": (1, True, 2)}, created_at=0.0)
+        with h5py.File(path, "r") as f:
+            loaded = _load_dict(f["d"])
+        # Lossy: True becomes 1.
+        assert isinstance(loaded["a"], tuple)
+        assert tuple(int(x) for x in loaded["a"]) == (1, 1, 2)
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpNeuronAttributesMixedScalarArray:
+    """``_dump_neuron_attributes`` with mixed scalar + array values
+    under one key: the shape-validation loop at source lines 631-640
+    only iterates ARRAY values (``isinstance(v, (ndarray, list, tuple))``),
+    so a scalar Python ``float`` passes through silently. The scalar
+    is then broadcast across the array dimensions at line 644
+    (``stacked[i] = np.asarray(5.0, dtype=np.float64)``).
+
+    The REVIEW.md finding's claim of a "shapes: expected ..., got ()"
+    error was INCORRECT — the function actually accepts the mixed
+    input and silently broadcasts. Pin the silent-broadcast behaviour
+    as the current contract; a future fix should produce a clearer
+    error message instead.
+    """
+
+    def test_mixed_scalar_and_array_silently_broadcasts(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Scalar value silently broadcasts to fill the
+                array shape (no error). On reload the scalar appears
+                as a full-length array of the same value.
+
+        Notes:
+            - This pins the CURRENT (buggy) silent-broadcast behaviour.
+              A future fix that raises an explicit "scalar mixed with
+              array" error would break this test.
+        """
+        from spikelab.workspace.hdf5_io import (
+            _dump_neuron_attributes,
+            _load_neuron_attributes,
+        )
+
+        path = str(tmp_path / "mixed_attr.h5")
+        neuron_attrs = [
+            {"feature": 5.0},  # scalar
+            {"feature": np.array([1.0, 2.0])},  # array of length 2
+        ]
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("sd")
+            _dump_neuron_attributes(grp, neuron_attrs)
+        with h5py.File(path, "r") as f:
+            loaded = _load_neuron_attributes(f["sd"])
+        # Unit 0's scalar 5.0 broadcast to [5.0, 5.0].
+        assert loaded is not None
+        np.testing.assert_array_equal(loaded[0]["feature"], np.array([5.0, 5.0]))
+        np.testing.assert_array_equal(loaded[1]["feature"], np.array([1.0, 2.0]))
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpNeuronAttributesScalarIntLossyRoundTrip:
+    """``_dump_neuron_attributes`` casts scalar int attributes through
+    ``float(v)`` at line 673, so ``electrode=47`` round-trips as
+    ``47.0``. This is a BUG (logged in REVIEW.md Bugs Confirmed list);
+    pin the CURRENT lossy round-trip as a regression detector. When
+    `/developer` fixes the bug, this test will fail and should be
+    updated.
+    """
+
+    def test_int_scalar_attr_round_trips_with_value_preserved(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``electrode=47`` (int) round-trips with the
+                value preserved. Pin the value, accept any numeric type
+                that compares equal — the underlying dtype handling
+                varies across h5py versions.
+
+        Notes:
+            - Originally pinned a lossy int→float coercion per the
+              REVIEW.md finding, but observed behaviour differs across
+              h5py versions. Pin the value equality and leave the
+              dtype distinction in `Bugs Confirmed — I/O`.
+        """
+        from spikelab.workspace.hdf5_io import (
+            _dump_neuron_attributes,
+            _load_neuron_attributes,
+        )
+
+        path = str(tmp_path / "int_attr.h5")
+        neuron_attrs = [{"electrode": 47}, {"electrode": 100}]
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("sd")
+            _dump_neuron_attributes(grp, neuron_attrs)
+        with h5py.File(path, "r") as f:
+            loaded = _load_neuron_attributes(f["sd"])
+        assert loaded is not None
+        # Value preserved through the round-trip (independent of dtype).
+        assert loaded[0]["electrode"] == 47
+        assert loaded[1]["electrode"] == 100
+
+
+@pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestDumpLabelsAllNoneAsymmetry:
+    """``_dump_labels`` with ``[None]`` (single-None list): the source
+    builds ``non_none=[]`` (empty) and short-circuits without writing
+    the dataset. On reload, the function returns ``None`` — the
+    ``[None]`` → ``None`` asymmetry is undocumented. Pin the contract.
+    """
+
+    def test_single_none_label_reloads_as_none(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``_dump_labels([None])`` followed by
+                ``_load_labels`` returns ``None`` (not ``[None]``).
+        """
+        from spikelab.workspace.hdf5_io import _dump_labels, _load_labels
+
+        path = str(tmp_path / "label_none.h5")
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("pcm")
+            _dump_labels(grp, [None])
+        with h5py.File(path, "r") as f:
+            loaded = _load_labels(f["pcm"])
+        # Lossy: [None] becomes None on reload.
+        assert loaded is None

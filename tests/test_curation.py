@@ -1928,3 +1928,82 @@ class TestEstimateNoiseLevelsBoundary:
         assert noise.shape == (2,)
         assert np.all(np.isfinite(noise))
         assert (noise > 0).all()
+
+
+# ============================================================================
+# Test Coverage Scan (2026-05-25) — internal helpers.
+# ============================================================================
+
+
+class TestBuild1dArrayForChannels:
+    """``_build_1d_array_for_channels`` builds a per-unit waveform
+    vector laid out on an explicit channel list, padding zeros for
+    channels not in the unit's ``traces_meta``.
+    """
+
+    def test_channels_present_copied_in(self):
+        """
+        Tests:
+            (Test Case 1) Unit with avg_waveform on channels [0, 1] and
+                requested layout [0, 1] produces a flattened array
+                matching the source waveform.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        avg_wf = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # shape (2, 3)
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[
+                {"avg_waveform": avg_wf, "traces_meta": {"channels": [0, 1]}}
+            ],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1], template_len=3
+        )
+        # Flattened: row 0 first (channel 0), then row 1 (channel 1).
+        np.testing.assert_array_equal(result, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    def test_missing_channel_zero_padded(self):
+        """
+        Tests:
+            (Test Case 1) Requesting channel 2 when unit's traces_meta
+                lists [0, 1] yields zeros at channel 2's slot.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        avg_wf = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[
+                {"avg_waveform": avg_wf, "traces_meta": {"channels": [0, 1]}}
+            ],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1, 2], template_len=3
+        )
+        # Last 3 entries (channel 2 slot) should be zero.
+        np.testing.assert_array_equal(result[-3:], [0.0, 0.0, 0.0])
+        # First two slots match the source.
+        np.testing.assert_array_equal(result[:3], [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(result[3:6], [4.0, 5.0, 6.0])
+
+    def test_no_avg_waveform_returns_zeros(self):
+        """
+        Tests:
+            (Test Case 1) Unit without ``avg_waveform`` attribute
+                returns an all-zero array of the expected length.
+        """
+        from spikelab.spikedata.curation import _build_1d_array_for_channels
+
+        sd = SpikeData(
+            [[5.0]],
+            length=10.0,
+            neuron_attributes=[{"traces_meta": {"channels": [0, 1]}}],
+        )
+        result = _build_1d_array_for_channels(
+            sd, unit_idx=0, channels=[0, 1], template_len=3
+        )
+        assert result.shape == (6,)
+        assert np.all(result == 0.0)

@@ -925,3 +925,148 @@ class TestCountFunctions:
 
         with pytest.raises(ValueError, match="4-D"):
             count_evoked_spikes(np.zeros((4, 10, 20)))
+
+
+# ============================================================================
+# Test Coverage Scan (2026-05-25) — internal helpers in decoding.py.
+# ============================================================================
+
+
+try:
+    from sklearn.linear_model import RidgeClassifier  # noqa: F401
+
+    _has_sklearn = True
+except ImportError:
+    _has_sklearn = False
+
+skip_no_sklearn = pytest.mark.skipif(
+    not _has_sklearn, reason="scikit-learn not installed"
+)
+
+
+@skip_no_sklearn
+class TestBuildClassifierDispatch:
+    """``_build_classifier`` dispatches on the classifier name string
+    and constructs the right sklearn class. Pin each branch.
+    """
+
+    def test_ridge_branch(self):
+        """
+        Tests:
+            (Test Case 1) ``name="ridge"`` returns a RidgeClassifier
+                instance.
+        """
+        from sklearn.linear_model import RidgeClassifier
+
+        from spikelab.spikedata.decoding import _build_classifier
+
+        clf = _build_classifier("ridge", None, random_state=0)
+        assert isinstance(clf, RidgeClassifier)
+
+    def test_logistic_branch(self):
+        """
+        Tests:
+            (Test Case 1) ``name="logistic"`` returns a
+                LogisticRegression instance.
+        """
+        from sklearn.linear_model import LogisticRegression
+
+        from spikelab.spikedata.decoding import _build_classifier
+
+        clf = _build_classifier("logistic", None, random_state=0)
+        assert isinstance(clf, LogisticRegression)
+
+    def test_mlp_branch(self):
+        """
+        Tests:
+            (Test Case 1) ``name="mlp"`` returns an MLPClassifier
+                instance.
+        """
+        from sklearn.neural_network import MLPClassifier
+
+        from spikelab.spikedata.decoding import _build_classifier
+
+        clf = _build_classifier("mlp", None, random_state=0)
+        assert isinstance(clf, MLPClassifier)
+
+    def test_random_forest_branch(self):
+        """
+        Tests:
+            (Test Case 1) ``name="random_forest"`` returns a
+                RandomForestClassifier instance.
+        """
+        from sklearn.ensemble import RandomForestClassifier
+
+        from spikelab.spikedata.decoding import _build_classifier
+
+        clf = _build_classifier("random_forest", None, random_state=0)
+        assert isinstance(clf, RandomForestClassifier)
+
+    def test_unknown_name_raises(self):
+        """
+        Tests:
+            (Test Case 1) Unknown classifier name raises ValueError
+                listing the supported set.
+        """
+        from spikelab.spikedata.decoding import _build_classifier
+
+        with pytest.raises(ValueError, match="classifier must be one of"):
+            _build_classifier("svm", None, random_state=0)
+
+
+@skip_no_sklearn
+class TestBuildCvSplitterDispatch:
+    """``_build_cv_splitter`` dispatches on the ``cv`` argument."""
+
+    def test_loo_returns_leave_one_out(self):
+        """
+        Tests:
+            (Test Case 1) ``cv="loo"`` returns a ``LeaveOneOut``
+                instance.
+        """
+        from sklearn.model_selection import LeaveOneOut
+
+        from spikelab.spikedata.decoding import _build_cv_splitter
+
+        y = np.array([0, 1, 0, 1])
+        splitter = _build_cv_splitter("loo", y, random_state=0)
+        assert isinstance(splitter, LeaveOneOut)
+
+    def test_int_returns_stratified_kfold(self):
+        """
+        Tests:
+            (Test Case 1) ``cv=3`` returns a ``StratifiedKFold`` with
+                ``n_splits=3``.
+        """
+        from sklearn.model_selection import StratifiedKFold
+
+        from spikelab.spikedata.decoding import _build_cv_splitter
+
+        y = np.array([0, 1, 0, 1, 0, 1])
+        splitter = _build_cv_splitter(3, y, random_state=0)
+        assert isinstance(splitter, StratifiedKFold)
+        assert splitter.n_splits == 3
+
+    def test_int_below_two_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``cv=1`` raises ValueError mentioning the
+                minimum k.
+        """
+        from spikelab.spikedata.decoding import _build_cv_splitter
+
+        y = np.array([0, 1, 0])
+        with pytest.raises(ValueError, match=">= 2"):
+            _build_cv_splitter(1, y, random_state=0)
+
+    def test_unknown_string_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``cv="kfold"`` (unsupported string) raises
+                ValueError.
+        """
+        from spikelab.spikedata.decoding import _build_cv_splitter
+
+        y = np.array([0, 1])
+        with pytest.raises(ValueError):
+            _build_cv_splitter("kfold", y, random_state=0)

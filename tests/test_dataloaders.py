@@ -6243,3 +6243,107 @@ class TestLoadHDF5RawThresholdedFsHzTypeQuirks:
                 pytest.skip(f"fs_Hz=True now rejected (was previously accepted): {exc}")
         finally:
             os.unlink(path)
+
+
+# ============================================================================
+# Test Coverage Scan + Edge Case residuals (2026-05-25) — more pins.
+# ============================================================================
+
+
+class TestBuildS3Kwargs:
+    """``_build_s3_kwargs`` builds boto3 client kwargs from optional
+    credential params. Pin filtering and passthrough.
+    """
+
+    def test_empty_credentials_yields_empty_dict(self):
+        """
+        Tests:
+            (Test Case 1) All-None args produce an empty dict.
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs() == {}
+
+    def test_region_name_alone(self):
+        """
+        Tests:
+            (Test Case 1) Only ``region_name`` set produces a single-
+                entry dict (no credentials).
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(region_name="us-west-2") == {
+            "region_name": "us-west-2"
+        }
+
+    def test_full_credentials_passed_through(self):
+        """
+        Tests:
+            (Test Case 1) Access key, secret, session token, and region
+                all populate the result.
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(
+            aws_access_key_id="AKID",
+            aws_secret_access_key="secret",
+            aws_session_token="token",
+            region_name="us-east-1",
+        ) == {
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret",
+            "aws_session_token": "token",
+            "region_name": "us-east-1",
+        }
+
+    def test_empty_string_credentials_filtered_out(self):
+        """
+        Tests:
+            (Test Case 1) Empty-string credential args are filtered
+                (falsy values do not enter the dict).
+        """
+        from spikelab.data_loaders.s3_utils import _build_s3_kwargs
+
+        assert _build_s3_kwargs(
+            aws_access_key_id="",
+            aws_secret_access_key="",
+            region_name="us-east-1",
+        ) == {"region_name": "us-east-1"}
+
+
+class TestNwbLoaderStartTimeMsBrittleness:
+    """The NWB loader uses ``start_time=start_time_ms or 0.0`` — the
+    ``or`` pattern only falls back when LHS is falsy. Pin negative
+    values survive (Python truthy) but ``0.0`` falls to the default.
+    """
+
+    def test_negative_start_time_preserved(self):
+        """
+        Tests:
+            (Test Case 1) ``start_time_ms=-200.0`` survives the
+                ``or 0.0`` brittleness; SpikeData has start_time=-200.
+        """
+        if h5py is None:
+            pytest.skip("h5py not installed")
+
+        from spikelab.data_loaders.data_loaders import load_spikedata_from_nwb
+
+        with tempfile.NamedTemporaryFile(suffix=".nwb", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with h5py.File(path, "w") as f:
+                units = f.create_group("units")
+                units.create_dataset("id", data=np.array([0]))
+                units.create_dataset(
+                    "spike_times", data=np.array([0.001, 0.002])
+                )
+                units.create_dataset("spike_times_index", data=np.array([2]))
+            sd = load_spikedata_from_nwb(
+                path,
+                start_time_ms=-200.0,
+                length_ms=1000.0,
+                prefer_pynwb=False,
+            )
+            assert sd.start_time == -200.0
+        finally:
+            os.unlink(path)

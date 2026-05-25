@@ -459,9 +459,13 @@ class TestSpikeDataConstruction:
         from_idces_times with idces and times of different lengths.
 
         Tests:
-            (Test Case 1) Mismatched lengths raise IndexError from boolean indexing.
+            (Test Case 1) Mismatched lengths raise ValueError up-front
+                with a clear message naming both lengths. The new guard
+                (Tier F) replaces the previous deep-stack IndexError
+                that surfaced from boolean indexing inside
+                ``_train_from_i_t_list`` after silent broadcasting.
         """
-        with pytest.raises(IndexError):
+        with pytest.raises(ValueError, match="equal length"):
             SpikeData.from_idces_times([0, 0, 1], [10.0, 20.0], length=30.0)
 
     def test_from_idces_times_negative_indices_raise(self):
@@ -1307,24 +1311,21 @@ class TestSpikeDataSlicing:
         assert result.raw_time.shape == (10,)
         np.testing.assert_array_equal(result.raw_data, raw1)
 
-    def test_append_negative_offset(self):
+    def test_append_negative_offset_rejected(self):
         """
-        append with a negative offset.
+        append with a negative offset is rejected up-front (Tier F).
 
         Tests:
-        (Test Case 1) The resulting length is self.length + other.length + offset,
-        which is shorter than the sum of both lengths.
-        (Test Case 2) Spike times from the appended data are shifted by
-        self.length + offset.
+            (Test Case 1) Negative offset raises ValueError naming the
+                offending value. The previous lenient behaviour silently
+                interleaved the appended spikes with self's by shifting
+                the concatenation point backwards — visually correct
+                length but semantically wrong train.
         """
         sd1 = SpikeData([[5.0]], length=20.0)
         sd2 = SpikeData([[3.0]], length=10.0)
-        result = sd1.append(sd2, offset=-5)
-        # length = 20 + 10 + (-5) = 25
-        np.testing.assert_equal(result.length, 25.0)
-        # Appended spike at 3.0 shifted by self.length + offset = 20 + (-5) = 15
-        expected_second_spike = 3.0 + 20.0 + (-5)
-        np.testing.assert_almost_equal(result.train[0][1], expected_second_spike)
+        with pytest.raises(ValueError, match="offset must be non-negative"):
+            sd1.append(sd2, offset=-5)
 
     def test_append_to_empty_spikedata(self):
         """
@@ -10336,6 +10337,55 @@ class TestSpikeDataFromThresholdingDirectionBranches:
         n_both = sum(len(t) for t in sd_both.train)
         assert n_down >= 1
         assert n_down < n_both
+
+
+class TestSpikeDataFromThresholdingLengthStartTimeKwargs:
+    """``from_thresholding`` accepts ``length`` and ``start_time`` kwargs
+    that are forwarded to the underlying ``from_raster``. Without
+    these kwargs the length is inferred from ``data.shape[1]`` and
+    ``start_time`` defaults to 0.0 — explicit values honour file-level
+    attrs (trailing silence, event-centered start).
+    """
+
+    def test_length_kwarg_overrides_inferred_length(self):
+        """
+        Tests:
+            (Test Case 1) Explicit ``length=500.0`` produces a SpikeData
+                whose ``length`` is 500.0, even when the raw data
+                covers a shorter span.
+        """
+        # 1 channel × 100 samples at 1 kHz → naive length would be
+        # 100 ms. Pass length=500.0 to honour trailing silence past
+        # the raw_data window.
+        data = np.zeros((1, 100), dtype=float)
+        data[0, 50] = 10.0  # one super-threshold sample at 50 ms
+        sd = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+            length=500.0,
+        )
+        assert sd.length == pytest.approx(500.0)
+
+    def test_start_time_kwarg_overrides_default_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``start_time=-100.0`` (event-centered) is
+                forwarded to ``SpikeData.start_time``.
+        """
+        data = np.zeros((1, 100), dtype=float)
+        data[0, 50] = 10.0
+        sd = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+            start_time=-100.0,
+        )
+        assert sd.start_time == pytest.approx(-100.0)
 
 
 # ============================================================================

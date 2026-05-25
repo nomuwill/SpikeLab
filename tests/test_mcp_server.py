@@ -8274,14 +8274,18 @@ class TestSanitizeForJsonOversizeRaises:
     reference pattern and at the cap-raise knob.
     """
 
-    def test_oversize_ndarray_raises_with_size_and_cap_in_message(self):
+    def test_oversize_ndarray_returns_summary_marker(self):
         """
+        Oversize arrays no longer raise — they degrade to an elided
+        summary dict so the handler's other return-dict fields (e.g.
+        the workspace key where the actual result is stored) reach
+        the agent.
+
         Tests:
-            (Test Case 1) Array of 20,000 zeros raises ``ValueError``.
-            (Test Case 2) Error message includes the actual element
-                count, the documented cap (10000), and the words
-                "exceeds the inline JSON cap" so the user can
-                attribute the failure.
+            (Test Case 1) Array of 10001 elements returns a dict with
+                ``__elided_ndarray__: True``.
+            (Test Case 2) Summary carries the size, shape, dtype, and
+                a hint mentioning fetch_workspace_item.
         """
         from spikelab.mcp_server.server import (
             MAX_INLINE_ARRAY_SIZE,
@@ -8289,16 +8293,21 @@ class TestSanitizeForJsonOversizeRaises:
         )
 
         big = np.zeros(MAX_INLINE_ARRAY_SIZE + 1)
-        with pytest.raises(ValueError, match="exceeds the inline JSON cap"):
-            _sanitize_for_json(big)
+        out = _sanitize_for_json(big)
+        assert isinstance(out, dict)
+        assert out["__elided_ndarray__"] is True
+        assert out["size"] == MAX_INLINE_ARRAY_SIZE + 1
+        assert out["shape"] == [MAX_INLINE_ARRAY_SIZE + 1]
+        assert "fetch_workspace_item" in out["hint"]
 
-    def test_at_cap_is_inlined_above_cap_raises(self):
+    def test_at_cap_is_inlined_above_cap_returns_summary(self):
         """
         Tests:
             (Test Case 1) Array of exactly ``MAX_INLINE_ARRAY_SIZE``
                 elements is inlined (the cap is ``> cap``, not ``>=``,
                 so the boundary case passes through).
-            (Test Case 2) ``cap + 1`` elements raises.
+            (Test Case 2) ``cap + 1`` elements returns the elided
+                summary dict.
         """
         from spikelab.mcp_server.server import (
             MAX_INLINE_ARRAY_SIZE,
@@ -8307,11 +8316,13 @@ class TestSanitizeForJsonOversizeRaises:
 
         at_cap = np.zeros(MAX_INLINE_ARRAY_SIZE)
         out = _sanitize_for_json(at_cap)
+        assert isinstance(out, list)
         assert len(out) == MAX_INLINE_ARRAY_SIZE
 
         above = np.zeros(MAX_INLINE_ARRAY_SIZE + 1)
-        with pytest.raises(ValueError):
-            _sanitize_for_json(above)
+        out_above = _sanitize_for_json(above)
+        assert isinstance(out_above, dict)
+        assert out_above["__elided_ndarray__"] is True
 
 
 class TestMergeWorkspaceNonexistentPath:
@@ -8771,8 +8782,10 @@ class TestSanitizeForJsonZeroDArrayAndCapAdjustable:
             # Lower the cap to a small value, then exceed it.
             srv_mod.MAX_INLINE_ARRAY_SIZE = 10
             small_above_cap = np.zeros(11)
-            with pytest.raises(ValueError, match="exceeds the inline JSON cap"):
-                srv_mod._sanitize_for_json(small_above_cap)
+            out_summary = srv_mod._sanitize_for_json(small_above_cap)
+            assert isinstance(out_summary, dict)
+            assert out_summary["__elided_ndarray__"] is True
+            assert out_summary["size"] == 11
 
             # Raise the cap; same array now inlines.
             srv_mod.MAX_INLINE_ARRAY_SIZE = 100
@@ -8985,19 +8998,26 @@ class TestSanitizeForJsonRecursionAndContainers:
     """
 
     @pytestmark_server
-    def test_oversize_ndarray_in_nested_dict_raises(self):
+    def test_oversize_ndarray_in_nested_dict_returns_summary(self):
         """
         Tests:
-            (Test Case 1) ``_sanitize_for_json({"a": np.zeros(20_000)})``
-                raises ValueError mentioning the inline JSON cap.
+            (Test Case 1) ``_sanitize_for_json({"a": np.zeros(200)})``
+                with a low cap returns a dict whose ``"a"`` is the
+                elided summary marker — the parent dict is preserved
+                so the handler's other return-dict fields still reach
+                the agent.
         """
         from spikelab.mcp_server import server as srv_mod
 
         original = srv_mod.MAX_INLINE_ARRAY_SIZE
         srv_mod.MAX_INLINE_ARRAY_SIZE = 100
         try:
-            with pytest.raises(ValueError, match="exceeds the inline JSON cap"):
-                srv_mod._sanitize_for_json({"a": np.zeros(200)})
+            out = srv_mod._sanitize_for_json({"a": np.zeros(200), "b": 7})
+            assert isinstance(out, dict)
+            assert out["b"] == 7
+            assert isinstance(out["a"], dict)
+            assert out["a"]["__elided_ndarray__"] is True
+            assert out["a"]["size"] == 200
         finally:
             srv_mod.MAX_INLINE_ARRAY_SIZE = original
 

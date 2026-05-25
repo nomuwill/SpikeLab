@@ -307,7 +307,7 @@ class TestStreamingWaveformExtractor:
         original = np.load(sorting.folder / "spike_times_kilosort.npy")
 
         np.testing.assert_array_equal(
-            np.sort(original), np.sort(original), err_msg="monotonicity"
+            np.sort(original), original, err_msg="monotonicity"
         )
         assert original.shape == recentered.shape
 

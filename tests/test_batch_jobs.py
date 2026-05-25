@@ -751,28 +751,36 @@ class TestS3StorageClient:
         client = self._make_client(prefix="s3://bucket/no-slash")
         assert client.prefix == "s3://bucket/no-slash/"
 
-    def test_upload_file_calls_boto3(self):
+    def test_upload_file_calls_boto3(self, tmp_path):
         """upload_file delegates to the boto3 client."""
+        # ``upload_file`` now validates that the local path exists
+        # before calling boto3 (clearer error than boto3's own).
+        # Create a real temp file so the validation passes and the
+        # mocked boto3 client still sees the delegation.
+        local = tmp_path / "data.pkl"
+        local.write_bytes(b"")
         with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
             mock_s3 = MagicMock()
             mock_boto3.client.return_value = mock_s3
             client = S3StorageClient(prefix="s3://bucket/pfx/")
             result = client.upload_file(
-                local_path="/tmp/data.pkl",
+                local_path=str(local),
                 s3_uri="s3://bucket/pfx/inputs/run-1/data.pkl",
             )
             mock_s3.upload_file.assert_called_once_with(
-                "/tmp/data.pkl", "bucket", "pfx/inputs/run-1/data.pkl"
+                str(local), "bucket", "pfx/inputs/run-1/data.pkl"
             )
             assert result == "s3://bucket/pfx/inputs/run-1/data.pkl"
 
-    def test_upload_bundle_builds_uri_and_uploads(self):
+    def test_upload_bundle_builds_uri_and_uploads(self, tmp_path):
         """upload_bundle composes build_uri + upload_file."""
+        local_zip = tmp_path / "run-7.zip"
+        local_zip.write_bytes(b"PK\x05\x06" + b"\x00" * 18)  # empty zip
         with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
             mock_s3 = MagicMock()
             mock_boto3.client.return_value = mock_s3
             client = S3StorageClient(prefix="s3://bucket/pfx/")
-            result = client.upload_bundle(local_zip="/tmp/run-7.zip", run_id="run-7")
+            result = client.upload_bundle(local_zip=str(local_zip), run_id="run-7")
             assert "run-7.zip" in result
             assert mock_s3.upload_file.called
 
@@ -821,7 +829,7 @@ class TestS3StorageClient:
         uri = client.build_uri(run_id="run-1", filename="my file (1).pkl")
         assert "my file (1).pkl" in uri
 
-    def test_prefixless_client_supports_download_upload(self):
+    def test_prefixless_client_supports_download_upload(self, tmp_path):
         """
         S3StorageClient(prefix=None) supports the entrypoint pattern:
         the container constructs a prefixless client and exercises only
@@ -847,12 +855,14 @@ class TestS3StorageClient:
             "bucket", "outputs/run-1/data.pkl", "/tmp/data.pkl"
         )
 
+        out_path = tmp_path / "out.pkl"
+        out_path.write_bytes(b"")
         result = client.upload_file(
-            local_path="/tmp/out.pkl",
+            local_path=str(out_path),
             s3_uri="s3://bucket/outputs/run-1/out.pkl",
         )
         mock_s3.upload_file.assert_called_once_with(
-            "/tmp/out.pkl", "bucket", "outputs/run-1/out.pkl"
+            str(out_path), "bucket", "outputs/run-1/out.pkl"
         )
         assert result == "s3://bucket/outputs/run-1/out.pkl"
 
@@ -4036,21 +4046,20 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
         )
         return session, storage
 
-    def test_corrupt_pickle_warns_and_skips(self, tmp_path):
+    def test_corrupt_pickle_raises_with_filename(self, tmp_path):
         """
-        _retrieve_sorting emits a UserWarning naming the corrupt pickle
-        and continues; the workspace ends up without that entry.
+        _retrieve_sorting now raises ``RuntimeError`` when any output
+        file fails to ingest, instead of silently warning and
+        returning a half-built workspace. The exception lists the
+        offending file so the operator can find it.
 
         Tests:
-            (Test Case 1) A UserWarning is emitted whose message names
-                the corrupt file.
-            (Test Case 2) The workspace is returned (no exception) and
-                contains no spikedata entry from the corrupt pickle.
+            (Test Case 1) RuntimeError is raised when a downloaded
+                pickle is corrupt.
+            (Test Case 2) The exception message names the corrupt
+                file.
         """
-        import warnings
-
         from spikelab.batch_jobs.models import SubmitResult
-        from spikelab.workspace.workspace import AnalysisWorkspace
 
         session, storage = self._make_session()
 
@@ -4085,31 +4094,19 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
             job_type="sorting",
         )
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result_ws = session.retrieve_result(submit_result, str(local_dir))
+        with pytest.raises(RuntimeError, match="bad.pkl"):
+            session.retrieve_result(submit_result, str(local_dir))
 
-        assert isinstance(result_ws, AnalysisWorkspace)
-        assert len(result_ws._index) == 0
-        # A UserWarning naming the corrupt pickle was emitted.
-        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
-        assert any("bad.pkl" in m for m in warn_msgs), warn_msgs
-
-    def test_corrupt_json_warns_and_skips(self, tmp_path):
+    def test_corrupt_json_raises_with_filename(self, tmp_path):
         """
-        _retrieve_sorting emits a UserWarning naming the unreadable JSON
-        and continues; the workspace ends up without that entry.
+        _retrieve_sorting raises ``RuntimeError`` when a JSON metadata
+        file is unreadable, naming the offending file.
 
         Tests:
-            (Test Case 1) A UserWarning is emitted whose message names
-                the unreadable JSON file.
-            (Test Case 2) The workspace is returned and contains no
-                metadata entry from the corrupt JSON.
+            (Test Case 1) RuntimeError is raised on bad JSON.
+            (Test Case 2) The exception message names the bad file.
         """
-        import warnings
-
         from spikelab.batch_jobs.models import SubmitResult
-        from spikelab.workspace.workspace import AnalysisWorkspace
 
         session, storage = self._make_session()
 
@@ -4141,14 +4138,8 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
             job_type="sorting",
         )
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result_ws = session.retrieve_result(submit_result, str(local_dir))
-
-        assert isinstance(result_ws, AnalysisWorkspace)
-        assert len(result_ws._index) == 0
-        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
-        assert any("metadata.json" in m for m in warn_msgs), warn_msgs
+        with pytest.raises(RuntimeError, match="metadata.json"):
+            session.retrieve_result(submit_result, str(local_dir))
 
 
 class TestBuildJobNameRfc1123Compliance:

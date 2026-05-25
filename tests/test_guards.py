@@ -1278,7 +1278,7 @@ class TestLogInactivityWatchdogConstruction:
         """
         for bad in (0, -5):
             with pytest.raises(
-                ValueError, match="inactivity_s must be positive or None"
+                ValueError, match="inactivity_s must be"
             ):
                 LogInactivityWatchdog(
                     log_path=tmp_path / "log",
@@ -7482,7 +7482,7 @@ class TestComputeInactivityTimeoutSEdges:
             max_s=None,
         )
         assert timeout < 0
-        with pytest.raises(ValueError, match="inactivity_s must be positive"):
+        with pytest.raises(ValueError, match="inactivity_s must be"):
             LogInactivityWatchdog(
                 log_path=tmp_path / "rec.log",
                 popen=mock.Mock(spec=subprocess.Popen),

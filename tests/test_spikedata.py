@@ -5356,7 +5356,7 @@ class TestSpikeDataStPR:
         train = [np.array([10.0, 50.0, 90.0]), np.array([])]  # unit 1 silent
         sd = SpikeData(train, length=100.0)
         stPR, cs_zero, cs_max, delays, lags = sd.compute_spike_trig_pop_rate(
-            window_ms=10
+            window_ms=10, cut_outer=5
         )
         assert stPR.shape[0] == 2
         # Silent neuron should have all-zero coupling
@@ -5383,6 +5383,24 @@ class TestSpikeDataStPR:
         sd = SpikeData([[5.0, 15.0, 25.0, 35.0, 45.0]], length=50.0)
         with pytest.raises(ValueError, match="at least 2 units"):
             sd.compute_spike_trig_pop_rate(window_ms=5)
+
+    def test_spike_trig_pop_rate_cut_outer_at_window_ms_raises(self):
+        """
+        compute_spike_trig_pop_rate with cut_outer >= window_ms raises ValueError.
+
+        Tests:
+            (Test Case 1) cut_outer == window_ms raises (would leave an empty
+                trimmed array; downstream argmax would fail).
+            (Test Case 2) cut_outer > window_ms raises.
+            (Test Case 3) Negative cut_outer raises.
+        """
+        sd = SpikeData([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], length=10.0)
+        with pytest.raises(ValueError, match="cut_outer"):
+            sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=10)
+        with pytest.raises(ValueError, match="cut_outer"):
+            sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=11)
+        with pytest.raises(ValueError, match="cut_outer"):
+            sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=-1)
 
     def test_compute_spike_trig_pop_rate_perfect_synchrony_zero_lag_peak(self):
         """

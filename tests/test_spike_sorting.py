@@ -13469,32 +13469,26 @@ class TestKilosortSortingExtractorClusterIdCoercion:
 
 
 class TestLogInactivityWatchdogInfTimeout:
-    """``LogInactivityWatchdog.__init__`` validates ``inactivity_s``
-    with ``np.isnan(inactivity_s) or inactivity_s <= 0.0`` at source
-    line 374. ``np.inf <= 0.0`` is False and ``np.isnan(np.inf)`` is
-    False, so an Inf inactivity tolerance slips past the guard and the
-    watchdog silently never trips. Pin the BUG (deferred to /developer).
+    """``LogInactivityWatchdog.__init__`` rejects non-finite ``inactivity_s``
+    (an infinite tolerance would silently disable the stall watchdog).
     """
 
-    def test_inactivity_inf_currently_accepted(self, tmp_path):
+    def test_inactivity_inf_rejected(self, tmp_path):
         """
         Tests:
-            (Test Case 1) ``inactivity_s=np.inf`` is currently accepted
-                (no ValueError raised), pinning the BUG.
-
-        Notes:
-            - When /developer adds an `np.isfinite` check, this test
-              should be updated to assert the new ValueError.
+            (Test Case 1) ``inactivity_s=np.inf`` raises ValueError.
         """
         from spikelab.spike_sorting.guards._inactivity import LogInactivityWatchdog
 
         log_path = tmp_path / "log.txt"
         log_path.write_text("hello")
-        # BUG: inf silently accepted, the watchdog will never trip on stall.
-        wd = LogInactivityWatchdog(
-            log_path=str(log_path), popen=None, inactivity_s=np.inf, sorter="ks2"
-        )
-        assert wd.inactivity_s == float("inf")
+        with pytest.raises(ValueError, match="inactivity_s"):
+            LogInactivityWatchdog(
+                log_path=str(log_path),
+                popen=None,
+                inactivity_s=np.inf,
+                sorter="ks2",
+            )
 
 
 class TestSignalReachedBaselineBoundaries:

@@ -624,7 +624,7 @@ class TestNumbaIntegrationStpr:
             (Test Case 2) All non-silent neurons produce finite values.
         """
         sd = _make_sd(n_units=4, length=500.0, spikes_per_unit=30)
-        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10)
+        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=5)
         assert stPR.shape == (4, 21)
         assert len(lags) == 21
         assert np.all(np.isfinite(stPR))
@@ -637,7 +637,7 @@ class TestNumbaIntegrationStpr:
             (Test Case 1) c0 matches stPR[:, window_ms] after filtering.
         """
         sd = _make_sd(n_units=4, length=500.0, spikes_per_unit=30)
-        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10)
+        stPR, c0, cmax, delays, lags = sd.compute_spike_trig_pop_rate(window_ms=10, cut_outer=5)
         # c0 is extracted from the filtered curve at the center index
         assert len(c0) == 4
         assert len(cmax) == 4

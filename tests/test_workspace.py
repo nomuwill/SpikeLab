@@ -5901,36 +5901,18 @@ class TestDumpDictMixedNumericTuple:
 
 @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
 class TestDumpNeuronAttributesMixedScalarArray:
-    """``_dump_neuron_attributes`` with mixed scalar + array values
-    under one key: the shape-validation loop at source lines 631-640
-    only iterates ARRAY values (``isinstance(v, (ndarray, list, tuple))``),
-    so a scalar Python ``float`` passes through silently. The scalar
-    is then broadcast across the array dimensions at line 644
-    (``stacked[i] = np.asarray(5.0, dtype=np.float64)``).
-
-    The REVIEW.md finding's claim of a "shapes: expected ..., got ()"
-    error was INCORRECT — the function actually accepts the mixed
-    input and silently broadcasts. Pin the silent-broadcast behaviour
-    as the current contract; a future fix should produce a clearer
-    error message instead.
+    """``_dump_neuron_attributes`` rejects mixed scalar + array values
+    under one key with a clear error rather than silently broadcasting
+    the scalar across array positions.
     """
 
-    def test_mixed_scalar_and_array_silently_broadcasts(self, tmp_path):
+    def test_mixed_scalar_and_array_raises(self, tmp_path):
         """
         Tests:
-            (Test Case 1) Scalar value silently broadcasts to fill the
-                array shape (no error). On reload the scalar appears
-                as a full-length array of the same value.
-
-        Notes:
-            - This pins the CURRENT (buggy) silent-broadcast behaviour.
-              A future fix that raises an explicit "scalar mixed with
-              array" error would break this test.
+            (Test Case 1) Mixing a scalar with an array value for the same
+                attribute key raises ValueError at dump time.
         """
-        from spikelab.workspace.hdf5_io import (
-            _dump_neuron_attributes,
-            _load_neuron_attributes,
-        )
+        from spikelab.workspace.hdf5_io import _dump_neuron_attributes
 
         path = str(tmp_path / "mixed_attr.h5")
         neuron_attrs = [
@@ -5939,13 +5921,8 @@ class TestDumpNeuronAttributesMixedScalarArray:
         ]
         with h5py.File(path, "w") as f:
             grp = f.create_group("sd")
-            _dump_neuron_attributes(grp, neuron_attrs)
-        with h5py.File(path, "r") as f:
-            loaded = _load_neuron_attributes(f["sd"])
-        # Unit 0's scalar 5.0 broadcast to [5.0, 5.0].
-        assert loaded is not None
-        np.testing.assert_array_equal(loaded[0]["feature"], np.array([5.0, 5.0]))
-        np.testing.assert_array_equal(loaded[1]["feature"], np.array([1.0, 2.0]))
+            with pytest.raises(ValueError):
+                _dump_neuron_attributes(grp, neuron_attrs)
 
 
 @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")

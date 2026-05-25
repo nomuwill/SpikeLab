@@ -3426,41 +3426,33 @@ class TestValidateTimeStartToEnd:
 class TestTimesConversion:
     """Edge case tests for times_from_ms and to_ms."""
 
-    def test_fs_hz_inf_produces_zero_samples(self):
+    def test_times_from_ms_rejects_non_finite_fs(self):
         """
-        fs_Hz=Inf passes the > 0 validation but produces overflow values.
+        times_from_ms with fs_Hz=Inf or NaN raises ValueError.
 
         Tests:
-            (Test Case 1) times_from_ms with fs_Hz=Inf does not raise.
-            (Test Case 2) For 0.0 ms, 0.0 * inf = nan, then np.rint(nan).astype(int)
-                produces an overflow value (not 0).
-            (Test Case 3) For 1.0 ms, inf produces the same overflow value.
-
-        Notes:
-            - 0.0 * inf = nan (not 0), so even the zero time point overflows
-              when cast to int. Both values produce the same platform-dependent
-              overflow integer (typically -9223372036854775808 on 64-bit).
+            (Test Case 1) fs_Hz=Inf raises ValueError.
+            (Test Case 2) fs_Hz=NaN raises ValueError.
         """
-        import warnings
-
         t = np.array([0.0, 1.0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            result = times_from_ms(t, "samples", fs_Hz=np.inf)
-        # Both values overflow to the same large negative integer
-        assert result[0] == result[1]
+        with pytest.raises(ValueError):
+            times_from_ms(t, "samples", fs_Hz=np.inf)
+        with pytest.raises(ValueError):
+            times_from_ms(t, "samples", fs_Hz=np.nan)
 
-    def test_to_ms_from_inf_fs(self):
+    def test_to_ms_rejects_non_finite_fs(self):
         """
-        to_ms with fs_Hz=Inf. Dividing by Inf produces 0.0 for all values.
+        to_ms with fs_Hz=Inf or NaN raises ValueError.
 
         Tests:
-            (Test Case 1) to_ms with fs_Hz=Inf and unit='samples'. All
-                sample values divided by Inf produce 0.0 ms.
+            (Test Case 1) fs_Hz=Inf raises ValueError.
+            (Test Case 2) fs_Hz=NaN raises ValueError.
         """
         v = np.array([100, 200, 300])
-        result = to_ms(v, "samples", fs_Hz=np.inf)
-        np.testing.assert_allclose(result, 0.0)
+        with pytest.raises(ValueError):
+            to_ms(v, "samples", fs_Hz=np.inf)
+        with pytest.raises(ValueError):
+            to_ms(v, "samples", fs_Hz=np.nan)
 
 
 # ---------------------------------------------------------------------------

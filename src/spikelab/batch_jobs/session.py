@@ -429,8 +429,6 @@ class RunSession:
             - Call ``wait_for_completion`` before calling this method to
               ensure the job has finished.
         """
-        from ..workspace.workspace import AnalysisWorkspace
-
         local = Path(local_dir)
         local.mkdir(parents=True, exist_ok=True)
 
@@ -536,9 +534,7 @@ class RunSession:
                 try:
                     sd = load_spikedata_from_pickle(local_path)
                 except (pickle.UnpicklingError, EOFError, OSError, ValueError) as e:
-                    failures.append(
-                        f"{relative}: {type(e).__name__}: {e}"
-                    )
+                    failures.append(f"{relative}: {type(e).__name__}: {e}")
                     continue
                 namespace = Path(relative).stem
                 ws.store(namespace, "spikedata", sd)
@@ -548,9 +544,7 @@ class RunSession:
                     with open(local_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                 except (json.JSONDecodeError, OSError) as e:
-                    failures.append(
-                        f"{relative}: {type(e).__name__}: {e}"
-                    )
+                    failures.append(f"{relative}: {type(e).__name__}: {e}")
                     continue
                 namespace = Path(relative).stem
                 ws.store(namespace, "sorting_metadata", meta)
@@ -602,9 +596,22 @@ class RunSession:
             base_path (str): Path without extension.
         """
         if isinstance(workspace, str):
-            # Assume it's a base path; verify .h5 exists
-            if not Path(f"{workspace}.h5").exists():
-                raise FileNotFoundError(f"Workspace file not found: {workspace}.h5")
+            # Assume it's a base path; verify both ``.h5`` and ``.json``
+            # exist — ``AnalysisWorkspace.save`` writes both, so a
+            # missing ``.json`` indicates either a corrupt save or a
+            # caller passing only the HDF5 file's stem (the surrounding
+            # bundle code adds both to the input_paths list).
+            h5_path = Path(f"{workspace}.h5")
+            json_path = Path(f"{workspace}.json")
+            if not h5_path.exists():
+                raise FileNotFoundError(f"Workspace file not found: {h5_path}")
+            if not json_path.exists():
+                raise FileNotFoundError(
+                    f"Workspace index file not found: {json_path}. "
+                    "AnalysisWorkspace.save writes both .h5 and .json — "
+                    "the .json is missing, suggesting a corrupt or "
+                    "partial save."
+                )
             return workspace
 
         # It's an AnalysisWorkspace object

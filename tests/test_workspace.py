@@ -4631,6 +4631,45 @@ class TestRemaining:
 
 
 @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestLoadWorkspaceFullSkipsDoubleUnderscoreGroups:
+    """``load_workspace_full`` skips any top-level HDF5 group whose
+    name starts with ``__``. This reserves the prefix for workspace
+    metadata sub-groups (e.g. ``/__history__/``) so a future audit-log
+    addition doesn't make the loader treat the metadata group as a
+    user namespace and fail on its first child's missing ``__type__``.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_double_underscore_group_skipped_from_items(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A workspace .h5 containing a normal namespace
+                ``ns_a/...`` plus a sibling ``__history__/...`` loads
+                without raising.
+            (Test Case 2) ``ws._items`` contains only ``ns_a``; the
+                ``__history__`` group is absent.
+        """
+        from spikelab.workspace.hdf5_io import load_workspace_full
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        # Build a valid workspace .h5 via the real save path first so
+        # the file has all the required attrs and a real ns_a entry.
+        ws = AnalysisWorkspace(name="skip-double-underscore")
+        ws.store("ns_a", "key", np.array([1, 2, 3]))
+        base = str(tmp_path / "ws")
+        ws.save(base)
+
+        # Add a sibling ``__history__`` group to the saved file.
+        with h5py.File(base + ".h5", "a") as f:
+            hist = f.create_group("__history__")
+            hist.create_dataset("dummy", data=np.array([42]))
+
+        loaded = load_workspace_full(base)
+        assert "ns_a" in loaded._items
+        assert "__history__" not in loaded._items
+        assert "__history__" not in loaded._index
+
+
 class TestLoadWorkspaceFullValidation:
     """Tests for load_workspace_full input validation."""
 

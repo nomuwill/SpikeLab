@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -841,6 +842,68 @@ class TestS3StorageClient:
             with pytest.raises(ImportError, match="boto3 is required"):
                 client.upload_file(local_path=__file__, s3_uri="s3://bucket/pfx/x.bin")
 
+    def test_boto3_not_installed_download_and_list_also_raise_deferred(self):
+        """
+        Reinforces the lazy-init detail of Tier H5: download_file and
+        list_output_files raise the same deferred ImportError as
+        upload_file when boto3 is unavailable. All client-using
+        operations should hit the same lazy property, so an absent
+        boto3 produces a consistent error message across the surface.
+
+        Tests:
+            (Test Case 1) ``download_file`` raises ImportError naming boto3.
+            (Test Case 2) ``list_output_files`` raises ImportError naming boto3.
+        """
+        with patch("spikelab.batch_jobs.storage_s3.boto3", None):
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+            with pytest.raises(ImportError, match="boto3 is required"):
+                client.download_file(
+                    s3_uri="s3://bucket/pfx/x.bin", local_path="/tmp/x.bin"
+                )
+            with pytest.raises(ImportError, match="boto3 is required"):
+                client.list_output_files(run_id="run-1")
+
+    def test_build_uri_invalid_category_warns_with_known_categories(self):
+        """
+        ``build_uri`` with an unknown ``category`` falls back to the
+        ``inputs`` template and emits a UserWarning naming the known
+        categories so typos ("input", "logs/") don't silently land in
+        the wrong S3 prefix.
+
+        Tests:
+            (Test Case 1) A UserWarning is emitted for an unknown
+                category.
+            (Test Case 2) The warning names the known categories
+                ("inputs", "outputs", "logs").
+            (Test Case 3) The returned URI uses the ``inputs`` template
+                as the fallback.
+        """
+        import warnings as _warnings
+
+        with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
+            mock_boto3.client.return_value = MagicMock()
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            uri = client.build_uri(
+                run_id="run-1",
+                filename="data.pkl",
+                category="not-a-real-category",
+            )
+
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        relevant = [m for m in warn_msgs if "build_uri" in m]
+        assert relevant, warn_msgs
+        # Known categories listed in the warning.
+        assert "inputs" in relevant[0]
+        assert "outputs" in relevant[0]
+        assert "logs" in relevant[0]
+        # Fallback to the inputs template.
+        assert uri == "s3://bucket/pfx/inputs/run-1/data.pkl"
+
     def test_build_uri_invalid_category_falls_back_to_inputs(self):
         """Invalid category string falls back to inputs template."""
         with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
@@ -1216,6 +1279,53 @@ class TestProfiles:
         """Unknown profile name falls back to defaults.yaml."""
         profile = load_profile_from_name("unknown-cluster")
         assert profile.name == "defaults"
+
+    def test_unknown_name_warns_with_recognised_aliases(self):
+        """
+        Unknown names emit a UserWarning naming the recognised aliases
+        so a typo doesn't silently land on the wrong profile.
+
+        Tests:
+            (Test Case 1) A UserWarning is emitted for an unknown name.
+            (Test Case 2) The warning lists at least one recognised
+                alias ("defaults") so the operator can correct the typo.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            profile = load_profile_from_name("not-a-real-profile")
+
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        relevant = [m for m in warn_msgs if "Unknown profile" in m]
+        assert relevant, warn_msgs
+        assert "defaults" in relevant[0]
+        # Falls back to defaults regardless.
+        assert profile.name == "defaults"
+
+    def test_known_names_do_not_warn(self):
+        """
+        Recognised names (``"defaults"``, ``"nrp"``) load without
+        emitting the unknown-name warning.
+
+        Tests:
+            (Test Case 1) ``load_profile_from_name("defaults")`` emits
+                no "Unknown profile" warning.
+            (Test Case 2) ``load_profile_from_name("nrp")`` emits no
+                "Unknown profile" warning.
+        """
+        import warnings as _warnings
+
+        for name in ("defaults", "nrp"):
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                load_profile_from_name(name)
+            warn_msgs = [str(rec.message) for rec in w]
+            assert not any(
+                "Unknown profile" in m for m in warn_msgs
+            ), f"{name!r}: {warn_msgs}"
 
     def test_nautilus_alias(self):
         """'nautilus' loads the same profile as 'nrp'."""
@@ -2788,6 +2898,80 @@ class TestWorkspaceEntrypoint:
 
         monkeypatch.setenv("INPUT_URI", "s3://bucket/input.zip")
         assert _require_env("INPUT_URI") == "s3://bucket/input.zip"
+
+    def test_main_script_failure_prints_marker_and_reraises(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        ``entrypoints/workspace.main`` wraps ``runpy.run_path`` so a
+        failure inside the analysis script surfaces with a clear
+        ``WORKSPACE_SCRIPT_FAILED: <type>: <msg>`` marker on stderr,
+        then re-raises so the pod exits non-zero. Without this, the
+        operator scanning pod logs would have to distinguish "script
+        ran and raised" from "entrypoint bootstrap failed" by stack-
+        trace shape alone.
+
+        Tests:
+            (Test Case 1) The marker substring ``WORKSPACE_SCRIPT_FAILED``
+                with the exception class name and message appears on
+                stderr.
+            (Test Case 2) The original exception propagates to the
+                caller (re-raise behaviour).
+        """
+        import json
+        import zipfile
+        import shutil
+
+        from spikelab.batch_jobs.entrypoints import workspace as ws_entrypoint
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        ws = AnalysisWorkspace(name="failure-marker-test")
+        ws_base = str(tmp_path / "workspace")
+        ws.save(ws_base)
+
+        script = tmp_path / "failing_script.py"
+        script.write_text(
+            "raise RuntimeError('synthetic failure')\n", encoding="utf-8"
+        )
+
+        bundle_dir = tmp_path / "bundle" / "run-1"
+        bundle_dir.mkdir(parents=True)
+        shutil.copy2(f"{ws_base}.h5", bundle_dir / "workspace.h5")
+        shutil.copy2(f"{ws_base}.json", bundle_dir / "workspace.json")
+        shutil.copy2(str(script), bundle_dir / "failing_script.py")
+        manifest = {"run_id": "run-1", "output_format": "workspace", "files": []}
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        shutil.make_archive(
+            str(tmp_path / "bundle"),
+            "zip",
+            root_dir=str(tmp_path / "bundle"),
+            base_dir="run-1",
+        )
+        zip_path = str(tmp_path / "bundle.zip")
+
+        def fake_download(*, s3_uri, local_path):
+            shutil.copy2(zip_path, local_path)
+            return local_path
+
+        mock_storage = MagicMock()
+        mock_storage.download_file.side_effect = fake_download
+        monkeypatch.setattr(
+            "spikelab.batch_jobs.storage_s3.S3StorageClient",
+            lambda **kwargs: mock_storage,
+        )
+        monkeypatch.setenv("INPUT_URI", "s3://bucket/input/bundle.zip")
+        monkeypatch.setenv("OUTPUT_PREFIX", "s3://bucket/outputs/run-1/")
+        monkeypatch.setenv("SCRIPT_NAME", "failing_script.py")
+
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            ws_entrypoint.main()
+
+        captured = capsys.readouterr()
+        assert "WORKSPACE_SCRIPT_FAILED" in captured.err
+        assert "RuntimeError" in captured.err
+        assert "synthetic failure" in captured.err
 
     def test_main_runs_script_with_workspace(self, tmp_path, monkeypatch):
         """
@@ -5411,6 +5595,230 @@ class TestSubmitPreparedJobRunIdTraversal:
         # The guard rejects traversal-style run_ids at the session boundary.
         assert "current_run_id" in body
         assert '".." in' in body or "'..' in" in body
+
+
+class TestCliCmdRenderNamespaceBackfill:
+    """``cli._cmd_render`` accepts an argparse.Namespace that only
+    carries the bare ``render`` subparser's attributes. It fills in
+    ``wait`` / ``follow_logs`` / ``max_wait_seconds`` /
+    ``allow_policy_risk`` / ``output_manifest`` defaults so the
+    delegate ``_cmd_deploy`` doesn't crash with ``AttributeError``.
+    """
+
+    def test_bare_render_namespace_does_not_raise_attributeerror(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) Calling ``_cmd_render`` with a Namespace
+                that lacks the deploy-only flags returns 0 without
+                ``AttributeError``.
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        # Minimal valid job config on disk so _cmd_render → _cmd_deploy →
+        # _load_payload finds something to validate.
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        # Stub heavy dependencies so the test stays hermetic.
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "rendered-yaml"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        # Build a bare Namespace carrying ONLY what the render subparser
+        # would set — no wait / follow_logs / max_wait_seconds /
+        # allow_policy_risk / output_manifest.
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+        )
+        result = cli_mod._cmd_render(args)
+        assert result == 0
+
+    def test_render_only_stdout_when_no_output_manifest(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        Tests:
+            (Test Case 1) Without ``output_manifest`` set on the
+                Namespace, ``_cmd_render`` prints the rendered manifest
+                to stdout (the documented fallback path).
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "yaml-from-stub"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+        )
+        cli_mod._cmd_render(args)
+        captured = capsys.readouterr().out
+        assert "yaml-from-stub" in captured
+
+
+class TestCliCmdDeployRenderOnlyCreatesParentDirs:
+    """``cli._cmd_deploy`` with ``--render-only`` + ``--output-manifest``
+    creates the parent directory if it doesn't exist (otherwise
+    ``write_text`` raises FileNotFoundError on a missing intermediate
+    directory like ``./out/dry-run/`` when ``./out`` doesn't exist).
+    """
+
+    def test_render_only_creates_missing_parent_dirs(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) Output path under a non-existent nested
+                subdirectory writes the manifest, creating the
+                missing parents.
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "rendered-yaml-payload"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        output_path = tmp_path / "deep" / "nested" / "manifest.yaml"
+        assert not output_path.parent.exists()
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+            render_only=True,
+            wait=False,
+            follow_logs=False,
+            max_wait_seconds=1,
+            allow_policy_risk=False,
+            output_manifest=str(output_path),
+        )
+        result = cli_mod._cmd_deploy(args)
+        assert result == 0
+        assert output_path.exists()
+        assert output_path.read_text(encoding="utf-8") == "rendered-yaml-payload"
+
+
+class TestPackageAnalysisBundleMetadataValidation:
+    """``package_analysis_bundle`` pre-validates ``metadata`` against
+    ``json.dumps`` before any I/O. Without this, the bundle would hash
+    every input, copy every file, then crash at the very end — wasting
+    the work.
+    """
+
+    def test_non_json_serializable_metadata_rejected_before_io(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``metadata={"path": Path("/tmp")}`` raises
+                ValueError mentioning "not JSON-serializable".
+            (Test Case 2) The metadata check runs before input-file
+                I/O — we pass a non-existent input path and confirm
+                no FileNotFoundError surfaces (metadata check fired
+                first).
+        """
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        nonexistent_input = str(tmp_path / "does_not_exist.bin")
+        with pytest.raises(ValueError, match="not JSON-serializable"):
+            package_analysis_bundle(
+                input_paths=[nonexistent_input],
+                run_id="run-meta",
+                output_dir=str(tmp_path / "out"),
+                output_format="workspace",
+                metadata={"path": Path("/tmp")},
+            )
+
+    def test_manifest_size_bytes_is_int_not_string(self, tmp_path):
+        """
+        ``manifest.json`` entries record ``size_bytes`` as an integer
+        (``json.loads`` returns ``int``), not a string. Readers should
+        not need to cast.
+
+        Tests:
+            (Test Case 1) ``isinstance(manifest["files"][0]["size_bytes"],
+                int)`` is True after a successful bundle.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        input_dir = tmp_path / "in"
+        input_dir.mkdir()
+        f = input_dir / "data.bin"
+        f.write_bytes(b"hello world")
+
+        bundle_path = package_analysis_bundle(
+            input_paths=[str(f)],
+            run_id="run-int",
+            output_dir=str(tmp_path / "out"),
+            output_format="workspace",
+        )
+
+        with zipfile.ZipFile(bundle_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+
+        assert manifest["files"]
+        # JSON int → Python int; a stringified int would deserialise as str.
+        first = manifest["files"][0]
+        assert isinstance(first["size_bytes"], int)
+        assert first["size_bytes"] == len(b"hello world")
 
 
 class TestPackageAnalysisBundleManifestCollision:

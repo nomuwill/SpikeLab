@@ -4001,6 +4001,56 @@ class TestComputeFootprintSimilarity:
             _compute_footprint_similarity(fp1, fp2)
 
 
+class TestComputeFootprintSimilaritySeenFiniteFlag:
+    """``_compute_footprint_similarity`` tracks "any finite sim seen"
+    with an explicit ``seen_finite`` flag rather than the previous
+    ``-np.inf`` sentinel. If every per-lag ``_cosine_sim`` is NaN the
+    function returns NaN; otherwise it returns the max of the finite
+    values.
+    """
+
+    def test_all_nan_per_lag_returns_nan(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Under a mock ``_cosine_sim`` that always
+                returns NaN, the function returns NaN (not -inf).
+        """
+        import spikelab.spikedata.utils as utils_mod
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        monkeypatch.setattr(utils_mod, "_cosine_sim", lambda a, b: np.nan)
+
+        fp1 = np.ones((2, 5))
+        fp2 = np.ones((2, 5))
+        result = _compute_footprint_similarity(fp1, fp2, max_lag=2)
+        assert np.isnan(result)
+
+    def test_max_across_finite_lags_is_returned(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Under a mock ``_cosine_sim`` that returns a
+                cycle of finite values [0.1, 0.5, 0.3] across lags,
+                the function returns 0.5 (the max).
+        """
+        import spikelab.spikedata.utils as utils_mod
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        values = iter([0.1, 0.5, 0.3])
+
+        def fake_cosine_sim(a, b):
+            try:
+                return next(values)
+            except StopIteration:
+                return 0.0
+
+        monkeypatch.setattr(utils_mod, "_cosine_sim", fake_cosine_sim)
+        fp1 = np.ones((2, 5))
+        fp2 = np.ones((2, 5))
+        # max_lag=1 → 3 lag candidates (-1, 0, 1).
+        result = _compute_footprint_similarity(fp1, fp2, max_lag=1)
+        assert result == pytest.approx(0.5)
+
+
 class TestComputeFootprintSimilarityAllZero:
     """``_compute_footprint_similarity`` zero-norm contract, pinned via
     ``_cosine_sim``'s documented behavior ("NaN if both zero-norm,

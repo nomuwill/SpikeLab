@@ -727,14 +727,15 @@ class TestWalkDiff:
         _walk_diff("", default, actual, out)
         assert out == [("section", {"x": 1}, 5)]
 
-    def test_lists_compared_as_leaves_not_recursed(self):
+    def test_equal_length_lists_recursed_element_wise(self):
         """
-        Lists are compared with ``!=``, not walked element-wise.
+        Lists of equal length are walked element-wise: each differing
+        index appears as its own ``"channels[i]"``-style diff entry,
+        not as one bulk list-vs-list entry.
 
         Tests:
-            (Test Case 1) Two unequal lists produce a single
-                top-level diff entry containing the entire lists,
-                not per-element entries.
+            (Test Case 1) Two equal-length lists differing at index 2
+                produce a single entry ``("channels[2]", 3, 4)``.
         """
         from spikelab.spike_sorting.report import _walk_diff
 
@@ -742,7 +743,26 @@ class TestWalkDiff:
         actual = {"channels": [1, 2, 4]}
         out: list = []
         _walk_diff("", default, actual, out)
-        assert out == [("channels", [1, 2, 3], [1, 2, 4])]
+        assert out == [("channels[2]", 3, 4)]
+
+    def test_unequal_length_lists_compared_as_leaves(self):
+        """
+        Lists of *different* lengths fall through to the leaf
+        ``!=`` comparison and produce a single bulk diff entry —
+        element-wise recursion is only safe when zip alignment is
+        unambiguous.
+
+        Tests:
+            (Test Case 1) Lists of lengths 2 vs 3 produce one top-
+                level diff entry containing the entire lists.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"channels": [1, 2]}
+        actual = {"channels": [1, 2, 3]}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("channels", [1, 2], [1, 2, 3])]
 
     def test_multiple_diffs_collected(self):
         """

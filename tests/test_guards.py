@@ -8008,19 +8008,23 @@ class TestValidateRecordingInputsEdges:
 
     def test_none_entry_raises(self):
         """
-        ``None`` in the recording inputs list raises ``ValueError``
-        flagging the caller bug.
+        ``None`` in the recording inputs list produces a fail-level
+        ``recording_input_none`` finding rather than raising. The
+        preflight collects all problems then surfaces them together,
+        so individual entries return findings.
 
         Tests:
-            (Test Case 1) Single ``None`` entry raises ``ValueError``
-                whose message contains ``"caller bug"``.
+            (Test Case 1) Single ``None`` entry produces one
+                fail-level finding with code ``recording_input_none``.
         """
         from spikelab.spike_sorting.guards._preflight import (
             _validate_recording_inputs,
         )
 
-        with pytest.raises(ValueError, match="caller bug"):
-            _validate_recording_inputs([None])
+        findings = _validate_recording_inputs([None])
+        assert len(findings) == 1
+        assert findings[0].level == "fail"
+        assert findings[0].code == "recording_input_none"
 
     def test_no_extension_path_yields_unfamiliar_warning(self, tmp_path):
         """

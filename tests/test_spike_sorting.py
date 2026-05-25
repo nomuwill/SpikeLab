@@ -8728,19 +8728,21 @@ class TestRunKilosortFormatParamsIsPure:
     def test_format_params_rounds_nt_to_multiple_of_32(self):
         """
         Concrete ``NT`` values are rounded down to the nearest multiple
-        of 32 (KS2 mex requirement).
+        of 32 (KS2 mex requirement). A ``NT`` below the 1024-sample
+        minimum (after rounding) raises ValueError — KS2 crashes with
+        an opaque error on smaller batches.
 
         Tests:
             (Test Case 1) NT=70_000 → 69984 (== 70000 // 32 * 32).
-            (Test Case 2) NT=64 → 64 (already a multiple of 32).
+            (Test Case 2) NT below 1024 after rounding raises ValueError.
         """
         from spikelab.spike_sorting.ks2_runner import RunKilosort
 
         out = RunKilosort.format_params({"car": False, "NT": 70_000, "ntbuff": 64})
         assert out["NT"] == 70_000 // 32 * 32
 
-        out = RunKilosort.format_params({"car": False, "NT": 64, "ntbuff": 64})
-        assert out["NT"] == 64
+        with pytest.raises(ValueError, match="1024-sample minimum"):
+            RunKilosort.format_params({"car": False, "NT": 64, "ntbuff": 64})
 
     def test_format_params_car_false_becomes_zero(self):
         """``car=False`` maps to integer 0 (the MATLAB ops template
@@ -8748,7 +8750,8 @@ class TestRunKilosortFormatParamsIsPure:
         """
         from spikelab.spike_sorting.ks2_runner import RunKilosort
 
-        out = RunKilosort.format_params({"car": False, "NT": 64, "ntbuff": 64})
+        # NT must be ≥ 1024 after rounding — pick a multiple-of-32 above that.
+        out = RunKilosort.format_params({"car": False, "NT": 2048, "ntbuff": 64})
         assert out["car"] == 0
 
 

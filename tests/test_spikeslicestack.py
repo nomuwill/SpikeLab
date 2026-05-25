@@ -402,6 +402,30 @@ class TestSpikeSliceStackConstructor:
         with pytest.raises(ValueError, match="fall outside"):
             SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 100.0)])
 
+    def test_spike_stack_spike_within_sd_length_but_outside_slice_tuple_accepted(
+        self,
+    ):
+        """
+        Tier H1: the per-slice validator bounds against ``sd.length``
+        (the SpikeData's own claimed window), not the slice-tuple
+        duration. A spike that fits the SpikeData but exceeds the
+        narrower tuple range must be ACCEPTED — the tuple is a
+        bookkeeping label, not a re-validation surface.
+
+        Tests:
+            (Test Case 1) ``sd.length=300``, tuple ``(0, 100)``, spike
+                at 250 ms — no exception (the spike is well inside
+                ``[sd.start_time, sd.start_time + sd.length]``).
+        """
+        sd = SpikeData([[250.0]], length=300.0)
+        # No ValueError — spike at 250 fits sd.length=300, even though
+        # 250 > 100 (the slice-tuple end).
+        stack = SpikeSliceStack(
+            spike_stack=[sd], times_start_to_end=[(0.0, 100.0)]
+        )
+        assert len(stack.spike_stack) == 1
+        np.testing.assert_array_equal(stack.spike_stack[0].train[0], [250.0])
+
     def test_spike_stack_zero_based_no_warning(self):
         """
         Constructing via spike_stack with correctly 0-based spike times

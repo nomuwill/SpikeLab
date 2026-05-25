@@ -2761,6 +2761,26 @@ class TestSpikeDataRates:
         rate = sd.binned_meanrate(bin_size=100.0)
         assert len(rate) == 1
 
+    def test_binned_n_zero_returns_zero_array(self):
+        """
+        ``SpikeData.binned`` short-circuits the N=0 case: a SpikeData
+        with no units returns a 1-D ndarray of length
+        ``ceil(length / bin_size)`` filled with zeros. Without the
+        short-circuit, the sparse-matrix sum path raises on the empty
+        input list (scipy version-dependent).
+
+        Tests:
+            (Test Case 1) ``binned(bin_size=10)`` on a length=100, N=0
+                SpikeData returns ``np.zeros(10)`` of dtype int64.
+            (Test Case 2) Mirrors ``binned_meanrate``'s zero-units
+                contract — both helpers are symmetric for N=0.
+        """
+        sd = SpikeData([], length=100.0, N=0)
+        result = sd.binned(bin_size=10.0)
+        assert result.shape == (10,)
+        np.testing.assert_array_equal(result, np.zeros(10, dtype=np.int64))
+        assert result.dtype == np.int64
+
     def test_binned_meanrate_n_zero_matches_sparse_raster_width(self):
         """
         binned_meanrate(N=0) returns a zero-vector whose length equals

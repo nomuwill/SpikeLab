@@ -294,6 +294,37 @@ class TestRateDataSubset:
         np.testing.assert_array_equal(dedup.inst_Frate_data[1], rd.inst_Frate_data[0])
         np.testing.assert_array_equal(dedup.inst_Frate_data[2], rd.inst_Frate_data[1])
 
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        because ``preserve_order`` has no effect under the
+        ``by``-attribute path.
+
+        Tests:
+            (Test Case 1) A UserWarning naming ``preserve_order`` and
+                ``by`` is emitted.
+            (Test Case 2) The resulting subset still succeeds.
+        """
+        import warnings as _warnings
+
+        rd = make_ratedata(n_units=3, n_times=20, step=1.0)
+        rd.neuron_attributes = [
+            {"region": "MO"},
+            {"region": "VIS"},
+            {"region": "MO"},
+        ]
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = rd.subset(["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        assert any(
+            "preserve_order" in m and "by" in m for m in warn_msgs
+        ), warn_msgs
+        assert sub.N == 2
+
     def test_subset_by_attribute(self):
         """
         Tests subset() with the by parameter for attribute-based selection.

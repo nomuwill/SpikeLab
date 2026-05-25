@@ -96,6 +96,22 @@ def package_analysis_bundle(
     output_base = Path(output_dir).resolve()
     output_base.mkdir(parents=True, exist_ok=True)
 
+    # Pre-validate that metadata is JSON-serializable. Without this
+    # guard we'd hash every input, copy every file, then crash on
+    # ``json.dumps`` at the very end — wasting the I/O. Catch it
+    # before any work happens.
+    if metadata is not None:
+        try:
+            json.dumps(metadata)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"metadata is not JSON-serializable: {exc}. The bundle "
+                "manifest is written via ``json.dumps``; convert any "
+                "non-serializable values (Path, datetime, ndarray, etc.) "
+                "to plain JSON types before passing to "
+                "package_analysis_bundle."
+            ) from exc
+
     # Reject duplicate basenames upfront. Two input paths with the
     # same filename (e.g. ``/dir_a/rec.bin`` and ``/dir_b/rec.bin``)
     # would silently overwrite each other in ``bundle_dir`` and the
@@ -139,7 +155,11 @@ def package_analysis_bundle(
                 {
                     "name": dest.name,
                     "sha256": _sha256(dest),
-                    "size_bytes": str(dest.stat().st_size),
+                    # size_bytes was previously stringified, which made
+                    # the manifest awkward to consume (downstream
+                    # readers had to ``int(entry["size_bytes"])`` every
+                    # time). Store as int for natural JSON typing.
+                    "size_bytes": int(dest.stat().st_size),
                 }
             )
 

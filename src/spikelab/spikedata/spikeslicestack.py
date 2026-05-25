@@ -183,13 +183,24 @@ class SpikeSliceStack:
                         "would silently mis-align downstream raster outputs."
                     )
 
-            # Validate that spike times are consistent with the slice
-            # duration. Spike times must be relative to the slice (0-based
-            # or event-centered), not absolute recording times.
+            # Validate that spike times are consistent with the slice's
+            # *intrinsic* length. Spike times must be relative to the
+            # slice (0-based or event-centered), not absolute recording
+            # times.
+            #
+            # Use ``sd.length`` (the SpikeData's own length) rather than
+            # ``end - start`` (the user-supplied tuple duration). The
+            # spike-time validity contract is determined by the SpikeData
+            # object itself; the absolute ``(start, end)`` tuple is a
+            # bookkeeping label that may legitimately differ from
+            # ``sd.length`` for hand-built stacks (e.g. a 1-second slice
+            # tagged with absolute timestamps `(120000, 121000)`).
+            # Driving the bounds check off the tuple duration silently
+            # misclassified in-range spikes as out-of-range whenever
+            # the two diverged.
             for i, (sd, (start, end)) in enumerate(zip(self.spike_stack, self.times)):
-                duration = end - start
                 expected_start = sd.start_time
-                expected_end = sd.start_time + duration
+                expected_end = sd.start_time + sd.length
                 for u, train in enumerate(sd.train):
                     if len(train) == 0:
                         continue
@@ -198,7 +209,8 @@ class SpikeSliceStack:
                             f"Slice {i}, unit {u}: spike times "
                             f"[{train[0]:.1f}, {train[-1]:.1f}] ms fall outside "
                             f"expected range [{expected_start:.1f}, "
-                            f"{expected_end:.1f}] ms. "
+                            f"{expected_end:.1f}] ms "
+                            f"(sd.start_time={sd.start_time}, sd.length={sd.length}). "
                             "Spike times must be relative to the slice (0-based "
                             "or event-centered), not absolute recording times."
                         )

@@ -823,11 +823,23 @@ class TestS3StorageClient:
         assert client.output_prefix_for_run("r1") == "s3://b/p/out/r1/"
         assert client.logs_prefix_for_run("r1") == "s3://b/p/lg/r1/"
 
-    def test_boto3_not_installed(self):
-        """ImportError raised when boto3 is not available."""
+    def test_boto3_not_installed_constructor_succeeds_for_uri_ops(self):
+        """boto3 missing is tolerated at construction (Tier H).
+
+        Pure-string operations like ``build_uri`` /
+        ``output_prefix_for_run`` / ``logs_prefix_for_run`` don't need
+        boto3, so the constructor no longer eagerly checks for the
+        optional dependency. The ImportError is deferred to the first
+        call that actually needs the boto3 client (upload, download,
+        list).
+        """
         with patch("spikelab.batch_jobs.storage_s3.boto3", None):
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+            # URI-only operations work without boto3.
+            assert client.output_prefix_for_run("run-1") == "s3://bucket/pfx/outputs/run-1/"
+            # Client-using operations raise the deferred ImportError.
             with pytest.raises(ImportError, match="boto3 is required"):
-                S3StorageClient(prefix="s3://bucket/pfx/")
+                client.upload_file(local_path=__file__, s3_uri="s3://bucket/pfx/x.bin")
 
     def test_build_uri_invalid_category_falls_back_to_inputs(self):
         """Invalid category string falls back to inputs template."""
@@ -5006,7 +5018,11 @@ class TestS3StorageDownloadOutputPathTraversalGuard:
 
         client = S3StorageClient.__new__(S3StorageClient)
         client.bucket = "test-bucket"
-        client._client = None  # never touched: validation fires first
+        # ``_client`` is now a lazy property; assign to the underlying
+        # ``_client_instance`` slot directly (also never touched, since
+        # validation fires first).
+        client._client_instance = None
+        client._boto3_kwargs = {}
 
         with pytest.raises(ValueError, match=r"path-traversal"):
             client.download_output(

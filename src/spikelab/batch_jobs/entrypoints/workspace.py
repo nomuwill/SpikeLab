@@ -166,11 +166,30 @@ def main() -> None:
         # The script receives the workspace as a global variable named
         # 'workspace'. It can modify it freely; the modified workspace
         # is saved and uploaded after the script completes.
+        #
+        # Wrap ``runpy.run_path`` so failures inside the analysis
+        # script surface with a clear stdout marker — the pod still
+        # exits non-zero (re-raise after the marker) but the operator
+        # can distinguish "script ran and raised" from "entrypoint
+        # bootstrap failed" or "result upload failed" when scanning
+        # pod logs.
+        import sys
+
         run_globals = {
             "workspace": workspace,
             "__name__": "__main__",
         }
-        runpy.run_path(script_path, init_globals=run_globals, run_name="__main__")
+        try:
+            runpy.run_path(
+                script_path, init_globals=run_globals, run_name="__main__"
+            )
+        except BaseException as exc:
+            print(
+                f"WORKSPACE_SCRIPT_FAILED: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
 
         # In case the script replaced the workspace object
         workspace = run_globals.get("workspace", workspace)

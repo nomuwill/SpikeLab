@@ -127,7 +127,14 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             run_id="dry-run",
         )
         if args.output_manifest:
-            Path(args.output_manifest).write_text(manifest, encoding="utf-8")
+            # Ensure the parent directory exists before writing.
+            # ``write_text`` raises ``FileNotFoundError`` if the parent
+            # is missing — easy to hit when the user passes a path
+            # like ``./out/dry-run/job.yaml`` and ``./out/dry-run``
+            # doesn't exist yet.
+            output_path = Path(args.output_manifest)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(manifest, encoding="utf-8")
             print(f"MANIFEST_PATH={args.output_manifest}")
         else:
             print(manifest)
@@ -170,14 +177,28 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
-    overrides = {
+    # ``_cmd_deploy`` reads several attributes that the ``render``
+    # subparser doesn't define (``wait``, ``follow_logs``,
+    # ``max_wait_seconds``, ``allow_policy_risk``, ``output_manifest``,
+    # ``render_only``). Without explicit defaults the
+    # ``args.render_only`` branch later in ``_cmd_deploy`` would
+    # ``AttributeError`` on a Namespace that didn't get those flags
+    # from argparse. Build a complete Namespace with safe defaults
+    # and let ``vars(args)`` provide any values the user did pass.
+    defaults = {
         "render_only": True,
         "wait": False,
         "follow_logs": False,
         "max_wait_seconds": 1,
         "allow_policy_risk": False,
+        "output_manifest": None,
     }
-    render_args = argparse.Namespace(**{**vars(args), **overrides})
+    render_args = argparse.Namespace(**{**defaults, **vars(args)})
+    # Force the render-specific values even if the caller passed
+    # something else (defensive against future arg additions).
+    render_args.render_only = True
+    render_args.wait = False
+    render_args.follow_logs = False
     return _cmd_deploy(render_args)
 
 

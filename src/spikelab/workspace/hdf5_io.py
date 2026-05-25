@@ -130,6 +130,16 @@ def load_workspace_full(path: str):
         ws._items = {}
         ws._index = {}
         for ns in f.keys():
+            # Skip any top-level group whose name starts with ``__``.
+            # This mirrors the ``__workspace_id__`` / ``__workspace_name__``
+            # / ``__created_at__`` attribute convention and reserves
+            # the namespace for future metadata sub-groups (e.g. a
+            # ``/__history__/`` audit log). Without this filter, the
+            # loader would treat such a group as a user namespace and
+            # ``_load_item`` would fail on its first child (missing
+            # ``__type__`` attr).
+            if ns.startswith("__"):
+                continue
             ns_grp = f[ns]
             ws._items[ns] = {}
             ws._index[ns] = {}

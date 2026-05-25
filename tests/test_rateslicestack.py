@@ -1082,6 +1082,43 @@ class TestSubset:
         np.testing.assert_array_equal(dedup.event_stack[1], mat[0])
         np.testing.assert_array_equal(dedup.event_stack[2], mat[1])
 
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        explaining that ``preserve_order`` has no effect under the
+        ``by``-attribute path.
+
+        Tests:
+            (Test Case 1) A UserWarning naming ``preserve_order`` and
+                ``by`` is emitted.
+            (Test Case 2) The resulting subset still succeeds.
+        """
+        import warnings as _warnings
+
+        mat = make_event_matrix(3, 10, 2)
+        rss = RateSliceStack(
+            event_matrix=mat,
+            times_start_to_end=[(0.0, 10.0), (10.0, 20.0)],
+            step_size=1.0,
+        )
+        rss.neuron_attributes = [
+            {"region": "MO"},
+            {"region": "VIS"},
+            {"region": "MO"},
+        ]
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = rss.subset(["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        assert any(
+            "preserve_order" in m and "by" in m for m in warn_msgs
+        ), warn_msgs
+        # Matching units come back in source order.
+        assert sub.event_stack.shape[0] == 2
+
     def test_subset_by_attribute(self):
         """
         Tests subset using the by parameter with neuron_attributes.

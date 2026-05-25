@@ -704,6 +704,16 @@ class SpikeData:
             binned_raster (numpy.ndarray): Array of the number of events in
                 each bin.
         """
+        # Short-circuit the zero-units case explicitly rather than
+        # relying on ``scipy.sparse.csr_matrix.sum(axis=0)`` returning
+        # a ``(1, T)`` row vector for ``(0, T)`` inputs — that
+        # behaviour is undocumented and has varied across scipy
+        # versions. ``binned_meanrate`` (line ~720) already has the
+        # explicit guard; mirror it here so both helpers are
+        # symmetric.
+        if self.N == 0:
+            n_bins = int(np.ceil(self.length / bin_size)) if self.length > 0 else 0
+            return np.zeros(n_bins, dtype=np.int64)
         # sum(0) on CSR returns a (1, T) matrix in older SciPy; flatten to 1D array
         return np.asarray(self.sparse_raster(bin_size).sum(0)).ravel()  # type: ignore
 

@@ -3270,6 +3270,65 @@ from spikelab.spikedata.utils import _validate_time_start_to_end
 class TestValidateTimeStartToEnd:
     """Edge case tests for _validate_time_start_to_end."""
 
+    def test_unsorted_input_returns_sorted_and_warns(self):
+        """
+        ``_validate_time_start_to_end`` always returns windows sorted
+        by start time. When the input was NOT already sorted, the
+        function emits a UserWarning naming the parallel-array
+        misalignment risk so callers that pair the times with an
+        external positional array (e.g. ``spike_stack``) see the
+        reorder rather than discovering a silent index shuffle.
+
+        Tests:
+            (Test Case 1) Input ``[(100, 200), (50, 150)]`` returns
+                ``[(50, 150), (100, 200)]`` (sorted).
+            (Test Case 2) A UserWarning is emitted whose message
+                mentions parallel arrays / misalignment.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            result = _validate_time_start_to_end(
+                [(100.0, 200.0), (50.0, 150.0)]
+            )
+
+        assert result == [(50.0, 150.0), (100.0, 200.0)]
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        relevant = [
+            m
+            for m in warn_msgs
+            if "parallel" in m.lower() and "misalign" in m.lower()
+        ]
+        assert relevant, warn_msgs
+
+    def test_already_sorted_input_does_not_warn(self):
+        """
+        When the caller passes already-sorted windows, no reorder
+        warning fires (the function only warns when the sort changed
+        the order).
+
+        Tests:
+            (Test Case 1) Sorted input returns unchanged.
+            (Test Case 2) No UserWarning mentioning "misalignment" is
+                emitted.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            result = _validate_time_start_to_end(
+                [(50.0, 150.0), (100.0, 200.0)]
+            )
+
+        assert result == [(50.0, 150.0), (100.0, 200.0)]
+        warn_msgs = [str(rec.message) for rec in w]
+        assert not any(
+            "misalign" in m.lower() for m in warn_msgs
+        ), warn_msgs
+
     def test_all_negative_start_preserved(self):
         """
         Windows with negative start times are preserved (not filtered).

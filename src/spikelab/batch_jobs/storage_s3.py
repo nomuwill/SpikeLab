@@ -38,22 +38,67 @@ class S3StorageClient:
         self.endpoint_url = endpoint_url
         self.region_name = region_name
         self._templates = path_templates or StoragePathTemplates()
-        if boto3 is None:
-            raise ImportError("boto3 is required for S3 storage: pip install boto3")
-        self._client = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            region_name=region_name,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            aws_session_token=aws_session_token,
-        )
+        # When boto3 is available, eagerly construct the client so
+        # tests that patch ``spikelab.batch_jobs.storage_s3.boto3``
+        # for the duration of the constructor get the patched client
+        # (the original behaviour). When boto3 is None, defer the
+        # ImportError until a method that actually needs the client
+        # is called — this lets pure-string operations
+        # (``build_uri``, ``output_prefix_for_run``,
+        # ``logs_prefix_for_run``) succeed on hosts without the
+        # optional dependency installed, e.g. ``cli._cmd_render`` →
+        # ``_build_session`` → here.
+        self._boto3_kwargs = {
+            "endpoint_url": endpoint_url,
+            "region_name": region_name,
+            "aws_access_key_id": aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "aws_session_token": aws_session_token,
+        }
+        if boto3 is not None:
+            self._client_instance = boto3.client("s3", **self._boto3_kwargs)
+        else:
+            self._client_instance = None
+
+    @property
+    def _client(self):
+        """Return the boto3 S3 client, deferring the ImportError to
+        first use when boto3 was not available at construction time.
+        """
+        if self._client_instance is None:
+            if boto3 is None:
+                raise ImportError(
+                    "boto3 is required for S3 storage: pip install boto3"
+                )
+            self._client_instance = boto3.client("s3", **self._boto3_kwargs)
+        return self._client_instance
 
     def build_uri(self, *, run_id: str, filename: str, category: str = "inputs") -> str:
-        """Build an S3 URI for a file using the active path templates."""
+        """Build an S3 URI for a file using the active path templates.
+
+        ``category`` should be one of the keys defined on
+        ``StoragePathTemplates`` (``"inputs"``, ``"outputs"``,
+        ``"logs"``). An unknown category silently falls back to the
+        ``inputs`` template and emits a ``UserWarning`` so typos
+        ("input", "logs/", etc.) don't quietly land in the wrong S3
+        prefix.
+        """
         if not self.prefix:
             raise ValueError(
                 "S3 prefix is not configured. Set it in the profile or command."
+            )
+        if not hasattr(self._templates, category):
+            import warnings
+
+            known = sorted(
+                k for k in vars(self._templates).keys() if not k.startswith("_")
+            )
+            warnings.warn(
+                f"build_uri: unknown category={category!r}; falling back "
+                f"to the ``inputs`` template. Known categories: {known}. "
+                "Check for typos.",
+                UserWarning,
+                stacklevel=2,
             )
         template = getattr(self._templates, category, self._templates.inputs)
         return template.format(prefix=self.prefix, run_id=run_id, filename=filename)

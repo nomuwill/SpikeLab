@@ -2198,7 +2198,14 @@ def _compute_footprint_similarity(fp1, fp2, max_lag=5):
         )
 
     n_samples = fp1.shape[1]
-    best = -np.inf
+    # Track "any finite sim seen" with an explicit flag rather than
+    # comparing the running best against ``-np.inf``. If
+    # ``_cosine_sim`` ever returns ``-inf`` (e.g. via a future refactor
+    # that propagates a degenerate denominator) the sentinel
+    # comparison would silently return ``-inf`` as a real similarity;
+    # the flag makes the "no finite value seen" contract unambiguous.
+    best = 0.0
+    seen_finite = False
     for lag in range(-max_lag, max_lag + 1):
         if lag == 0:
             vec1 = fp1.ravel()
@@ -2212,7 +2219,10 @@ def _compute_footprint_similarity(fp1, fp2, max_lag=5):
             vec1 = fp1[:, : n_samples + lag].ravel()
             vec2 = fp2[:, -lag:].ravel()
         sim = _cosine_sim(vec1, vec2)
-        if not np.isnan(sim) and sim > best:
+        if np.isnan(sim):
+            continue
+        if not seen_finite or sim > best:
             best = sim
+            seen_finite = True
 
-    return float(best) if best > -np.inf else np.nan
+    return float(best) if seen_finite else np.nan

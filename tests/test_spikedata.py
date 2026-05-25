@@ -1169,6 +1169,46 @@ class TestSpikeDataSlicing:
         floats = sd.subset(units=[2.0, 0.0], preserve_order=True)
         assert [a["unit_id"] for a in floats.neuron_attributes] == [2, 0]
 
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        explaining that ``preserve_order`` has no effect under the
+        ``by``-attribute path (attribute values have no positional
+        correspondence to unit indices).
+
+        Tests:
+            (Test Case 1) UserWarning is emitted.
+            (Test Case 2) The warning message contains ``preserve_order``
+                and ``by``.
+            (Test Case 3) The subset still succeeds and returns matching
+                units in self.train order.
+        """
+        import warnings as _warnings
+
+        sd = SpikeData(
+            [[1.0], [2.0], [3.0]],
+            length=50.0,
+            neuron_attributes=[
+                {"region": "MO"},
+                {"region": "VIS"},
+                {"region": "MO"},
+            ],
+        )
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = sd.subset(units=["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [
+            str(rec.message) for rec in w if rec.category is UserWarning
+        ]
+        relevant = [
+            m for m in warn_msgs if "preserve_order" in m and "by" in m
+        ]
+        assert relevant, warn_msgs
+        # Matching units come back in self.train order (0, 2).
+        assert sub.N == 2
+
     def test_subtime_start_equals_end(self):
         """
         subtime raises ValueError when start equals end.
@@ -1405,6 +1445,31 @@ class TestSpikeDataSlicing:
         assert sub.N == 0
         assert sub.length == 10.0
         assert len(sub.train) == 0
+
+    def test_subset_empty_preserves_empty_neuron_attributes(self):
+        """
+        ``SpikeData.subset([])`` on a SpikeData with neuron_attributes
+        returns an instance whose ``neuron_attributes`` is the empty
+        list ``[]`` — NOT ``None``. The empty-list distinction matters:
+        ``None`` means "no attributes were ever attached", while ``[]``
+        means "attributes were present but every unit got filtered
+        out". Downstream code that branches on ``if ...
+        neuron_attributes is None`` would silently disagree with
+        callers asking ``len(...) == 0``.
+
+        Tests:
+            (Test Case 1) ``sd.subset([])`` returns an instance whose
+                ``neuron_attributes`` is the empty list ``[]``, not
+                ``None``.
+        """
+        sd = SpikeData(
+            [np.array([1.0]), np.array([2.0])],
+            length=10.0,
+            neuron_attributes=[{"region": "MO"}, {"region": "VIS"}],
+        )
+        sub = sd.subset([])
+        assert sub.neuron_attributes == []
+        assert sub.neuron_attributes is not None
 
     def test_subset_negative_unit_index(self):
         """

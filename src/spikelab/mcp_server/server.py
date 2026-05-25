@@ -4328,16 +4328,33 @@ def _sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
 
         if isinstance(obj, _np.ndarray):
             if obj.size > MAX_INLINE_ARRAY_SIZE:
-                raise ValueError(
-                    f"numpy array with {obj.size} elements (shape "
-                    f"{obj.shape}, dtype {obj.dtype}) exceeds the inline "
-                    f"JSON cap of {MAX_INLINE_ARRAY_SIZE}. Either store "
-                    "the array in the workspace and return its "
-                    "(namespace, key) reference, or raise the cap by "
-                    "setting ``spikelab.mcp_server.server."
-                    "MAX_INLINE_ARRAY_SIZE`` to a larger value before "
-                    "invoking the tool."
-                )
+                # Degrade gracefully instead of raising. Tools that
+                # store their actual result in the workspace and only
+                # *embed* the array in the response dict (e.g.
+                # fetch_workspace_item for a large slice-stack's
+                # ``times``) would otherwise propagate a ValueError
+                # after the workspace store had already succeeded —
+                # the agent sees an error and does not realise the
+                # result is queryable via fetch_workspace_item. By
+                # returning a summary marker instead, the response
+                # parses successfully and the agent can decide
+                # whether to fetch the array via a follow-up call.
+                return {
+                    "__elided_ndarray__": True,
+                    "reason": (
+                        f"size {obj.size} exceeds inline JSON cap of "
+                        f"{MAX_INLINE_ARRAY_SIZE}"
+                    ),
+                    "shape": list(obj.shape),
+                    "dtype": str(obj.dtype),
+                    "size": int(obj.size),
+                    "hint": (
+                        "Fetch via fetch_workspace_item if a workspace "
+                        "key was returned, or raise "
+                        "spikelab.mcp_server.server.MAX_INLINE_ARRAY_SIZE "
+                        "before invoking the tool."
+                    ),
+                }
             if obj.ndim == 0:
                 # 0-D array: ``.tolist()`` returns a Python scalar (not
                 # a list), so the list comprehension below would raise

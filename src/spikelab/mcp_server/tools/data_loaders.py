@@ -494,10 +494,18 @@ async def load_from_kilosort(
     region_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Load spike data from KiloSort/Phy output folder.
+    Load spike data from a **local** KiloSort/Phy output folder.
+
+    .. note::
+        S3 folder paths are not currently supported and raise
+        ``NotImplementedError``. The ``aws_*`` / ``region_name``
+        arguments are accepted for forward-compatibility but ignored
+        until the S3 path is implemented. Download the KiloSort
+        output folder locally and pass that path for now.
 
     Args:
-        folder_path: Local folder path or S3 URL prefix to KiloSort output folder
+        folder_path: Local folder path to KiloSort output folder
+            (passing an ``s3://`` URL raises ``NotImplementedError``)
         fs_Hz: Sampling frequency in Hz
         spike_times_file: Filename for spike_times.npy
         spike_clusters_file: Filename for spike_clusters.npy
@@ -507,10 +515,10 @@ async def load_from_kilosort(
         length_ms: Optional recording length in ms
         workspace_id: Workspace to store the SpikeData in; creates a new one if empty
         namespace: Recording namespace within the workspace; derived from folder name if empty
-        aws_access_key_id: Optional AWS access key for S3
-        aws_secret_access_key: Optional AWS secret key for S3
-        aws_session_token: Optional AWS session token for S3
-        region_name: Optional AWS region name
+        aws_access_key_id: Reserved for future S3 support; currently ignored.
+        aws_secret_access_key: Reserved for future S3 support; currently ignored.
+        aws_session_token: Reserved for future S3 support; currently ignored.
+        region_name: Reserved for future S3 support; currently ignored.
 
     Returns:
         Dictionary with 'workspace_id', 'namespace', 'workspace_key', and 'info'

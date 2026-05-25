@@ -760,10 +760,35 @@ class LazyAnalysisWorkspace(AnalysisWorkspace):
     # Cleanup
     # ------------------------------------------------------------------
 
+    def close(self) -> None:
+        """Explicitly release the backing temp HDF5 file.
+
+        ``__del__`` is unreliable for cleanup (not called during
+        interpreter shutdown, not called if the workspace is captured
+        in a closure, not called for objects in reference cycles), so
+        consumers that need deterministic cleanup — notably
+        :meth:`WorkspaceManager.delete_workspace` — should call this
+        method first. Safe to call multiple times.
+        """
+        path = getattr(self, "_h5_path", None)
+        if path is not None and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                # Best-effort: another process may have unlinked, or
+                # the path may be on a read-only mount. Drop the
+                # reference so a second close() doesn't retry.
+                pass
+        self._h5_path = None
+        # Invalidate the in-memory index so subsequent reads fail
+        # loudly rather than silently returning stale data after the
+        # backing file is gone.
+        self._index = {}
+
     def __del__(self) -> None:
+        # Best-effort fallback; explicit ``close()`` is preferred.
         try:
-            if hasattr(self, "_h5_path") and os.path.exists(self._h5_path):
-                os.unlink(self._h5_path)
+            self.close()
         except Exception:
             pass
 
@@ -838,6 +863,14 @@ class WorkspaceManager:
         with self._lock:
             if workspace_id not in self._workspaces:
                 raise KeyError(f"workspace not found: {workspace_id!r}")
+            ws = self._workspaces[workspace_id]
+            # Release the backing temp HDF5 file deterministically
+            # when the workspace is a LazyAnalysisWorkspace. Without
+            # this, the temp file leaked until ``__del__`` ran (which
+            # is unreliable on Windows and during interpreter
+            # shutdown).
+            if isinstance(ws, LazyAnalysisWorkspace):
+                ws.close()
             del self._workspaces[workspace_id]
 
     def list_workspaces(self) -> List[dict]:

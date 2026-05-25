@@ -3392,23 +3392,33 @@ class TestKubernetesBatchJobBackendK8sClientPath:
         assert result == "file-job"
 
     def test_apply_manifest_k8s_client_invalid_yaml(self):
-        """apply_manifest via K8s client with invalid YAML raises."""
+        """apply_manifest via K8s client with invalid YAML raises ValueError.
+
+        Updated for the apply_manifest rework (Tier E): non-dict
+        payloads (and dict payloads missing metadata.name) now raise
+        a clear ValueError mentioning that the Python-client path
+        needs a structured manifest, instead of the previous mix of
+        TypeError/KeyError/AttributeError surfaced from whatever
+        attribute access happened to fail first.
+        """
         backend = KubernetesBatchJobBackend(namespace="test-ns")
         mock_batch_api = MagicMock()
         backend._batch_api = mock_batch_api
 
-        # YAML that parses as a string, not a dict — will fail on metadata access
-        with pytest.raises((TypeError, KeyError, AttributeError)):
+        with pytest.raises(ValueError, match="metadata.name"):
             backend.apply_manifest("just a plain string without yaml structure")
 
     def test_apply_manifest_k8s_client_missing_metadata_name(self):
-        """apply_manifest via K8s client raises when metadata.name is missing."""
+        """apply_manifest via K8s client raises ValueError when
+        metadata.name is missing — clearer than the previous KeyError
+        propagated from raw dict access.
+        """
         backend = KubernetesBatchJobBackend(namespace="test-ns")
         mock_batch_api = MagicMock()
         backend._batch_api = mock_batch_api
 
         manifest = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  labels: {}\n"
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="metadata.name"):
             backend.apply_manifest(manifest)
 
     def test_delete_job_k8s_client(self):

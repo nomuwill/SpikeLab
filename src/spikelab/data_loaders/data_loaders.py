@@ -771,6 +771,12 @@ def load_spikedata_from_nwb(
                     "/units/electrodes_index and /units/electrodes datasets.",
                     UserWarning,
                 )
+                # Clip the index so _split_by_index's strict
+                # overflow check doesn't promote the warning to an
+                # error. We've already told the caller about the
+                # truncation; preserve the pre-refactor lenient
+                # contract for this specific NWB-in-the-wild quirk.
+                elec_idx = np.minimum(elec_idx, len(elec_flat))
             # Use the shared splitter so the leading-zero (length N+1)
             # NWB convention is honoured the same way it is for
             # spike_times_index. The previous inline ``for stop in

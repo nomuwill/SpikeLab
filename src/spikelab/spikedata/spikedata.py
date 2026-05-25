@@ -2643,14 +2643,14 @@ class SpikeData:
         """
         if window_ms < 1:
             raise ValueError("window_ms must be at least 1.")
+        if self.N < 2:
+            raise ValueError("compute_spike_trig_pop_rate requires at least 2 units.")
         if cut_outer < 0 or cut_outer >= window_ms:
             raise ValueError(
                 f"cut_outer ({cut_outer}) must be in [0, window_ms={window_ms}); "
                 "a larger value would leave an empty trimmed array and the "
                 "downstream np.argmax would raise."
             )
-        if self.N < 2:
-            raise ValueError("compute_spike_trig_pop_rate requires at least 2 units.")
         if not any(len(ts) > 0 for ts in self.train):
             raise ValueError(
                 "compute_spike_trig_pop_rate requires at least one spike across all "

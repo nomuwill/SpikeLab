@@ -87,7 +87,18 @@ class RunSession:
         uploaded_input_uri: str,
         job_type: str,
     ) -> SubmitResult:
-        """Render manifest, apply to cluster, return result."""
+        """Render manifest, apply to cluster, return result.
+
+        Two manifests are rendered: a real one (with credentials
+        intact) that is written to a tempfile and applied to the
+        cluster, and a redacted one (with sensitive env values
+        masked) returned in ``SubmitResult.manifest_yaml``. The
+        latter is surfaced to logs and audit trails — without the
+        redaction, a caller who put credentials directly into
+        ``container.env`` would leak them into log/audit storage.
+        """
+        from .credentials import redact_sensitive_map
+
         job_name = self._build_job_name(job_spec.name_prefix)
         manifest_text = self.render_manifest(
             job_name=job_name, job_spec=job_spec, run_id=run_id
@@ -106,9 +117,24 @@ class RunSession:
         finally:
             os.unlink(manifest_path)
 
+        # Render a second manifest with sensitive env values redacted
+        # for the SubmitResult surface. The redaction policy lives in
+        # ``redact_sensitive_map`` (word-boundary SECRET / TOKEN /
+        # PASSWORD), so any env var the caller wires up through that
+        # naming convention is automatically scrubbed here without a
+        # separate allow-list.
+        redacted_env = redact_sensitive_map(dict(job_spec.container.env))
+        redacted_container = job_spec.container.model_copy(
+            update={"env": redacted_env}
+        )
+        redacted_spec = job_spec.model_copy(update={"container": redacted_container})
+        redacted_manifest = self.render_manifest(
+            job_name=job_name, job_spec=redacted_spec, run_id=run_id
+        )
+
         return SubmitResult(
             job_name=job_name,
-            manifest_yaml=manifest_text,
+            manifest_yaml=redacted_manifest,
             run_id=run_id,
             uploaded_input_uri=uploaded_input_uri,
             output_prefix=self.storage.output_prefix_for_run(run_id),

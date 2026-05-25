@@ -392,18 +392,34 @@ class AnalysisWorkspace:
 
         dump_workspace(self, path)
 
+        # Write JSON via temp-file + os.replace so a partial write
+        # (disk full, permission, interrupted process) can't leave a
+        # stale ``{path}.json`` next to the just-written ``{path}.h5``.
+        # ``describe()`` consumers reading the JSON directly would
+        # otherwise see metadata that disagrees with the HDF5 contents.
         json_path = f"{path}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "workspace_id": self.workspace_id,
-                    "name": self.name,
-                    "created_at": self.created_at,
-                    "index": self._index,
-                },
-                f,
-                indent=2,
-            )
+        tmp_path = f"{json_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "workspace_id": self.workspace_id,
+                        "name": self.name,
+                        "created_at": self.created_at,
+                        "index": self._index,
+                    },
+                    f,
+                    indent=2,
+                )
+            os.replace(tmp_path, json_path)
+        except Exception:
+            # Best-effort cleanup of the temp file on failure; the
+            # underlying error is re-raised regardless.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, path: str) -> "AnalysisWorkspace":

@@ -182,8 +182,29 @@ class KubernetesBatchJobBackend:
                 yield str(line)
             return
 
-        text = self._core_api.read_namespaced_pod_log(
-            name=pod_name, namespace=self.namespace
+        # Stream the (non-follow) log via ``_preload_content=False``
+        # so multi-GB pod logs don't materialise as a single string in
+        # memory. The kubernetes client returns an
+        # ``urllib3.response.HTTPResponse`` in this mode which exposes
+        # ``stream(chunk_size)`` for chunked reading. We buffer
+        # partial lines across chunks and yield only when we see a
+        # newline (or at EOF), matching the line-at-a-time contract
+        # used by the kubectl-fallback path above.
+        response = self._core_api.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=self.namespace,
+            _preload_content=False,
         )
-        for line in text.splitlines():
-            yield line
+        try:
+            buf = ""
+            for chunk in response.stream(amt=64 * 1024, decode_content=True):
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8", errors="replace")
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    yield line
+            if buf:
+                yield buf
+        finally:
+            response.release_conn()

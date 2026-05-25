@@ -518,8 +518,24 @@ def export_to_pickle(
         dirpath = os.path.dirname(filepath)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
-        with open(filepath, "wb") as f:
-            pickle.dump(sd, f, protocol=protocol)
+        # Write atomically: serialise into ``{filepath}.tmp`` first
+        # and ``os.replace`` onto the final path on success. Without
+        # this, a failed pickle.dump (disk full, segfault inside a
+        # user-supplied ``__reduce__``, etc.) would leave the
+        # already-truncated destination as a corrupt file — silently
+        # destroying any previous good export. ``os.replace`` is
+        # atomic on POSIX and NTFS.
+        tmp_path = f"{filepath}.tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(sd, f, protocol=protocol)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
         return filepath
 
 

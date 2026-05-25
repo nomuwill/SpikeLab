@@ -65,21 +65,41 @@ def dump_workspace(ws, path: str) -> None:
     Parameters:
         ws (AnalysisWorkspace): The workspace to serialise.
         path (str): Base path without file extension.
+
+    Notes:
+        - The HDF5 file is written to a sibling ``.tmp`` path and
+          ``os.replace``-d into position on success. A partial write
+          (disk full, permission, interrupted process) therefore can
+          no longer leave a half-populated ``{path}.h5`` next to a
+          stale ``{path}.json`` index.
     """
+    import os
 
     h5_path = f"{path}.h5"
-    with h5py.File(h5_path, "w") as f:
-        f.attrs["__workspace_id__"] = ws.workspace_id
-        f.attrs["__workspace_name__"] = ws.name or ""
-        f.attrs["__created_at__"] = ws.created_at
-        for ns, keys in ws._items.items():
-            ns_grp = f.require_group(ns)
-            for key, obj in keys.items():
-                key_grp = ns_grp.require_group(key)
-                index_entry = ws._index.get(ns, {}).get(key, {})
-                created_at = index_entry.get("created_at", time.time())
-                note = index_entry.get("note")
-                _dump_item(key_grp, obj, created_at, note)
+    tmp_path = f"{h5_path}.tmp"
+    try:
+        with h5py.File(tmp_path, "w") as f:
+            f.attrs["__workspace_id__"] = ws.workspace_id
+            f.attrs["__workspace_name__"] = ws.name or ""
+            f.attrs["__created_at__"] = ws.created_at
+            for ns, keys in ws._items.items():
+                ns_grp = f.require_group(ns)
+                for key, obj in keys.items():
+                    key_grp = ns_grp.require_group(key)
+                    index_entry = ws._index.get(ns, {}).get(key, {})
+                    created_at = index_entry.get("created_at", time.time())
+                    note = index_entry.get("note")
+                    _dump_item(key_grp, obj, created_at, note)
+        os.replace(tmp_path, h5_path)
+    except BaseException:
+        # Best-effort cleanup; the underlying error is re-raised
+        # regardless. ``BaseException`` is used so KeyboardInterrupt
+        # mid-write also tidies up the half-written tmp.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_workspace_full(path: str):

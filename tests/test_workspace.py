@@ -5399,8 +5399,11 @@ class TestLazyAnalysisWorkspaceCloseDeleteCleanup:
         manager.delete_workspace(ws.workspace_id)
 
         assert not os.path.exists(h5_path)
+        # ``get_workspace`` returns None for unknown IDs (the public
+        # contract); a second ``delete_workspace`` raises KeyError.
+        assert manager.get_workspace(ws.workspace_id) is None
         with pytest.raises(KeyError):
-            manager.get_workspace(ws.workspace_id)
+            manager.delete_workspace(ws.workspace_id)
 
     @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
     def test_double_close_is_noop(self):

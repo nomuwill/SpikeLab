@@ -59,7 +59,16 @@ class S3StorageClient:
         return template.format(prefix=self.prefix, run_id=run_id, filename=filename)
 
     def upload_file(self, *, local_path: str, s3_uri: str) -> str:
-        """Upload a local file to S3 and return the URI."""
+        """Upload a local file to S3 and return the URI.
+
+        Raises ``FileNotFoundError`` if ``local_path`` does not exist
+        rather than deferring to boto3's less informative error.
+        """
+        if not Path(local_path).is_file():
+            raise FileNotFoundError(
+                f"upload_file: local_path={local_path!r} does not exist "
+                "or is not a regular file."
+            )
         bucket, key = parse_s3_url(s3_uri)
         self._client.upload_file(local_path, bucket, key)
         return s3_uri

@@ -37,6 +37,15 @@ def _apply_image_selection(
     image_profile: str | None,
     image_override: str | None,
 ) -> Dict[str, Any]:
+    # Deep-copy the payload before mutating. Callers (notably
+    # ``_cmd_render`` which dispatches to ``_cmd_deploy``) reuse the
+    # parsed config dict across invocations; in-place mutation here
+    # leaked the resolved image into the caller's dict, surprising
+    # any caller that re-applied a different image_profile on the
+    # second call.
+    import copy
+
+    payload = copy.deepcopy(payload)
     container = payload.get("container")
     if container is None:
         container = {}

@@ -2434,9 +2434,7 @@ class TestRunSessionRetrieve:
 
         # Fully prefixed listing key — common in real S3 listings — must
         # not produce a drive-root path when concatenated with local_dir.
-        storage.list_output_files.return_value = [
-            "pfx/outputs/run-1/rec1_curated.pkl"
-        ]
+        storage.list_output_files.return_value = ["pfx/outputs/run-1/rec1_curated.pkl"]
         storage.output_prefix_for_run.return_value = "s3://bucket/pfx/outputs/run-1/"
 
         observed_local_paths: list[str] = []

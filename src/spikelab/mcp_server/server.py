@@ -237,8 +237,11 @@ async def _list_tools() -> list[types.Tool]:
             types.Tool(
                 name="load_from_kilosort",
                 description=(
-                    "Load spike data from KiloSort/Phy output folder. Stores "
-                    "SpikeData at (namespace, 'spikedata') in the workspace."
+                    "Load spike data from a LOCAL KiloSort/Phy output folder. "
+                    "Stores SpikeData at (namespace, 'spikedata') in the "
+                    "workspace. S3 folder paths are not yet supported and "
+                    "raise NotImplementedError — download the folder locally "
+                    "first."
                 ),
                 inputSchema={
                     "type": "object",

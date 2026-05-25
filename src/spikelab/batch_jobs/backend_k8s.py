@@ -48,7 +48,29 @@ class KubernetesBatchJobBackend:
         return out.stdout.strip()
 
     def apply_manifest(self, manifest_path_or_str: str) -> str:
-        """Apply a job manifest by YAML file path or raw YAML string."""
+        """Apply a job manifest by YAML file path or raw YAML string.
+
+        Raises ``ValueError`` if the manifest's ``metadata.namespace``
+        is set and disagrees with the backend's ``self.namespace`` —
+        this would otherwise silently deploy into the backend's
+        namespace, contrary to the rendered manifest. Manifests with
+        no ``metadata.namespace`` are accepted and assigned the
+        backend's namespace as before.
+        """
+
+        def _check_manifest_namespace(payload: Any) -> None:
+            try:
+                manifest_ns = (payload or {}).get("metadata", {}).get("namespace")
+            except AttributeError:
+                manifest_ns = None
+            if manifest_ns and manifest_ns != self.namespace:
+                raise ValueError(
+                    f"Manifest metadata.namespace={manifest_ns!r} disagrees "
+                    f"with backend namespace={self.namespace!r}. Refusing "
+                    "to deploy a manifest into a different namespace than "
+                    "the rendered one."
+                )
+
         if self._batch_api is None:
             if not self.use_kubectl_fallback:
                 raise RuntimeError(
@@ -56,9 +78,13 @@ class KubernetesBatchJobBackend:
                 )
             path = Path(manifest_path_or_str)
             if path.exists():
+                _check_manifest_namespace(
+                    yaml.safe_load(path.read_text(encoding="utf-8"))
+                )
                 return self._run_kubectl(
                     ["apply", "-f", str(path), "-n", self.namespace]
                 )
+            _check_manifest_namespace(yaml.safe_load(manifest_path_or_str))
             temp_path = None
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".yaml", encoding="utf-8", delete=False
@@ -78,6 +104,7 @@ class KubernetesBatchJobBackend:
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         else:
             payload = yaml.safe_load(manifest_path_or_str)
+        _check_manifest_namespace(payload)
         self._batch_api.create_namespaced_job(namespace=self.namespace, body=payload)
         return payload["metadata"]["name"]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -111,7 +112,21 @@ class JobSpec(BaseModel):
         safe = re.sub(r"-+", "-", safe)
         # Truncate, then strip leading/trailing hyphens so the result never
         # ends in '-' after truncation (RFC 1123 violation).
+        pre_truncate = safe
         safe = safe[:40].strip("-")
+        # Warn when the input was meaningfully truncated. The operator
+        # may have expected the full string to survive into the Job
+        # name; surfacing the truncation lets them shorten the prefix
+        # upstream rather than discovering a mangled name in kubectl.
+        if len(pre_truncate) > 40 and safe and safe != pre_truncate:
+            warnings.warn(
+                f"name_prefix={value!r} truncated to {safe!r} to fit the "
+                "40-character RFC 1123 budget. Job names that need to "
+                "round-trip the full prefix should pass a shorter "
+                "name_prefix upstream.",
+                UserWarning,
+                stacklevel=2,
+            )
         if not safe:
             raise ValueError(
                 f"name_prefix={value!r} has no usable ASCII content (after "

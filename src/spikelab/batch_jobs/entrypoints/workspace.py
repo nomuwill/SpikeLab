@@ -56,21 +56,33 @@ def _find_workspace_h5(extract_dir: Path) -> Path:
     import h5py
 
     candidates: List[Path] = []
+    skipped: List[str] = []
     for h5_path in extract_dir.rglob("*.h5"):
         try:
             with h5py.File(h5_path, "r") as f:
                 if "__workspace_id__" in f.attrs:
                     candidates.append(h5_path)
-        except OSError:
-            # Not a valid HDF5 file (e.g. truncated, wrong format) —
-            # skip; clearly not a workspace.
+        except OSError as exc:
+            # Likely a non-HDF5 file (or a truncated one) that just
+            # happens to end in ``.h5``. Record the path + reason so
+            # the "no workspace found" branch below can tell the
+            # operator which files were skipped — without this, a
+            # genuinely broken HDF5 file looked exactly like "no
+            # workspace in the bundle" with no diagnostic.
+            skipped.append(f"{h5_path}: {exc}")
             continue
     if not candidates:
-        raise FileNotFoundError(
+        msg = (
             "No SpikeLab workspace .h5 found in input bundle. "
             "Expected a file with the __workspace_id__ attribute "
             "(written by AnalysisWorkspace.save)."
         )
+        if skipped:
+            msg += (
+                " The following .h5 files were unreadable and could "
+                "not be inspected:\n  - " + "\n  - ".join(skipped)
+            )
+        raise FileNotFoundError(msg)
     if len(candidates) > 1:
         raise RuntimeError(
             f"Multiple workspace .h5 candidates in bundle: "

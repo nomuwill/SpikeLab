@@ -5057,3 +5057,226 @@ class TestConsecutiveDurationsNaNThreshold:
         # The function returns an array (possibly empty) of durations.
         result_arr = np.asarray(result)
         assert result_arr.size == 0
+
+
+class TestGetChannelsForUnit:
+    """Direct tests for the waveform-extraction channel selector."""
+
+    def test_none_channels_with_mapped_unit_returns_mapped_channel(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=None`` with a unit present in
+                ``neuron_to_channel`` returns ``[mapped_channel]``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(
+            unit_idx=0,
+            channels=None,
+            neuron_to_channel={0: 7},
+            n_channels_total=32,
+        )
+        assert result == [7]
+
+    def test_none_channels_with_unmapped_unit_returns_all_channels(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=None`` with a unit absent from the
+                mapping returns ``list(range(n_channels_total))``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(
+            unit_idx=5,
+            channels=None,
+            neuron_to_channel={0: 7},
+            n_channels_total=4,
+        )
+        assert result == [0, 1, 2, 3]
+
+    def test_int_channel_wrapped_in_list(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=3`` returns ``[3]``.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        assert get_channels_for_unit(0, 3, {}, 10) == [3]
+
+    def test_empty_list_with_mapped_unit_falls_back_to_mapping(self):
+        """
+        Tests:
+            (Test Case 1) ``channels=[]`` with a mapped unit returns
+                the mapped channel — the empty-list sentinel means
+                "use the unit's preferred channel".
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        result = get_channels_for_unit(0, [], {0: 2}, 10)
+        assert result == [2]
+
+    def test_invalid_channels_argument_raises(self):
+        """
+        Tests:
+            (Test Case 1) A non-int, non-list, non-None ``channels``
+                value raises ValueError.
+        """
+        from spikelab.spikedata.utils import get_channels_for_unit
+
+        with pytest.raises(ValueError):
+            get_channels_for_unit(0, "abc", {}, 10)
+
+
+class TestComputeAvgWaveform:
+    """Direct tests for compute_avg_waveform — averaging contract and
+    the empty-spike fallback shape.
+    """
+
+    def test_mean_over_spike_axis(self):
+        """
+        Tests:
+            (Test Case 1) Output equals waveforms.mean(axis=2) — averaging
+                is over the spike axis, returning (num_channels, num_samples).
+        """
+        from spikelab.spikedata.utils import compute_avg_waveform
+
+        # 2 channels, 3 samples, 4 spikes — pick values where the mean
+        # is independently computable.
+        waveforms = np.array(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+                [
+                    [-1.0, -2.0, -3.0, -4.0],
+                    [-5.0, -6.0, -7.0, -8.0],
+                    [-9.0, -10.0, -11.0, -12.0],
+                ],
+            ]
+        )
+        avg = compute_avg_waveform(waveforms, [0, 1], np.float64)
+        # Spike-axis mean per (channel, sample): e.g. channel 0 sample 0
+        # is mean([1, 2, 3, 4]) = 2.5
+        expected = np.array(
+            [[2.5, 6.5, 10.5], [-2.5, -6.5, -10.5]],
+        )
+        np.testing.assert_allclose(avg, expected)
+        assert avg.shape == (2, 3)
+
+    def test_empty_spikes_returns_zero_array_with_correct_shape(self):
+        """
+        Tests:
+            (Test Case 1) When the spike axis has size 0, output is a
+                zero array of shape (len(channel_indices), num_samples)
+                with the requested dtype.
+        """
+        from spikelab.spikedata.utils import compute_avg_waveform
+
+        waveforms = np.zeros((3, 5, 0), dtype=np.float32)
+        avg = compute_avg_waveform(waveforms, [10, 20, 30], np.float32)
+        assert avg.shape == (3, 5)
+        assert avg.dtype == np.float32
+        np.testing.assert_array_equal(avg, np.zeros((3, 5)))
+
+
+class TestGetValidSpikeTimes:
+    """Direct tests for get_valid_spike_times — boundary exclusion."""
+
+    def test_spike_at_start_excluded_when_ms_before_overlaps_negative_samples(self):
+        """
+        Tests:
+            (Test Case 1) A spike near t=0 with positive ms_before is
+                excluded because its extraction window starts before
+                sample 0.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        # fs=20 kHz → 1 ms = 20 samples. ms_before=1.0 needs ≥20 samples
+        # of pre-spike data. A spike at 0.5 ms only has 10 samples.
+        result = get_valid_spike_times(
+            spike_times_ms=np.array([0.5, 10.0]),
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,  # 20 ms total
+        )
+        # 0.5 ms spike rejected; 10 ms spike survives.
+        np.testing.assert_array_equal(result, [10.0])
+
+    def test_spike_at_end_excluded_when_ms_after_overlaps_past_end(self):
+        """
+        Tests:
+            (Test Case 1) A spike near the recording end with positive
+                ms_after is excluded because its extraction window
+                extends past n_time_samples.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        result = get_valid_spike_times(
+            spike_times_ms=np.array([10.0, 19.9]),
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,  # 20 ms total
+        )
+        # 19.9 ms + 1 ms after = 20.9 ms = 418 samples > 400.
+        np.testing.assert_array_equal(result, [10.0])
+
+    def test_all_spikes_valid_passes_through_in_order(self):
+        """
+        Tests:
+            (Test Case 1) When every spike has a valid extraction
+                window, all are returned in input order.
+        """
+        from spikelab.spikedata.utils import get_valid_spike_times
+
+        spikes = np.array([5.0, 10.0, 15.0])
+        result = get_valid_spike_times(
+            spike_times_ms=spikes,
+            fs_kHz=20.0,
+            ms_before=1.0,
+            ms_after=1.0,
+            n_time_samples=400,
+        )
+        np.testing.assert_array_equal(result, spikes)
+
+
+class TestWaveformsByChannel:
+    """Direct tests for waveforms_by_channel — shape and validation contract."""
+
+    def test_dispatches_each_channel_with_correct_shape(self):
+        """
+        Tests:
+            (Test Case 1) Output keys are exactly ``channel_indices``.
+            (Test Case 2) Each per-channel array has shape
+                ``(num_samples, num_spikes)`` matching the input slice.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        waveforms = np.arange(2 * 3 * 4).reshape(2, 3, 4).astype(np.float64)
+        result = waveforms_by_channel(waveforms, [7, 11])
+
+        assert set(result.keys()) == {7, 11}
+        assert result[7].shape == (3, 4)
+        assert result[11].shape == (3, 4)
+        np.testing.assert_array_equal(result[7], waveforms[0, :, :])
+        np.testing.assert_array_equal(result[11], waveforms[1, :, :])
+
+    def test_non_3d_input_raises(self):
+        """
+        Tests:
+            (Test Case 1) A 2D input array raises ValueError.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        with pytest.raises(ValueError, match="3D"):
+            waveforms_by_channel(np.zeros((3, 4)), [0])
+
+    def test_channel_indices_length_mismatch_raises(self):
+        """
+        Tests:
+            (Test Case 1) Providing fewer channel indices than
+                ``waveforms.shape[0]`` raises ValueError.
+        """
+        from spikelab.spikedata.utils import waveforms_by_channel
+
+        with pytest.raises(ValueError, match="channel_indices"):
+            waveforms_by_channel(np.zeros((3, 5, 2)), [0, 1])

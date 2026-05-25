@@ -521,18 +521,23 @@ class RunSession:
             self.storage.download_file(s3_uri=s3_uri, local_path=str(local_path))
             downloaded.append((relative, str(local_path)))
 
-        # Build workspace from downloaded SpikeData pickles
+        # Build workspace from downloaded SpikeData pickles. Accumulate
+        # per-file failures so the caller sees the full set in one
+        # RuntimeError at the end. Previously each error was logged as
+        # a UserWarning and skipped silently — the workspace was
+        # returned as if successful even when half the pickles were
+        # corrupt, and the caller had no programmatic way to detect
+        # the partial-failure state.
         ws = AnalysisWorkspace(name=f"sorting-{result.run_id[:8]}")
+        failures: List[str] = []
 
         for relative, local_path in downloaded:
             if local_path.endswith(".pkl"):
                 try:
                     sd = load_spikedata_from_pickle(local_path)
                 except (pickle.UnpicklingError, EOFError, OSError, ValueError) as e:
-                    warnings.warn(
-                        f"Skipping corrupt pickle {relative!r}: "
-                        f"{type(e).__name__}: {e}",
-                        UserWarning,
+                    failures.append(
+                        f"{relative}: {type(e).__name__}: {e}"
                     )
                     continue
                 namespace = Path(relative).stem
@@ -543,14 +548,20 @@ class RunSession:
                     with open(local_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                 except (json.JSONDecodeError, OSError) as e:
-                    warnings.warn(
-                        f"Skipping unreadable JSON {relative!r}: "
-                        f"{type(e).__name__}: {e}",
-                        UserWarning,
+                    failures.append(
+                        f"{relative}: {type(e).__name__}: {e}"
                     )
                     continue
                 namespace = Path(relative).stem
                 ws.store(namespace, "sorting_metadata", meta)
+
+        if failures:
+            joined = "\n  - " + "\n  - ".join(failures)
+            raise RuntimeError(
+                f"Failed to ingest {len(failures)} sorting output file(s) for "
+                f"run_id={result.run_id!r}; the workspace would have been "
+                f"silently incomplete:{joined}"
+            )
 
         return ws
 

@@ -157,6 +157,49 @@ class TestSpikeDataConstruction:
         sdneo = SpikeData.from_neo_spiketrains(neo_trains)
         self.assert_spikedata_equal(sd, sdneo)
 
+    @skip_no_neo
+    def test_from_neo_spiketrains_forwards_kwargs(self):
+        """
+        from_neo_spiketrains forwards length/start_time kwargs to the
+        SpikeData constructor.
+
+        Tests:
+            (Test Case 1) Explicit length kwarg overrides any inferred
+                length and ends up on the returned SpikeData.
+            (Test Case 2) start_time kwarg is preserved on the returned
+                SpikeData.
+        """
+        assert SpikeTrain is not None
+        assert quantities is not None
+        trains = [
+            SpikeTrain(
+                np.array([10.0, 50.0]) * quantities.ms, t_stop=100 * quantities.ms
+            ),
+            SpikeTrain(np.array([20.0]) * quantities.ms, t_stop=100 * quantities.ms),
+        ]
+        sd = SpikeData.from_neo_spiketrains(trains, length=500.0, start_time=5.0)
+        assert sd.length == pytest.approx(500.0)
+        assert sd.start_time == pytest.approx(5.0)
+        assert sd.N == 2
+
+    @skip_no_neo
+    def test_from_neo_spiketrains_seconds_input_converted_to_ms(self):
+        """
+        Neo SpikeTrains supplied in seconds are rescaled to milliseconds
+        — the units mutation must be a rescale, not a relabel.
+
+        Tests:
+            (Test Case 1) A SpikeTrain whose times are in seconds with
+                a 0.1 s spike is converted to a 100 ms spike in the
+                resulting SpikeData.
+        """
+        assert SpikeTrain is not None
+        assert quantities is not None
+        # Spike at 0.1 s = 100 ms.
+        train_s = SpikeTrain(np.array([0.1]) * quantities.s, t_stop=1.0 * quantities.s)
+        sd = SpikeData.from_neo_spiketrains([train_s], length=1000.0)
+        np.testing.assert_allclose(sd.train[0], [100.0])
+
     def test_spike_data(self):
         """
         Comprehensive test of SpikeData constructors and methods.

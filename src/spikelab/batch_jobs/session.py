@@ -124,9 +124,7 @@ class RunSession:
         # naming convention is automatically scrubbed here without a
         # separate allow-list.
         redacted_env = redact_sensitive_map(dict(job_spec.container.env))
-        redacted_container = job_spec.container.model_copy(
-            update={"env": redacted_env}
-        )
+        redacted_container = job_spec.container.model_copy(update={"env": redacted_env})
         redacted_spec = job_spec.model_copy(update={"container": redacted_container})
         redacted_manifest = self.render_manifest(
             job_name=job_name, job_spec=redacted_spec, run_id=run_id

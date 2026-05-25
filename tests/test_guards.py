@@ -1277,9 +1277,7 @@ class TestLogInactivityWatchdogConstruction:
             (Test Case 2) inactivity_s=-5 → ValueError.
         """
         for bad in (0, -5):
-            with pytest.raises(
-                ValueError, match="inactivity_s must be"
-            ):
+            with pytest.raises(ValueError, match="inactivity_s must be"):
                 LogInactivityWatchdog(
                     log_path=tmp_path / "log",
                     popen=mock.Mock(spec=subprocess.Popen),

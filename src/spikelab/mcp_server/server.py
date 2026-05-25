@@ -4246,11 +4246,13 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCon
 #: threshold branch with a small cap.
 MAX_INLINE_ARRAY_SIZE = 10_000
 
+MAX_SANITIZE_DEPTH = 64
 
-def _sanitize_for_json(obj: Any) -> Any:
+
+def _sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
     """Recursively prepare an MCP tool result for ``json.dumps``.
 
-    Three responsibilities:
+    Four responsibilities:
 
       1. Replace non-finite floats (``NaN`` / ``Inf``) with ``None``
          so ``json.dumps(..., allow_nan=False)`` succeeds. These
@@ -4268,8 +4270,25 @@ def _sanitize_for_json(obj: Any) -> Any:
          workspace-store-by-reference pattern (an MCP tool that
          needs to return a large array should write it to the
          workspace and return ``{"namespace": ..., "key": ...}``).
+      4. Reject pathologically nested inputs whose dict/list/tuple
+         nesting exceeds :data:`MAX_SANITIZE_DEPTH` rather than
+         blowing the Python recursion limit with a ``RecursionError``
+         deep inside the call stack.
+
+    Parameters:
+        obj (Any): The MCP tool return value to sanitize.
+        _depth (int): Internal recursion-depth counter. Callers
+            should not pass this argument.
     """
     import math as _math
+
+    if _depth > MAX_SANITIZE_DEPTH:
+        raise ValueError(
+            f"MCP tool result nesting depth exceeded "
+            f"MAX_SANITIZE_DEPTH={MAX_SANITIZE_DEPTH}. Restructure the "
+            "result to be flatter, or store the deep object in the "
+            "workspace and return a (namespace, key) reference."
+        )
 
     # Numpy branch first: ``np.float64`` happens to be a ``float``
     # subclass on modern numpy and would route through the float
@@ -4298,13 +4317,13 @@ def _sanitize_for_json(obj: Any) -> Any:
                 # ``TypeError: 'float' object is not iterable``. Route
                 # through the scalar branch instead so NaN/Inf
                 # propagate to None and numpy-scalar types coerce.
-                return _sanitize_for_json(obj.item())
-            return [_sanitize_for_json(v) for v in obj.tolist()]
+                return _sanitize_for_json(obj.item(), _depth + 1)
+            return [_sanitize_for_json(v, _depth + 1) for v in obj.tolist()]
         if isinstance(obj, _np.generic):
             # Numpy scalar — convert to Python equivalent so the float
             # NaN/Inf branch (or the dict/list/passthrough branches)
             # below can take over uniformly.
-            return _sanitize_for_json(obj.item())
+            return _sanitize_for_json(obj.item(), _depth + 1)
     except ImportError:
         pass  # numpy not available — skip numpy-specific handling
 
@@ -4313,9 +4332,9 @@ def _sanitize_for_json(obj: Any) -> Any:
             return None
         return obj
     if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+        return {k: _sanitize_for_json(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
+        return [_sanitize_for_json(v, _depth + 1) for v in obj]
     return obj
 
 

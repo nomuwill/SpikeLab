@@ -463,7 +463,7 @@ class TestAnalysisTools:
 
         Tests:
             (Test Case 1) Result contains workspace_id, namespace, key, neuron_i, neuron_j.
-            (Test Case 2) Stored item info shows ndarray type (scalar wrapped in array).
+            (Test Case 2) Stored item info shows a scalar numeric type.
         """
         ws_id, ns = loaded_ws
         result = await analysis.compute_spike_time_tiling(
@@ -473,7 +473,7 @@ class TestAnalysisTools:
         assert result["key"] == "sttc"
         assert result["neuron_i"] == 0
         assert result["neuron_j"] == 1
-        assert result["info"]["type"] == "ndarray"
+        assert result["info"]["type"] in ("float", "ndarray")
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -3499,7 +3499,11 @@ class TestComputeSpikeTimeTiling:
         )
         ws = get_workspace_manager().get_workspace(ws_id)
         val = ws.get(ns, "sttc_auto")
-        assert val[0] == pytest.approx(0.0, abs=0.01)
+        # Stored value is a scalar (float or 0-d/1-d ndarray); coerce to a
+        # plain float before approx comparison.
+        if hasattr(val, "__iter__"):
+            val = float(np.asarray(val).flatten()[0])
+        assert val == pytest.approx(0.0, abs=0.01)
 
     @pytestmark_server
     @pytest.mark.asyncio

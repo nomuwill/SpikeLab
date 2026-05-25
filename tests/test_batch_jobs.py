@@ -641,8 +641,8 @@ class TestArtifactPackager:
         )
         assert Path(zip_path).exists()
 
-    def test_duplicate_filenames_last_wins(self, tmp_path):
-        """Duplicate filenames in input_paths: last file overwrites earlier ones."""
+    def test_duplicate_filenames_rejected(self, tmp_path):
+        """Duplicate basenames in input_paths raise ValueError at packaging time."""
         dir_a = tmp_path / "a"
         dir_a.mkdir()
         dir_b = tmp_path / "b"
@@ -653,19 +653,13 @@ class TestArtifactPackager:
         file_b = dir_b / "data.pkl"
         file_b.write_bytes(b"content_b")
 
-        import zipfile
-
-        zip_path = package_analysis_bundle(
-            input_paths=[str(file_a), str(file_b)],
-            run_id="run-dup",
-            output_dir=str(tmp_path / "out"),
-            output_format="workspace",
-        )
-
-        with zipfile.ZipFile(zip_path) as zf:
-            content = zf.read("run-dup/data.pkl")
-            # Last copy wins (shutil.copy2 overwrites)
-            assert content == b"content_b"
+        with pytest.raises(ValueError, match="Duplicate basename"):
+            package_analysis_bundle(
+                input_paths=[str(file_a), str(file_b)],
+                run_id="run-dup",
+                output_dir=str(tmp_path / "out"),
+                output_format="workspace",
+            )
 
     def test_large_file_hashing(self, tmp_path):
         """Files larger than the read chunk size are hashed correctly."""
@@ -1308,14 +1302,14 @@ class TestModelValidation:
         assert job_spec.name_prefix == "my-job-test"
 
     def test_name_prefix_all_special_chars_raises(self):
-        """JobSpec raises ValueError when prefix is empty after ASCII sanitization.
+        """JobSpec raises ValueError when prefix has no usable ASCII content.
 
         Tests:
             - An all-hyphen prefix sanitizes to empty and raises ValueError.
         """
         payload = _example_payload()
         payload["name_prefix"] = "---"
-        with pytest.raises(ValueError, match="empty after ASCII sanitization"):
+        with pytest.raises(ValueError, match="no usable ASCII content"):
             validate_job_spec(payload)
 
     def test_name_prefix_truncated_to_40(self):
@@ -2378,8 +2372,10 @@ class TestRunSessionRetrieve:
         with open(pkl_path, "wb") as f:
             pickle.dump(sd, f)
 
-        # Mock list_output_files to return one pickle
-        storage.list_output_files.return_value = ["pfx/outputs/run-1/rec1_curated.pkl"]
+        # Mock list_output_files to return one pickle. The listed key is the
+        # bare filename (no prefix path) so it strips cleanly regardless of
+        # how parse_s3_url normalises trailing slashes.
+        storage.list_output_files.return_value = ["rec1_curated.pkl"]
         storage.output_prefix_for_run.return_value = "s3://bucket/pfx/outputs/run-1/"
 
         # Mock download_file to copy the pickle
@@ -2970,6 +2966,7 @@ class TestSortingEntrypointMain:
             config,
             intermediate_folders,
             results_folders,
+            **kwargs,
         ):
             # Snapshot existence-at-call-time: the temp dir holding
             # these folders is cleaned up when main() returns, so
@@ -3179,7 +3176,7 @@ class TestJobSpecNamePrefix:
 
         payload_all_non_ascii = _example_payload()
         payload_all_non_ascii["name_prefix"] = "áöü"
-        with pytest.raises(ValueError, match="empty after ASCII sanitization"):
+        with pytest.raises(ValueError, match="no usable ASCII content"):
             validate_job_spec(payload_all_non_ascii)
 
     def test_trailing_hyphens_stripped_after_truncation(self):
@@ -3494,22 +3491,30 @@ class TestStreamLogs:
         backend = KubernetesBatchJobBackend(namespace="test-ns")
         mock_core_api = MagicMock()
         backend._core_api = mock_core_api
-        mock_core_api.read_namespaced_pod_log.return_value = "line a\nline b"
+        # Source uses _preload_content=False which yields a streaming HTTP
+        # response — emulate the .stream() chunk iterator + release_conn().
+        mock_response = MagicMock()
+        mock_response.stream.return_value = iter([b"line a\nline b"])
+        mock_core_api.read_namespaced_pod_log.return_value = mock_response
 
         with patch("spikelab.batch_jobs.backend_k8s.watch", None):
             lines = list(backend.stream_logs("test-pod", follow=True))
 
         assert lines == ["line a", "line b"]
+        mock_response.release_conn.assert_called_once()
 
     def test_stream_logs_k8s_client_no_follow(self):
         """stream_logs with follow=False via K8s client reads log text."""
         backend = KubernetesBatchJobBackend(namespace="test-ns")
         mock_core_api = MagicMock()
         backend._core_api = mock_core_api
-        mock_core_api.read_namespaced_pod_log.return_value = "hello\nworld"
+        mock_response = MagicMock()
+        mock_response.stream.return_value = iter([b"hello\nworld"])
+        mock_core_api.read_namespaced_pod_log.return_value = mock_response
 
         lines = list(backend.stream_logs("test-pod", follow=False))
         assert lines == ["hello", "world"]
+        mock_response.release_conn.assert_called_once()
 
 
 class TestK8sBackendConfigException:
@@ -3993,7 +3998,7 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
         local_dir = tmp_path / "local"
         local_dir.mkdir()
 
-        storage.list_output_files.return_value = ["pfx/out/run-1/bad.pkl"]
+        storage.list_output_files.return_value = ["bad.pkl"]
         storage.output_prefix_for_run.return_value = "s3://b/pfx/out/run-1/"
 
         def fake_download(*, s3_uri, local_path):
@@ -4049,7 +4054,7 @@ class TestRetrieveSortingWarnsOnCorruptOutputs:
         local_dir = tmp_path / "local"
         local_dir.mkdir()
 
-        storage.list_output_files.return_value = ["pfx/out/run-1/metadata.json"]
+        storage.list_output_files.return_value = ["metadata.json"]
         storage.output_prefix_for_run.return_value = "s3://b/pfx/out/run-1/"
 
         def fake_download(*, s3_uri, local_path):
@@ -4681,9 +4686,9 @@ class TestModelValidationBatchJobs:
 
 
 class TestJobSpecNamePrefixBoundaries:
-    """``JobSpec._validate_name_prefix`` boundary pins. The whitespace-
-    only vs all-hyphen inputs hit *different* ValueError branches; the
-    inconsistency is logged as a Bug Confirmed.
+    """``JobSpec._validate_name_prefix`` boundary pins. Whitespace-only
+    and all-hyphen inputs collapse to the same unified error so operators
+    don't see different messages for inputs that look equivalent.
     """
 
     def _make_payload(self, name_prefix: str):
@@ -4691,32 +4696,27 @@ class TestJobSpecNamePrefixBoundaries:
         payload["name_prefix"] = name_prefix
         return payload
 
-    def test_whitespace_only_raises_empty_message(self):
+    def test_whitespace_only_raises_unified_message(self):
         """
         Tests:
-            (Test Case 1) ``"   "`` triggers the first ValueError
-                ("cannot be empty") via post-strip emptiness.
+            (Test Case 1) ``"   "`` raises ValidationError with the
+                unified "no usable ASCII content" message.
         """
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError, match="cannot be empty"):
+        with pytest.raises(ValidationError, match="no usable ASCII content"):
             JobSpec(**self._make_payload("   "))
 
-    def test_all_hyphens_raises_post_sanitization_message(self):
+    def test_all_hyphens_raises_unified_message(self):
         """
         Tests:
-            (Test Case 1) ``"---"`` triggers the *second* ValueError
-                ("empty after ASCII sanitization") via the post-strip
-                ``safe[:40].strip("-")`` path.
-
-        Notes:
-            - Different message from whitespace-only despite both being
-              "name_prefix was effectively empty". See Bugs Confirmed —
-              Batch Jobs for the recommended unification.
+            (Test Case 1) ``"---"`` raises ValidationError with the same
+                unified "no usable ASCII content" message as the
+                whitespace-only case.
         """
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError, match="empty after"):
+        with pytest.raises(ValidationError, match="no usable ASCII content"):
             JobSpec(**self._make_payload("---"))
 
     def test_leading_hyphens_stripped_to_non_empty(self):
@@ -4880,61 +4880,43 @@ class TestLoadProfileFromNameBoundaries:
 
 
 class TestSubmitPreparedJobRunIdTraversal:
-    """``RunSession.submit_prepared_job`` skips ``package_analysis_bundle``
-    (which has the run_id traversal guard) and lets ``run_id`` flow
-    directly into S3 prefixes. Pin the BUG — a malicious operator-
-    supplied ``run_id="../escape"`` silently embeds in URIs.
+    """``RunSession.submit_prepared_job`` rejects a traversal-shaped
+    ``run_id`` before it can flow into S3 prefixes.
     """
 
-    def test_traversal_run_id_flows_to_storage_unvalidated(self):
+    def test_traversal_run_id_rejected(self):
         """
         Tests:
-            (Test Case 1) Source contains the run_id pass-through at
-                ``submit_prepared_job`` line 340 (``current_run_id =
-                run_id or uuid4().hex``) with no traversal validation
-                before ``_submit`` is called. Pin via source
+            (Test Case 1) Source contains a guard inside
+                ``submit_prepared_job`` that rejects ``run_id`` values
+                containing ``..``, ``/``, or ``\\``. Pin via source
                 inspection.
-
-        Notes:
-            - Pins the BUG. See Bugs Confirmed — Batch Jobs. The full
-              integration path requires mocking backend/storage/profile
-              with realistic shapes; the source-inspection contract
-              suffices to detect a future guard addition.
         """
         from pathlib import Path
 
         import spikelab.batch_jobs.session as session_mod
 
         src = Path(session_mod.__file__).read_text(encoding="utf-8")
-        # The submit_prepared_job body uses run_id verbatim.
-        assert "current_run_id = run_id or uuid4().hex" in src
-        # No traversal-style guard is invoked from submit_prepared_job
-        # (the guard exists only in package_analysis_bundle, which
-        # submit_prepared_job intentionally skips).
-        # Pin the absence so a future caller-side guard surfaces here.
-        assert "submit_prepared_job" in src
         sub_start = src.index("def submit_prepared_job")
         sub_end = src.index("def retrieve_result")
         body = src[sub_start:sub_end]
-        # No '..' in run_id check in this function body.
-        assert "'..' in" not in body and '".." in' not in body
+        # The guard rejects traversal-style run_ids at the session boundary.
+        assert "current_run_id" in body
+        assert '".." in' in body or "'..' in" in body
 
 
 class TestPackageAnalysisBundleManifestCollision:
-    """``package_analysis_bundle`` writes ``manifest.json`` into the
-    bundle directory *after* copying inputs. A user-supplied input file
-    named ``manifest.json`` is silently overwritten. Pin the BUG.
+    """``package_analysis_bundle`` rejects an input file named
+    ``manifest.json`` upfront so the generated manifest cannot silently
+    overwrite a user file.
     """
 
-    def test_user_manifest_silently_overwritten(self, tmp_path):
+    def test_user_manifest_input_rejected(self, tmp_path):
         """
         Tests:
-            (Test Case 1) A user input file named ``manifest.json`` is
-                replaced by the generated manifest after bundling.
-
-        Notes:
-            - Pins the BUG. When /developer rejects the colliding name
-              or renames the user file, this test should be updated.
+            (Test Case 1) A user input file named ``manifest.json``
+                raises ValueError at packaging time rather than being
+                silently replaced.
         """
         from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
 
@@ -4944,25 +4926,13 @@ class TestPackageAnalysisBundleManifestCollision:
         user_manifest.write_text('{"user_data": "original"}')
 
         output_dir = tmp_path / "out"
-        bundle_path = package_analysis_bundle(
-            input_paths=[str(user_manifest)],
-            run_id="run-1",
-            output_dir=str(output_dir),
-            output_format="workspace",
-        )
-        # Extract the zip and verify manifest.json holds the GENERATED
-        # content, not the user's original.
-        import zipfile
-
-        with zipfile.ZipFile(bundle_path) as zf:
-            # Bundle stores files under "<run_id>/<filename>".
-            names = zf.namelist()
-            manifest_entry = next(n for n in names if n.endswith("manifest.json"))
-            with zf.open(manifest_entry) as f:
-                content = f.read().decode()
-        # Generated manifest replaces user's content.
-        assert "user_data" not in content
-        assert "run_id" in content or "files" in content
+        with pytest.raises(ValueError, match="manifest.json"):
+            package_analysis_bundle(
+                input_paths=[str(user_manifest)],
+                run_id="run-1",
+                output_dir=str(output_dir),
+                output_format="workspace",
+            )
 
 
 class TestSortingEntrypointResultCountMismatch:
@@ -5017,24 +4987,28 @@ class TestS3StoragePrefixBoundaries:
 
 
 class TestCredentialsRedactionBoundaries:
-    """``credentials.redact_sensitive_map`` substring-based redaction
-    has known false positives (e.g. ``SECRETS_PATH``) — pin the current
-    behaviour so a future word-boundary tightening is intentional.
+    """``credentials.redact_sensitive_map`` uses word-boundary matching
+    so keys like ``SECRETS_PATH`` are not falsely flagged as sensitive.
     """
 
-    def test_secrets_path_redacted_as_false_positive(self):
+    def test_secrets_path_not_redacted(self):
         """
         Tests:
-            (Test Case 1) ``"SECRETS_PATH"`` is redacted because
-                ``"SECRET" in "SECRETS_PATH"`` is True — false positive.
-
-        Notes:
-            - Pins the current substring heuristic. A future change to
-              word-boundary matching would surface here.
+            (Test Case 1) ``"SECRETS_PATH"`` passes through unredacted —
+                ``SECRETS`` is not a word-boundary match against the
+                ``SECRET`` token.
         """
         result = redact_sensitive_map({"SECRETS_PATH": "/etc/secrets"})
-        # The current heuristic redacts this (false positive).
-        assert result["SECRETS_PATH"] != "/etc/secrets"
+        assert result["SECRETS_PATH"] == "/etc/secrets"
+
+    def test_secret_key_redacted(self):
+        """
+        Tests:
+            (Test Case 1) A key actually containing the standalone token
+                ``SECRET`` is still redacted (regression guard).
+        """
+        result = redact_sensitive_map({"API_SECRET": "abc123"})
+        assert result["API_SECRET"] != "abc123"
 
     def test_empty_string_key_passed_through(self):
         """

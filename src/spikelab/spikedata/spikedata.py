@@ -89,6 +89,18 @@ class SpikeData:
               range (>= N).
         """
         idces = np.asarray(idces)
+        times = np.asarray(times)
+        # Reject length mismatch up-front. ``_train_from_i_t_list``
+        # uses ``times[idces == i]`` boolean indexing internally; on
+        # ``len(idces) != len(times)`` numpy silently broadcasts or
+        # truncates instead of erroring, silently producing wrong
+        # per-unit trains. Surface the mismatch at the input boundary.
+        if idces.shape != times.shape:
+            raise ValueError(
+                f"idces and times must have equal length and shape; got "
+                f"len(idces)={len(idces)} (shape {idces.shape}), "
+                f"len(times)={len(times)} (shape {times.shape})."
+            )
         if idces.size == 0:
             kwargs.setdefault("length", 0)
             N = 0 if N is None else N
@@ -1247,6 +1259,19 @@ class SpikeData:
         """
         if self.N != spikeData.N:
             raise ValueError("Cannot concatenate SpikeData with different N")
+        # Reject negative offsets up-front. A negative ``offset`` shifts
+        # the concatenation point *backwards* into self's recording
+        # window, silently interleaving the appended spikes with
+        # self's instead of appending them. The result's ``length``
+        # then computes incorrectly. If someone genuinely wants to
+        # overlay two recordings they should use a different API.
+        if offset < 0:
+            raise ValueError(
+                f"offset must be non-negative, got {offset}. A negative "
+                "offset would shift the concatenation point backwards "
+                "into self's recording window, silently interleaving "
+                "the appended spikes with self's."
+            )
         # Shift appended spikes from their own time base to follow self's time range.
         # Subtract spikeData.start_time to normalize to 0-based, then add the
         # concatenation point (self's end time + gap).

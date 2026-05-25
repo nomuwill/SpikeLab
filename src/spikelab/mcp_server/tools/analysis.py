@@ -229,17 +229,52 @@ async def compute_resampled_isi(
     """
     Compute instantaneous firing rates via the resampled ISI method and store
     the result as a RateData object in the workspace.
+
+    The ``times`` array must be strictly increasing and uniformly
+    spaced — the core ``resampled_isi`` requires it (commit ``a8ad4bc``
+    added the guard). Validate at the MCP boundary so the agent sees a
+    clear, actionable error instead of a deep-stack ValueError from
+    inside the core implementation.
     """
+    times_arr = np.asarray(times, dtype=float)
+    if times_arr.ndim != 1:
+        raise ValueError(
+            f"compute_resampled_isi: times must be a 1-D array, got "
+            f"shape {times_arr.shape}."
+        )
+    if times_arr.size < 2:
+        raise ValueError(
+            f"compute_resampled_isi: times must have at least 2 entries "
+            f"to infer a uniform step, got {times_arr.size}."
+        )
+    diffs = np.diff(times_arr)
+    if not np.all(diffs > 0):
+        raise ValueError(
+            "compute_resampled_isi: times must be strictly increasing. "
+            f"Got min diff={diffs.min():g}. Sort and deduplicate the "
+            "times array before calling."
+        )
+    median_step = float(np.median(diffs))
+    if median_step <= 0 or not np.allclose(
+        diffs, median_step, rtol=1e-6, atol=1e-9
+    ):
+        raise ValueError(
+            "compute_resampled_isi: times must be uniformly spaced. "
+            f"Got median step={median_step:g}, min step={diffs.min():g}, "
+            f"max step={diffs.max():g}. Resample to a uniform grid "
+            "(e.g. ``np.arange(start, end, step)``) before calling."
+        )
+
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    rd = sd.resampled_isi(times=np.array(times), sigma_ms=sigma_ms)
+    rd = sd.resampled_isi(times=times_arr, sigma_ms=sigma_ms)
     ws.store(namespace, key, rd)
     return {
         "workspace_id": workspace_id,
         "namespace": namespace,
         "key": key,
         "sigma_ms": sigma_ms,
-        "n_timepoints": len(times),
+        "n_timepoints": len(times_arr),
         "info": ws.get_info(namespace, key),
     }
 

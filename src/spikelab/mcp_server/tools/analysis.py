@@ -252,11 +252,17 @@ async def compute_spike_time_tiling(
     neuron_j: int,
     delt: float = 20.0,
 ) -> Dict[str, Any]:
-    """Compute spike time tiling coefficient for a neuron pair and store to workspace."""
+    """Compute spike time tiling coefficient for a neuron pair and store to workspace.
+
+    The STTC value is stored as a plain ``float`` (not a length-1
+    array) — consistent with other scalar-producing tools and avoids
+    forcing every consumer to remember to index ``[0]`` to read the
+    value.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
     sttc = sd.spike_time_tiling(neuron_i, neuron_j, delt=delt)
-    ws.store(namespace, key, np.array([sttc]))
+    ws.store(namespace, key, float(sttc))
     return {
         "workspace_id": workspace_id,
         "namespace": namespace,
@@ -264,6 +270,7 @@ async def compute_spike_time_tiling(
         "neuron_i": neuron_i,
         "neuron_j": neuron_j,
         "delt": delt,
+        "value": float(sttc),
         "info": ws.get_info(namespace, key),
     }
 

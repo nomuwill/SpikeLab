@@ -653,8 +653,17 @@ def compute_cross_correlation_with_lag(ref_rate, comp_rate, max_lag=0):
     search_end = min(len(r), center + max_lag + 1)
     search_window = r[search_start:search_end]
 
-    max_corr = np.max(search_window)
-    max_lag_idx = np.argmax(search_window) + search_start - center
+    # NaN-safe peak detection. RateData allows NaN entries (caller-built
+    # rate matrices, e.g. from external sources), so the correlation
+    # output ``r`` can contain NaN. Plain ``np.max``/``argmax`` would
+    # silently propagate NaN into the pairwise matrices; the cosine
+    # sibling ``compute_cosine_similarity_with_lag`` already uses the
+    # nan-safe variants. Match that behaviour, with a sentinel return
+    # for the all-NaN edge case.
+    if np.all(np.isnan(search_window)):
+        return np.nan, 0
+    max_corr = np.nanmax(search_window)
+    max_lag_idx = int(np.nanargmax(search_window)) + search_start - center
 
     return max_corr, max_lag_idx
 
@@ -1079,8 +1088,11 @@ def times_from_ms(
     if unit == "s":
         return times_ms.astype(float) / 1e3
     if unit == "samples":
-        if not fs_Hz or fs_Hz <= 0:
-            raise ValueError("fs_Hz must be provided and > 0 when unit='samples'")
+        if fs_Hz is None or not np.isfinite(fs_Hz) or fs_Hz <= 0:
+            raise ValueError(
+                f"fs_Hz must be a positive finite number when unit='samples', "
+                f"got {fs_Hz!r}."
+            )
         # Use round-to-nearest to produce integer samples
         return np.rint(times_ms.astype(float) * (fs_Hz / 1e3)).astype(np.int64)
     raise ValueError(f"Unknown time unit '{unit}' (expected 's','ms','samples')")
@@ -1093,8 +1105,11 @@ def to_ms(values: np.ndarray, unit: str, fs_Hz: Optional[float]) -> np.ndarray:
     if unit == "s":
         return values.astype(float) * 1e3
     if unit == "samples":
-        if not fs_Hz or fs_Hz <= 0:
-            raise ValueError("fs_Hz must be provided and > 0 when unit='samples'")
+        if fs_Hz is None or not np.isfinite(fs_Hz) or fs_Hz <= 0:
+            raise ValueError(
+                f"fs_Hz must be a positive finite number when unit='samples', "
+                f"got {fs_Hz!r}."
+            )
         return values.astype(float) / fs_Hz * 1e3
     raise ValueError(f"Unknown time unit '{unit}' (expected 's','ms','samples')")
 
@@ -1599,6 +1614,14 @@ def _validate_time_start_to_end(
     """
     if not isinstance(times_start_to_end, list):
         raise TypeError("times must be a list of tuples")
+    if recording_range is not None:
+        rec_start, rec_end = recording_range
+        if not (np.isfinite(rec_start) and np.isfinite(rec_end)):
+            raise ValueError(
+                f"recording_range must contain finite values, got "
+                f"({rec_start}, {rec_end}). NaN comparisons silently pass the "
+                "bounds check and corrupt downstream slicing."
+            )
     time_diff_check = []
     valid_time_tuples = []
     zero_duration_offenders = []
@@ -2079,7 +2102,14 @@ def _compute_footprint(neuron_attrs, f_rel_to_trough, n_channels):
     channel = int(neuron_attrs["channel"])
     nb_channels = np.asarray(neuron_attrs["neighbor_channels"])
 
-    t_i = int(np.argmin(template))
+    # Locate the trough by largest absolute deflection so this works
+    # for both polarities. ``np.argmin(template)`` only worked for
+    # extracellular spikes with the conventional negative-going peak;
+    # sorters that emit positive-going templates (e.g. some calcium-
+    # imaging-style pipelines, or sorters with inverted polarity)
+    # produced a meaningless "trough" at the least-positive sample,
+    # which then silently misaligned the downstream footprint slice.
+    t_i = int(np.argmax(np.abs(template)))
 
     sel_start = max(0, t_i - f_rel_to_trough[0])
     sel_end = min(len(template) - 1, t_i + f_rel_to_trough[1])

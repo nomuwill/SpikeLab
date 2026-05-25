@@ -624,6 +624,24 @@ def _dump_neuron_attributes(grp, neuron_attributes: list) -> None:
         use_string = any(isinstance(v, str) for v in non_none)
 
         if use_array:
+            # Reject mixed scalar + array under the same key. Previously the
+            # shape-validation loop only iterated array-typed values, so a
+            # scalar passed through silently and was broadcast across the
+            # array dimensions at write time — producing a phantom row
+            # with the scalar repeated at every position. Surface the
+            # mistake at dump time with a clear message naming the unit
+            # whose value is the wrong type.
+            for i, v in enumerate(values):
+                if v is None or isinstance(v, _SUPPORTED_ARRAY_TYPES):
+                    continue
+                raise ValueError(
+                    f"Neuron attribute {attr_key!r} mixes scalar and array "
+                    f"values across units: unit {i} has scalar "
+                    f"{type(v).__name__} {v!r} but other units have arrays. "
+                    "All units must use the same value shape for a given "
+                    "attribute. Either wrap the scalar in a length-1 array "
+                    "to match, or split the attribute into separate keys."
+                )
             # Infer dtype from the first non-None array value rather
             # than always coercing to float64. Two reasons:
             #   (1) Integer-valued attributes (per-unit channel-index
@@ -924,10 +942,33 @@ def _dump_spikedata(grp, sd) -> None:
     grp.attrs["start_time"] = float(sd.start_time)
     grp.attrs["N"] = int(sd.N)
     _dump_metadata_json(grp, sd.metadata)
-    if getattr(sd, "raw_data", None) is not None and sd.raw_data.size > 0:
-        grp.create_dataset("raw_data", data=sd.raw_data)
-    if getattr(sd, "raw_time", None) is not None and np.asarray(sd.raw_time).size > 0:
-        grp.create_dataset("raw_time", data=sd.raw_time)
+    # Persist raw_data + raw_time atomically: write both or neither.
+    # The previous independent-write path produced files where the
+    # loader had to fabricate an empty raw_data buffer from raw_time's
+    # length, which failed for scalar raw_time. Enforce consistency
+    # here so the file is self-describing.
+    raw_data = getattr(sd, "raw_data", None)
+    raw_time = getattr(sd, "raw_time", None)
+    raw_data_present = raw_data is not None and raw_data.size > 0
+    raw_time_present = raw_time is not None and np.asarray(raw_time).size > 0
+    if raw_data_present and raw_time_present:
+        grp.create_dataset("raw_data", data=raw_data)
+        grp.create_dataset("raw_time", data=raw_time)
+    elif raw_data_present != raw_time_present:
+        # The atomic-write contract requires both arrays (or neither).
+        # Silently dropping a one-sided pair would lose data without
+        # the caller noticing; warn so they can either drop both
+        # upstream or supply the missing partner. Mirrors the
+        # ``_maybe_with_raw`` UserWarning in the file-loader path.
+        warnings.warn(
+            "SpikeData has one of raw_data/raw_time set but not the "
+            f"other (raw_data_present={raw_data_present}, "
+            f"raw_time_present={raw_time_present}); neither will be "
+            "persisted to the workspace HDF5. Provide both or clear "
+            "both upstream to silence this warning.",
+            UserWarning,
+            stacklevel=2,
+        )
     if sd.neuron_attributes is not None:
         _dump_neuron_attributes(grp, sd.neuron_attributes)
 
@@ -948,12 +989,18 @@ def _load_spikedata(grp):
         train.append(flat[prev:end])
         prev = int(end)
 
-    raw_data = np.array(grp["raw_data"]) if "raw_data" in grp else None
-    raw_time = np.array(grp["raw_time"]) if "raw_time" in grp else None
-    # SpikeData requires both or neither; supply empty raw_data when only
-    # raw_time was persisted (e.g. original raw_data had size 0).
-    if raw_data is None and raw_time is not None:
-        raw_data = np.zeros((0, len(raw_time)))
+    # _dump_spikedata now writes raw_data and raw_time atomically.
+    # Defensive: if a legacy file has only one of the pair, ignore both
+    # rather than try to reconstruct (the old fabricate-zeros path
+    # failed on scalar raw_time).
+    has_raw_data = "raw_data" in grp
+    has_raw_time = "raw_time" in grp
+    if has_raw_data and has_raw_time:
+        raw_data = np.array(grp["raw_data"])
+        raw_time = np.array(grp["raw_time"])
+    else:
+        raw_data = None
+        raw_time = None
     neuron_attributes = _load_neuron_attributes(grp)
 
     return SpikeData(

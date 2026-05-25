@@ -550,6 +550,18 @@ def load_spikedata_from_hdf5_raw_thresholded(
     ensure_h5py()
     with h5py.File(filepath, "r") as f:  # type: ignore
         data = np.asarray(f[dataset])
+        # Honour the same file-level ``length_ms``/``start_time`` attrs
+        # that ``load_spikedata_from_hdf5`` reads. Without these, the
+        # two loaders for the same on-disk file format had asymmetric
+        # round-trip semantics for trailing silence and event-centered
+        # start_time: the raster path preserved them, the thresholded
+        # path silently inferred from data shape.
+        file_length = (
+            float(f.attrs["length_ms"]) if "length_ms" in f.attrs else None
+        )
+        file_start_time = (
+            float(f.attrs["start_time"]) if "start_time" in f.attrs else None
+        )
     return SpikeData.from_thresholding(
         data,
         fs_Hz=fs_Hz,
@@ -557,6 +569,8 @@ def load_spikedata_from_hdf5_raw_thresholded(
         filter=filter,
         hysteresis=hysteresis,
         direction=direction,  # type: ignore[arg-type]
+        length=file_length,
+        start_time=file_start_time,
     )
 
 
@@ -1477,9 +1491,99 @@ def load_spikedata_from_pickle(
 
     if not isinstance(obj, SpikeData):
         raise ValueError(
-            f"Pickle file does not contain a SpikeData object (found {type(obj).__name__})"
+            f"Pickle file does not contain a SpikeData object (found {type(obj).__name__}). "
+            "Use load_from_pickle for the generic loader that accepts any spikelab data type."
         )
 
+    return obj
+
+
+def load_from_pickle(
+    filepath: str,
+    *,
+    allow_remote: bool = False,
+    aws_access_key_id: Optional[str] = None,
+    aws_secret_access_key: Optional[str] = None,
+    aws_session_token: Optional[str] = None,
+    region_name: Optional[str] = None,
+):
+    """Load any spikelab data object from a pickle file.
+
+    Companion to ``load_spikedata_from_pickle``: accepts any of the six
+    types that ``export_to_pickle`` supports (``SpikeData``, ``RateData``,
+    ``PairwiseCompMatrix``, ``PairwiseCompMatrixStack``, ``RateSliceStack``,
+    ``SpikeSliceStack``).
+
+    Warning:
+        Only load pickle files from trusted sources. Pickle
+        deserialization can execute arbitrary code; the type check below
+        runs after deserialisation completes.
+
+    Parameters:
+        filepath (str): Path to the pickle file, or an S3 URL.
+        allow_remote (bool): Opt-in flag for S3 URLs (default False).
+        aws_access_key_id (str | None): AWS access key ID for S3 downloads.
+        aws_secret_access_key (str | None): AWS secret access key.
+        aws_session_token (str | None): AWS session token.
+        region_name (str | None): AWS region name.
+
+    Returns:
+        obj: The deserialized spikelab data object.
+    """
+    from ..spikedata.pairwise import PairwiseCompMatrix, PairwiseCompMatrixStack
+    from ..spikedata.ratedata import RateData
+    from ..spikedata.rateslicestack import RateSliceStack
+    from ..spikedata.spikeslicestack import SpikeSliceStack
+    from .s3_utils import ensure_local_file, is_s3_url
+
+    _SUPPORTED = (
+        SpikeData,
+        RateData,
+        PairwiseCompMatrix,
+        PairwiseCompMatrixStack,
+        RateSliceStack,
+        SpikeSliceStack,
+    )
+
+    if is_s3_url(filepath):
+        if not allow_remote:
+            raise ValueError(
+                f"Refusing to load pickle from remote URL {filepath!r}: "
+                "pickle.load executes arbitrary code from the source. "
+                "Pass allow_remote=True to confirm you trust the bucket."
+            )
+        warnings.warn(
+            f"Loading pickle from remote URL {filepath!r}; pickle.load "
+            "will execute arbitrary code embedded in the file. Trust "
+            "the bucket and its credentials before continuing.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    local_path, is_temp = ensure_local_file(
+        filepath,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        region_name=region_name,
+    )
+
+    try:
+        with open(local_path, "rb") as f:
+            obj = pickle.load(f)
+    finally:
+        if is_temp:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+    if not isinstance(obj, _SUPPORTED):
+        supported_names = ", ".join(t.__name__ for t in _SUPPORTED)
+        raise ValueError(
+            f"Pickle file does not contain a spikelab data object "
+            f"({supported_names}); found {type(obj).__name__}"
+        )
     return obj
 
 
@@ -1623,7 +1727,24 @@ def load_spikedata_from_ibl(
     # Infer session length from the largest spike time if not provided.
     if length_ms is None:
         max_t = max((t.max() for t in spike_trains if len(t) > 0), default=0.0)
-        length_ms = float(max_t) if max_t > 0 else 10_000.0
+        if max_t > 0:
+            length_ms = float(max_t)
+        else:
+            # All surviving units returned zero spikes for this probe.
+            # The previous fabricated 10 000 ms default silently produced
+            # a SpikeData whose downstream rate normalisation
+            # (``rates()``) and binning (``raster(bin_size_ms)``) were
+            # based on the magic duration. Refuse instead and force the
+            # caller to supply ``length_ms`` explicitly, so the time
+            # axis used downstream is provenance-traceable.
+            raise ValueError(
+                f"IBL probe {pid!r} returned zero spikes for every "
+                "surviving unit, so the session length cannot be "
+                "inferred from spike times. Pass an explicit "
+                "``length_ms`` argument to load_spikedata_from_ibl "
+                "(typically the session duration from the IBL "
+                "trials table)."
+            )
 
     # Load trials and extract relevant fields as numpy arrays (seconds → ms).
     trials = one.load_object(eid, "trials")

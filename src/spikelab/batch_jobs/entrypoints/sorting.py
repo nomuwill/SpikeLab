@@ -108,11 +108,20 @@ def main() -> None:
             Path(folder).mkdir(parents=True, exist_ok=True)
 
         # --- Run sorting ---
+        # Construct a SortRunReport so per-recording status, wall time,
+        # and any failure classification can be uploaded alongside the
+        # bundle. Previously the entrypoint only saw the list of
+        # SpikeData and reported "Sorting job completed successfully"
+        # even when some recordings had degraded or partial results.
+        from spikelab.spike_sorting.pipeline import SortRunReport
+
+        sort_report = SortRunReport()
         spikedata_results = sort_recording(
             recording_files=recording_files,
             config=config,
             intermediate_folders=inter_folders,
             results_folders=results_folders,
+            out_report=sort_report,
         )
 
         # --- Save and upload curated SpikeData pickles ---
@@ -145,12 +154,27 @@ def main() -> None:
             "n_results": len(spikedata_results),
             "recording_names": [Path(r).stem for r in recording_files],
             "sorter": config.sorter.sorter_name,
+            "all_succeeded": sort_report.all_succeeded,
+            "n_succeeded": len(sort_report.succeeded),
+            "n_failed": len(sort_report.failed),
         }
         meta_path = str(results_dir / "sorting_report.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
         storage.upload_file(
             local_path=meta_path, s3_uri=output_prefix + "sorting_report.json"
+        )
+
+        # Detailed per-recording report — JSON-serialisable and
+        # contains status, wall time, classified errors, etc. — so the
+        # operator can audit which recordings succeeded without
+        # parsing per-recording log files.
+        detailed_report_path = str(results_dir / "sort_run_report.json")
+        with open(detailed_report_path, "w", encoding="utf-8") as f:
+            json.dump(sort_report.to_dict(), f, indent=2, default=str)
+        storage.upload_file(
+            local_path=detailed_report_path,
+            s3_uri=output_prefix + "sort_run_report.json",
         )
 
         # --- Upload QC figures if generated ---
@@ -160,7 +184,22 @@ def main() -> None:
                 s3_uri = output_prefix + str(relative).replace("\\", "/")
                 storage.upload_file(local_path=str(fig_path), s3_uri=s3_uri)
 
-    print("Sorting job completed successfully.")
+    if sort_report.all_succeeded:
+        print(
+            f"Sorting job completed successfully ({len(sort_report.succeeded)}/"
+            f"{len(sort_report.records)} recordings)."
+        )
+    else:
+        # Surface the failed recordings in the final log line so the
+        # operator notices that "job exit 0" does not necessarily
+        # mean every recording was processed cleanly.
+        failed_names = ", ".join(r.rec_path for r in sort_report.failed)
+        print(
+            f"Sorting job completed with partial failures: "
+            f"{len(sort_report.failed)}/{len(sort_report.records)} "
+            f"recordings failed ({failed_names}). See "
+            f"sort_run_report.json for per-recording status."
+        )
 
 
 if __name__ == "__main__":

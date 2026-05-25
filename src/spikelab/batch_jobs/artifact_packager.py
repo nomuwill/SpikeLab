@@ -47,12 +47,30 @@ def package_analysis_bundle(
     output_base = Path(output_dir).resolve()
     output_base.mkdir(parents=True, exist_ok=True)
 
+    # Reject duplicate basenames upfront. Two input paths with the
+    # same filename (e.g. ``/dir_a/rec.bin`` and ``/dir_b/rec.bin``)
+    # would silently overwrite each other in ``bundle_dir`` and the
+    # pod-side entrypoint would see only the second copy. Surface the
+    # collision before any I/O so the operator can rename inputs.
+    seen_names: Dict[str, str] = {}
+    input_paths_list = list(input_paths)
+    for item in input_paths_list:
+        name = Path(item).name
+        if name in seen_names:
+            raise ValueError(
+                f"Duplicate basename in input_paths: {name!r} appears in "
+                f"both {seen_names[name]!r} and {item!r}. The bundle "
+                "layout cannot disambiguate them. Rename one of the "
+                "files (or pass them with distinct stems)."
+            )
+        seen_names[name] = item
+
     with tempfile.TemporaryDirectory(prefix=f"{run_id}-bundle-") as temp_dir:
         bundle_dir = Path(temp_dir) / run_id
         bundle_dir.mkdir(parents=True, exist_ok=True)
         payload_files: List[Dict[str, str]] = []
 
-        for item in input_paths:
+        for item in input_paths_list:
             src = Path(item)
             if not src.exists():
                 raise FileNotFoundError(f"Input file not found: {src}")

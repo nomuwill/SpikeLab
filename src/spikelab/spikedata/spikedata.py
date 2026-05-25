@@ -203,6 +203,9 @@ class SpikeData:
         filter: Union[dict, bool] = True,
         hysteresis=True,
         direction: Literal["both", "up", "down"] = "both",
+        *,
+        length: Optional[float] = None,
+        start_time: Optional[float] = None,
     ):
         """Create a SpikeData object by filtering and thresholding raw electrophysiological data.
 
@@ -217,6 +220,14 @@ class SpikeData:
             hysteresis (bool): Use hysteresis for thresholding.
             direction (str): Direction of thresholding ('both', 'up',
                 'down').
+            length (float or None): Recording length in ms. When
+                ``None``, the length is inferred from ``data.shape[1]``.
+                Pass an explicit value to honour trailing silence
+                recorded in a file-level ``length_ms`` attribute.
+            start_time (float or None): Recording start time in ms.
+                When ``None``, defaults to 0.0. Pass an explicit value
+                for event-centered data or to honour a file-level
+                ``start_time`` attribute.
 
         Returns:
             sd (SpikeData): Object with the given raw data.
@@ -257,9 +268,12 @@ class SpikeData:
             diff = np.diff(np.array(raster, dtype=int), axis=1) == 1
             raster = np.hstack([np.zeros((diff.shape[0], 1), dtype=bool), diff])
 
-        return SpikeData.from_raster(
-            raster, 1e3 / fs_Hz, raw_data=data, raw_time=fs_Hz / 1e3
-        )
+        kwargs: dict = {"raw_data": data, "raw_time": fs_Hz / 1e3}
+        if length is not None:
+            kwargs["length"] = length
+        if start_time is not None:
+            kwargs["start_time"] = start_time
+        return SpikeData.from_raster(raster, 1e3 / fs_Hz, **kwargs)
 
     def __init__(
         self,
@@ -329,6 +343,8 @@ class SpikeData:
             length = max_spike - self.start_time
         if np.isnan(length):
             raise ValueError("length must not be NaN")
+        if np.isinf(length):
+            raise ValueError(f"length must be finite, got {length}")
         if length < 0:
             raise ValueError(f"length must be non-negative, got {length}")
         self.length = length
@@ -865,13 +881,39 @@ class SpikeData:
             values (single value or list): Single value (applied to all) or
                 list/array matching neuron_indices length for each neuron.
             neuron_indices (list): Neurons to update. If None, updates all.
+
+        Notes:
+            - Generator / iterator inputs are materialised via ``list()``
+              so the per-neuron values are stored individually. Without
+              this, the generator would be silently broadcast as a single
+              object across every neuron.
+            - 0-D numpy arrays (``np.array(5)``) are treated as scalars
+              even though they have ``__len__``-style attributes.
         """
         if not isinstance(key, str):
             raise TypeError(f"key must be a string, got {type(key).__name__}: {key!r}")
         if self.neuron_attributes is None:
             self.neuron_attributes = [{} for _ in range(self.N)]
         indices = range(self.N) if neuron_indices is None else neuron_indices
-        if hasattr(values, "__len__") and not isinstance(values, str):
+
+        # Materialise iterators/generators so each neuron gets a distinct
+        # value rather than the generator object itself.
+        if (
+            iter(values) is values
+            if hasattr(values, "__iter__") and not isinstance(values, (str, bytes))
+            else False
+        ):
+            values = list(values)
+
+        # 0-D ndarrays expose ``__len__`` indirectly but ``len(np.array(5))``
+        # raises. Treat them as scalar broadcasts.
+        is_zero_d_array = isinstance(values, np.ndarray) and values.ndim == 0
+
+        if (
+            not is_zero_d_array
+            and hasattr(values, "__len__")
+            and not isinstance(values, str)
+        ):
             indices = list(indices)
             if len(values) != len(indices):
                 raise ValueError(
@@ -880,8 +922,11 @@ class SpikeData:
             for i, val in zip(indices, values):
                 self.neuron_attributes[i][key] = val
         else:
+            # Unwrap 0-D arrays so the stored value is a Python scalar
+            # rather than a 0-D ndarray wrapper.
+            scalar = values.item() if is_zero_d_array else values
             for i in indices:
-                self.neuron_attributes[i][key] = values
+                self.neuron_attributes[i][key] = scalar
 
     def get_neuron_attribute(self, key: str, default=None):
         """Get an attribute across all neurons.
@@ -1303,6 +1348,10 @@ class SpikeData:
         """
         if np.isnan(bin_size) or bin_size <= 0:
             raise ValueError(f"bin_size must be > 0, got {bin_size}.")
+        if not np.isfinite(time_offset):
+            raise ValueError(
+                f"time_offset must be finite, got {time_offset}."
+            )
         if time_offset < -self.length:
             raise ValueError(
                 f"time_offset ({time_offset}) cannot be less than -length "
@@ -2596,6 +2645,12 @@ class SpikeData:
         """
         if window_ms < 1:
             raise ValueError("window_ms must be at least 1.")
+        if cut_outer < 0 or cut_outer >= window_ms:
+            raise ValueError(
+                f"cut_outer ({cut_outer}) must be in [0, window_ms={window_ms}); "
+                "a larger value would leave an empty trimmed array and the "
+                "downstream np.argmax would raise."
+            )
         if self.N < 2:
             raise ValueError("compute_spike_trig_pop_rate requires at least 2 units.")
         if not any(len(ts) > 0 for ts in self.train):

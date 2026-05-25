@@ -141,7 +141,15 @@ class RateSliceStack:
                 data_obj = data_obj.resampled_isi(all_times, sigma_ms)
 
             if len(data_obj.times) > 1:
-                self.step_size = data_obj.times[1] - data_obj.times[0]
+                # ``RateData.__init__`` allows monotonically non-decreasing
+                # times (equal consecutive values are accepted), so a
+                # non-uniform input could pass upstream validation. Use
+                # the median diff rather than ``times[1] - times[0]`` so a
+                # single anomalous gap or a duplicate-time pair at the
+                # start can't poison the step inference for the rest of
+                # the stack. The median is exact on a uniform grid.
+                diffs = np.diff(np.asarray(data_obj.times))
+                self.step_size = float(np.median(diffs))
             else:
                 self.step_size = 1.0
 

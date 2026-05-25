@@ -456,11 +456,12 @@ class RateData:
               accepts the embedding array directly and supports background
               masks, continuous colour values, and discrete group colouring.
         """
-        if (
-            isinstance(n_components, (int, float, np.integer, np.floating))
-            and n_components <= 0
+        if isinstance(n_components, (int, float, np.integer, np.floating)) and not (
+            n_components > 0 and np.isfinite(n_components)
         ):
-            raise ValueError(f"n_components must be > 0, got {n_components}")
+            raise ValueError(
+                f"n_components must be a positive finite number, got {n_components}"
+            )
 
         # Shape is (U, T); treat each time bin as a sample.
         data_T = self.inst_Frate_data.T  # (T, U)

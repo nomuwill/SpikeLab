@@ -126,20 +126,24 @@ def export_spikedata_to_hdf5(
     # been created and partially populated — the user is left with a
     # half-written file on disk. Validate the active style's time unit
     # against the unit→fs_Hz contract upfront.
-    if style == "ragged" and spike_times_unit == "samples" and not fs_Hz:
+    if (
+        style == "ragged"
+        and spike_times_unit == "samples"
+        and (not fs_Hz or fs_Hz <= 0)
+    ):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "spike_times_unit='samples' (style='ragged')."
+            f"spike_times_unit='samples' (style='ragged'), got {fs_Hz!r}."
         )
-    if style == "group" and group_time_unit == "samples" and not fs_Hz:
+    if style == "group" and group_time_unit == "samples" and (not fs_Hz or fs_Hz <= 0):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "group_time_unit='samples' (style='group')."
+            f"group_time_unit='samples' (style='group'), got {fs_Hz!r}."
         )
-    if style == "paired" and times_unit == "samples" and not fs_Hz:
+    if style == "paired" and times_unit == "samples" and (not fs_Hz or fs_Hz <= 0):
         raise ValueError(
             "fs_Hz must be provided and > 0 when "
-            "times_unit='samples' (style='paired')."
+            f"times_unit='samples' (style='paired'), got {fs_Hz!r}."
         )
 
     # Create or overwrite the HDF5 file

@@ -556,9 +556,7 @@ def load_spikedata_from_hdf5_raw_thresholded(
         # round-trip semantics for trailing silence and event-centered
         # start_time: the raster path preserved them, the thresholded
         # path silently inferred from data shape.
-        file_length = (
-            float(f.attrs["length_ms"]) if "length_ms" in f.attrs else None
-        )
+        file_length = float(f.attrs["length_ms"]) if "length_ms" in f.attrs else None
         file_start_time = (
             float(f.attrs["start_time"]) if "start_time" in f.attrs else None
         )

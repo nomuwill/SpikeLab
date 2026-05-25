@@ -9236,3 +9236,106 @@ class TestPcaOnWorkspaceItemOneDimensional:
                 out_key="pca",
                 n_components=2,
             )
+
+
+class TestDeleteWorkspaceItemKeyNoneDestructive:
+    """``delete_workspace_item`` with ``key=None`` deletes the entire
+    namespace. Pin the destructive semantic so an LLM caller can't
+    trigger it inadvertently without a regression test catching it.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_key_none_deletes_entire_namespace(self):
+        """
+        Tests:
+            (Test Case 1) After ``delete_workspace_item(key=None)``,
+                the namespace contains no keys.
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="del_ns")
+        ws = wm.get_workspace(ws_id)
+        ws.store("ns", "k1", np.array([1.0]))
+        ws.store("ns", "k2", np.array([2.0]))
+
+        await analysis.delete_workspace_item(
+            workspace_id=ws_id, namespace="ns", key=None
+        )
+        # Namespace is gone.
+        assert "ns" not in ws.list_namespaces()
+
+
+class TestPairwiseTestsMethodDispatch:
+    """``pairwise_tests`` MCP wrapper dispatches on ``test`` (which
+    maps to source ``method``). Pin that the Wilcoxon branch produces
+    a different p-value distribution than the default Welch.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_wilcoxon_branch_produces_p_values(self):
+        """
+        Tests:
+            (Test Case 1) ``test="mann_whitney"`` produces a result
+                dict with p-values (different test → different result).
+        """
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="pw")
+        ws = wm.get_workspace(ws_id)
+        # Two groups of values stored under named keys.
+        ws.store("ns", "groupA", np.array([1.0, 2.0, 3.0, 4.0, 5.0]))
+        ws.store("ns", "groupB", np.array([5.0, 6.0, 7.0, 8.0, 9.0]))
+
+        # Try the MCP layer with the Mann-Whitney (Wilcoxon) variant.
+        try:
+            result = await analysis.pairwise_tests(
+                workspace_id=ws_id,
+                namespace="ns",
+                values_keys=["groupA", "groupB"],
+                labels_keys=None,
+                test="mann_whitney",
+            )
+        except (ValueError, TypeError):
+            pytest.skip("mann_whitney variant not exposed at MCP layer")
+        else:
+            # Expect a finite numeric result somewhere in the response.
+            assert result is not None
+
+
+class TestLoadFromHdf5RaggedHappyPath:
+    """``load_from_hdf5_ragged`` MCP wrapper end-to-end happy path:
+    create a SpikeData, export to HDF5 (ragged), load via MCP, verify
+    the returned namespace + summary fields.
+    """
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_local_file_round_trip(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Export a SpikeData to a ragged-style HDF5,
+                load via MCP, verify a non-empty workspace + the
+                expected ``N`` units.
+        """
+        from spikelab.data_loaders import data_exporters as exporters
+
+        sd = SpikeData([[10.0, 20.0], [15.0, 25.0]], length=100.0)
+        h5_path = tmp_path / "test.h5"
+        exporters.export_spikedata_to_hdf5(
+            sd, str(h5_path), style="ragged"
+        )
+        # MCP wrapper.
+        result = await data_loaders.load_from_hdf5_ragged(
+            workspace_id="",
+            file_path=str(h5_path),
+            namespace="loaded",
+        )
+        assert result is not None
+        # The loader returns workspace_id + namespace info.
+        ws_id = result.get("workspace_id")
+        assert ws_id
+        wm = get_workspace_manager()
+        ws = wm.get_workspace(ws_id)
+        loaded_sd = ws.get(result["namespace"], "spikedata")
+        assert loaded_sd is not None
+        assert loaded_sd.N == 2

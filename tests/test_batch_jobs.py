@@ -137,18 +137,21 @@ def test_namespace_hooks_no_match_leaves_manifest_unchanged():
     assert "/etc/test-creds" not in mount_paths
 
 
-def test_volume_mount_name_with_newline_is_sanitized():
+def test_volume_mount_name_with_newline_raises():
     """
-    ``VolumeMountSpec(name="bad\\nname", ...)`` flows through
-    ``build_template_context`` and the rendered YAML must keep its
-    structure: the newline is stripped from the mount name and the
-    document parses cleanly.
+    Tier L-C1: ``VolumeMountSpec(name="bad\\nname", ...)`` flowing
+    through ``build_template_context`` now raises ``ValueError``
+    instead of silently stripping the newline. The error message
+    names the offending field path so the operator can locate the
+    bad entry.
 
     Tests:
-        (Test Case 1) The rendered ``volumeMounts[0].name`` contains
-            no newline (sanitized to ``"badname"``).
-        (Test Case 2) The full YAML round-trips through ``yaml.safe_load``.
+        (Test Case 1) ``build_template_context`` raises ValueError
+            whose message contains ``volume[bad\\nname].name`` and
+            mentions the newline char.
     """
+    import pytest
+
     payload = _example_payload()
     payload["namespace"] = "test-ns"
     payload["volumes"] = [
@@ -160,36 +163,30 @@ def test_volume_mount_name_with_newline_is_sanitized():
     ]
     job_spec = validate_job_spec(payload)
     profile = ClusterProfile(name="vol-sanitize-test")
-    context = build_template_context(
-        job_name="vol-test",
-        job_spec=job_spec,
-        profile=profile,
-    )
-    manifest = render_job_manifest(context)
-    parsed = yaml.safe_load(manifest)
-    mounts = parsed["spec"]["template"]["spec"]["containers"][0].get(
-        "volumeMounts", []
-    )
-    assert mounts, "expected at least one volume mount"
-    names = [m.get("name") for m in mounts]
-    assert "badname" in names
-    # No mount name contains the embedded newline.
-    for name in names:
-        assert "\n" not in name
+    with pytest.raises(ValueError, match="YAML-unsafe character"):
+        build_template_context(
+            job_name="vol-test",
+            job_spec=job_spec,
+            profile=profile,
+        )
 
 
-def test_namespace_hook_env_defaults_are_sanitized():
+def test_namespace_hook_env_defaults_with_newline_raises():
     """
-    Hook-supplied ``env_defaults`` flow through ``_sanitize_map`` before
-    they merge into the container env — newlines / quotes embedded in
-    a hook value cannot escape the rendered YAML structure.
+    Tier L-C1: hook-supplied ``env_defaults`` values containing YAML-
+    unsafe characters now raise ValueError when the hook merges into
+    the container env, instead of silently stripping the offending
+    chars. The error names the hook + key path so the offending
+    profile entry can be located.
 
     Tests:
         (Test Case 1) ``NamespaceHookSpec(env_defaults={"FOO":
-            "value\\nwith\\nnewlines"})`` produces a container.env
-            entry ``FOO`` with the newlines stripped.
-        (Test Case 2) The full YAML round-trips through ``yaml.safe_load``.
+            "value\\nwith\\nnewlines"})`` causes
+            ``build_template_context`` to raise ValueError whose
+            message mentions ``hooks.test-ns.env_defaults.FOO``.
     """
+    import pytest
+
     payload = _example_payload()
     payload["namespace"] = "test-ns"
     # No user-set FOO so the hook value wins.
@@ -210,18 +207,12 @@ def test_namespace_hook_env_defaults_are_sanitized():
             )
         },
     )
-    context = build_template_context(
-        job_name="env-test",
-        job_spec=job_spec,
-        profile=profile,
-    )
-    manifest = render_job_manifest(context)
-    parsed = yaml.safe_load(manifest)
-    env_list = parsed["spec"]["template"]["spec"]["containers"][0]["env"]
-    env_by_name = {e["name"]: e["value"] for e in env_list}
-    assert "FOO" in env_by_name
-    assert "\n" not in env_by_name["FOO"]
-    assert env_by_name["FOO"] == "valuewithnewlines"
+    with pytest.raises(ValueError, match="YAML-unsafe character"):
+        build_template_context(
+            job_name="env-test",
+            job_spec=job_spec,
+            profile=profile,
+        )
 
 
 def test_job_yaml_quoting_handles_special_characters():
@@ -4920,25 +4911,36 @@ class TestCli:
 class TestTemplating:
     """Edge cases for the templating module."""
 
-    def test_sanitize_yaml_value_strips_unsafe_chars(self):
-        """_sanitize_yaml_value removes newlines, tabs, quotes, backslashes."""
+    def test_sanitize_yaml_value_raises_on_unsafe_chars(self):
+        """Tier L-C1: _sanitize_yaml_value raises ValueError on unsafe chars.
+
+        Previously the function silently stripped \\n / \\t / " / \\
+        from the value. Tier L-C1 replaces the silent strip with a
+        fail-fast ValueError so commands and label values that
+        depend on those characters can't be silently mangled.
+        """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
-        result = _sanitize_yaml_value('hello\nworld\t"test\\value')
-        assert "\n" not in result
-        assert "\t" not in result
-        assert '"' not in result
-        assert "\\" not in result
-        assert result == "helloworldtestvalue"
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value('hello\nworld\t"test\\value')
+        # Safe inputs round-trip unchanged.
+        assert _sanitize_yaml_value("hello world") == "hello world"
+        assert _sanitize_yaml_value("foo:bar/baz") == "foo:bar/baz"
 
-    def test_sanitize_yaml_value_injection_attempt(self):
-        """YAML injection via label values is stripped."""
+    def test_sanitize_yaml_value_injection_attempt_rejected(self):
+        """Tier L-C1: YAML injection via label values raises ValueError.
+
+        The fail-fast contract surfaces the offending characters in
+        the error message; operators can't silently ship a job spec
+        whose newlines would inject extra YAML nodes.
+        """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
         malicious = 'value"\ninjected_key: injected_value'
-        result = _sanitize_yaml_value(malicious)
-        assert "\n" not in result
-        assert '"' not in result
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value(malicious)
 
     def test_build_pod_volumes_mount_with_no_name_skipped(self):
         """Mounts with no name are silently dropped."""
@@ -5918,14 +5920,20 @@ class TestTemplatingSanitizers:
 
         assert _sanitize_yaml_value("") == ""
 
-    def test_all_unsafe_chars_returns_empty(self):
+    def test_all_unsafe_chars_raises(self):
         """
+        Tier L-C1: an input composed entirely of unsafe characters
+        raises ValueError naming each unsafe character in the
+        message. Previously this returned empty string (silent mangle).
+
         Tests:
-            (Test Case 1) ``"\\n\\t\\""`` (all unsafe) returns empty.
+            (Test Case 1) ``"\\n\\t\\""`` raises ValueError.
         """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
-        assert _sanitize_yaml_value('\n\t"') == ""
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value('\n\t"')
 
 
 class TestLoadProfileFromNameBoundaries:

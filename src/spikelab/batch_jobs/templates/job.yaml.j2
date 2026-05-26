@@ -1,8 +1,8 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ job_name }}
-  namespace: {{ namespace }}
+  name: "{{ job_name }}"
+  namespace: "{{ namespace }}"
   labels:
 {% for key, value in labels.items() %}
     {{ key }}: "{{ value }}"
@@ -31,8 +31,8 @@ spec:
 {% endif %}
       containers:
       - name: analysis
-        image: {{ container.image }}
-        imagePullPolicy: {{ container.image_pull_policy }}
+        image: "{{ container.image }}"
+        imagePullPolicy: "{{ container.image_pull_policy }}"
 {% if container.command %}
         command:
 {% for part in container.command %}
@@ -48,7 +48,7 @@ spec:
 {% if container.env %}
         env:
 {% for key, value in container.env.items() %}
-        - name: {{ key }}
+        - name: "{{ key }}"
           value: "{{ value }}"
 {% endfor %}
 {% endif %}
@@ -68,7 +68,7 @@ spec:
 {% if volume_mounts %}
         volumeMounts:
 {% for volume in volume_mounts %}
-        - name: {{ volume.name }}
+        - name: "{{ volume.name }}"
           mountPath: "{{ volume.mount_path }}"
 {% if volume.sub_path %}
           subPath: "{{ volume.sub_path }}"
@@ -79,13 +79,13 @@ spec:
 {% if pod_volumes %}
       volumes:
 {% for volume in pod_volumes %}
-      - name: {{ volume.name }}
+      - name: "{{ volume.name }}"
 {% if volume.secret_name %}
         secret:
-          secretName: {{ volume.secret_name }}
+          secretName: "{{ volume.secret_name }}"
 {% elif volume.pvc_name %}
         persistentVolumeClaim:
-          claimName: {{ volume.pvc_name }}
+          claimName: "{{ volume.pvc_name }}"
 {% endif %}
 {% endfor %}
 {% endif %}

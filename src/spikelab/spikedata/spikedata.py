@@ -274,9 +274,12 @@ class SpikeData:
             # bin earlier than its actual crossing time (since diff
             # shifts everything left by one). Prepend a False column to
             # restore both: the raster regains its original (N, T)
-            # shape, and a rising edge at original sample t+1 maps
-            # back to raster bin t+1. The prepended column is a true
-            # statement — a rising edge cannot occur at sample 0.
+            # shape, and a fresh threshold crossing at original sample
+            # t+1 maps back to raster bin t+1. The prepended column is
+            # a true statement under all directions: a crossing
+            # (up-cross, down-cross, or either-direction) cannot occur
+            # at sample 0 because there is no preceding sample to
+            # compare against.
             diff = np.diff(np.array(raster, dtype=int), axis=1) == 1
             raster = np.hstack([np.zeros((diff.shape[0], 1), dtype=bool), diff])
 
@@ -1800,13 +1803,15 @@ class SpikeData:
             if length is None:
                 length = float(np.max(flat)) if len(flat) > 0 else 0.0
             upper = nb_sttc_all_pairs(flat, offsets, self.N, delt, length)
-            # Unpack upper-triangle vector into symmetric matrix
+            # Unpack upper-triangle vector into symmetric matrix. The
+            # earlier Python double-loop ran ~N^2/2 iterations at
+            # interpreter speed — for N=1000 that is ~500k iterations
+            # purely to copy floats. ``triu_indices`` + a single
+            # symmetric assignment runs entirely in NumPy C.
             ret = np.eye(self.N)
-            k = 0
-            for i in range(self.N):
-                for j in range(i + 1, self.N):
-                    ret[i, j] = ret[j, i] = upper[k]
-                    k += 1
+            triu_idx = np.triu_indices(self.N, k=1)
+            ret[triu_idx] = upper
+            ret[(triu_idx[1], triu_idx[0])] = upper
             return PairwiseCompMatrix(matrix=ret, metadata={"delt": delt})
 
         ret = np.eye(self.N)

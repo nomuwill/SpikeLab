@@ -81,6 +81,12 @@ class PolicyConfig(BaseModel):
     max_runtime_seconds: int = Field(default=1_209_600, ge=1)  # 14 days
     block_sleep_infinity: bool = True
     warn_request_limit_mismatch: bool = True
+    sleep_duration_threshold_s: int = Field(
+        default=86_400, ge=1
+    )  # 24 hours — bare ``sleep <n>`` durations >= this are flagged
+    # as idle-placeholders. Separate from ``max_runtime_seconds``
+    # because the check targets compute-masquerading sleeps, not
+    # the job's overall wall-clock budget.
 
 
 class JobSpec(BaseModel):

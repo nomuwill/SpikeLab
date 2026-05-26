@@ -38,6 +38,33 @@ def _template_env() -> Environment:
     )
 
 
+_VOLUME_STRING_FIELDS = (
+    "name",
+    "mount_path",
+    "sub_path",
+    "secret_name",
+    "pvc_name",
+)
+
+
+def _sanitize_volume_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize string fields on a single volume-mount dict.
+
+    Mirrors the ``container.env`` / ``container.command`` sanitization
+    pass in ``build_template_context`` but applied to the volume-mount
+    payload, which previously flowed into ``job.yaml.j2`` unfiltered.
+    A volume name containing ``\\n`` or ``"`` could break the rendered
+    YAML structure; this strips the same set of YAML-unsafe characters
+    as ``_sanitize_yaml_value``.
+    """
+    cleaned = dict(entry)
+    for field in _VOLUME_STRING_FIELDS:
+        value = cleaned.get(field)
+        if isinstance(value, str):
+            cleaned[field] = _sanitize_yaml_value(value)
+    return cleaned
+
+
 def _volume_entry_key(entry: Dict[str, Any]) -> Tuple[str, str, str]:
     return (
         str(entry.get("name", "")),
@@ -69,7 +96,7 @@ def _apply_namespace_hooks(
 
     # Always-on default volumes from profile
     for vol in profile.default_volumes:
-        entry = vol.model_dump()
+        entry = _sanitize_volume_entry(vol.model_dump())
         key = _volume_entry_key(entry)
         if key not in seen:
             merged_mounts.append(entry)
@@ -89,12 +116,17 @@ def _apply_namespace_hooks(
     # Merge hook env_defaults (hook values do not override user-specified keys)
     if hook.env_defaults:
         existing_env = updated_container.get("env", {})
-        merged_env = dict(hook.env_defaults)
+        # Sanitize hook env_defaults BEFORE the merge — the user's
+        # ``container.env`` was already sanitized at the call site in
+        # ``build_template_context``, but hook values bypass that pass
+        # and would otherwise embed un-escaped ``\n`` / ``"`` directly
+        # into the rendered YAML.
+        merged_env = _sanitize_map(dict(hook.env_defaults))
         merged_env.update(existing_env)  # user keys take precedence
         updated_container["env"] = merged_env
 
     for vol in hook.required_volumes:
-        entry = vol.model_dump()
+        entry = _sanitize_volume_entry(vol.model_dump())
         key = _volume_entry_key(entry)
         if key not in seen:
             merged_mounts.append(entry)
@@ -167,7 +199,9 @@ def build_template_context(
         labels.update(extra_labels)
     labels = _sanitize_map(labels)
     namespace = job_spec.namespace or profile.namespace
-    mounts = [volume.model_dump() for volume in job_spec.volumes]
+    mounts = [
+        _sanitize_volume_entry(volume.model_dump()) for volume in job_spec.volumes
+    ]
     container = job_spec.container.model_dump()
     container["env"] = _sanitize_map(container.get("env", {}))
     container["command"] = _sanitize_list(container.get("command", []))

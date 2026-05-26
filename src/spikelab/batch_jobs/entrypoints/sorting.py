@@ -67,13 +67,26 @@ def _reconstruct_config(config_dict: dict):
 
     import typing
 
+    # Resolve top-level field annotations explicitly. Under
+    # ``from __future__ import annotations`` (which spike_sorting.config
+    # does NOT use today, but which a future cleanup pass might add),
+    # ``f.type`` would be the string ``"RecordingConfig"`` and the
+    # naive ``f.type(**sub_dict)`` would crash with
+    # ``TypeError: 'str' object is not callable``. Resolve via
+    # ``get_type_hints`` so both annotation modes work.
+    try:
+        top_hints = typing.get_type_hints(SortingPipelineConfig)
+    except Exception:
+        top_hints = {}
+
     sub_configs = {}
     for f in fields(SortingPipelineConfig):
         sub_dict = config_dict.get(f.name, {})
-        sub_instance = f.type(**sub_dict)
+        sub_cls = top_hints.get(f.name, f.type)
+        sub_instance = sub_cls(**sub_dict)
         # Restore Path fields on the just-constructed sub-config.
         try:
-            sub_hints = typing.get_type_hints(f.type)
+            sub_hints = typing.get_type_hints(sub_cls)
         except Exception:
             sub_hints = {}
         for sub_field_name, sub_annotation in sub_hints.items():

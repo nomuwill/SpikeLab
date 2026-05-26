@@ -513,8 +513,13 @@ class LazyAnalysisWorkspace(AnalysisWorkspace):
     @property
     def _items(self):
         raise NotImplementedError(
-            "LazyAnalysisWorkspace does not use _items. "
-            "Override the parent method to use _index and the HDF5 file instead."
+            "LazyAnalysisWorkspace does not expose ``_items``; objects "
+            "are deserialised from the temp HDF5 file on each ``get()`` "
+            "call. Use ``list_namespaces()`` / ``list_keys(namespace)`` "
+            "/ ``get(namespace, key)`` instead. (Note: ``dump_workspace`` "
+            "iterates ``ws._items.items()`` and therefore cannot be "
+            "called on a LazyAnalysisWorkspace — use ``save(path)`` "
+            "which copies the temp file directly.)"
         )
 
     @_items.setter

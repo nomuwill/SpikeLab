@@ -52,11 +52,15 @@ def redact_sensitive_map(values: Dict[str, Optional[str]]) -> Dict[str, str]:
           non-secret keys that happened to contain ``SECRET``) as a
           false positive — the value of ``SECRETS_PATH`` is a
           filesystem path, not a credential.
+        - ``None`` inputs render as the literal ``"<unset>"`` so the
+          audit log can distinguish "credential is not configured"
+          from "credential is configured but empty" (the prior
+          implementation collapsed both into ``""``).
     """
     redacted: Dict[str, str] = {}
     for key, value in values.items():
         if value is None:
-            redacted[key] = ""
+            redacted[key] = "<unset>"
             continue
         key_upper = key.upper()
         if any(pat.search(key_upper) for pat in _SENSITIVE_PATTERNS):

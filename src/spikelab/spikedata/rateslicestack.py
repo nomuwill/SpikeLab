@@ -471,6 +471,16 @@ class RateSliceStack:
             # --- Vectorized fast path (no lag search) -------------------------
             # For each unit, compute the full S x S normalised dot-product
             # matrix in one matrix multiply instead of an O(S^2) Python loop.
+            # The build-then-mask pattern (compute corr_matrix over ALL
+            # slices, then assign only into valid-vs-valid pairs of
+            # ``unit_corr``) is mathematically equivalent to slicing by
+            # ``valid_idx`` before the matmul — the invalid columns
+            # contribute to ``corr_matrix`` but are never read.
+            # Mask-after-matmul is preferred because (a) BLAS matmul on
+            # a contiguous (T, S) array beats two non-contiguous
+            # ``rates[:, valid_idx]`` slices, and (b) the S<2 short-
+            # circuit above already guarantees that the matmul has
+            # work to do.
             for unit in range(num_units):
                 rates = event_stack[unit, :, :]  # (T, S)
                 slice_means = np.mean(rates, axis=0)  # (S,)

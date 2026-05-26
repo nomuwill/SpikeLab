@@ -255,9 +255,7 @@ async def compute_resampled_isi(
             "times array before calling."
         )
     median_step = float(np.median(diffs))
-    if median_step <= 0 or not np.allclose(
-        diffs, median_step, rtol=1e-6, atol=1e-9
-    ):
+    if median_step <= 0 or not np.allclose(diffs, median_step, rtol=1e-6, atol=1e-9):
         raise ValueError(
             "compute_resampled_isi: times must be uniformly spaced. "
             f"Got median step={median_step:g}, min step={diffs.min():g}, "

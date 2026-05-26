@@ -194,6 +194,14 @@ def _resampled_isi(spikes, times, sigma_ms):
         Assumed to have been sampled halfway between any two given spikes,
         interpolated, and then smoothed by a Gaussian kernel with the given
         width.
+
+        Bin assignment uses ``int(round(...))`` rather than ``floor``,
+        which means a spike landing at exactly ``0.5 * dt_ms`` past a
+        bin boundary can fall into either the lower or upper bin (a
+        known sub-ms precision limitation). For typical ``dt_ms`` of
+        1ms+ this introduces at most a one-bin shift; for sub-ms
+        ``dt_ms`` the caller should be aware that pinning the exact
+        bin of a boundary-spike requires a separate convention.
     """
 
     # Empty times → empty rates. Matches the empty-friendly behaviour
@@ -1638,10 +1646,7 @@ def _validate_time_start_to_end(
     zero_duration_offenders = []
     negative_start_offenders = []
     sorted_times = sorted(times_start_to_end)
-    if (
-        len(times_start_to_end) > 1
-        and list(times_start_to_end) != sorted_times
-    ):
+    if len(times_start_to_end) > 1 and list(times_start_to_end) != sorted_times:
         # The sort decouples the returned slice order from the
         # caller's input order. That's fine if no parallel array is
         # bound to the input positions, but it silently breaks

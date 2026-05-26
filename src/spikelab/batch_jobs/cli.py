@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import yaml
+from pydantic import ValidationError
 
 from .backend_k8s import KubernetesBatchJobBackend
 from .credentials import resolve_credentials
@@ -116,9 +117,17 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     )
     try:
         job_spec = validate_job_spec(payload)
+    except ValidationError as exc:
+        # Nominal match (``isinstance``) rather than structural
+        # (``hasattr(exc, "errors")``) — the previous form would also
+        # match unrelated exceptions that happen to expose an
+        # ``errors`` attribute and route them through the pydantic
+        # summariser, which then produced a noisy traceback.
+        raise SystemExit(
+            f"Invalid job config: {summarize_validation_error(exc)}"
+        ) from exc
     except Exception as exc:
-        msg = summarize_validation_error(exc) if hasattr(exc, "errors") else str(exc)
-        raise SystemExit(f"Invalid job config: {msg}") from exc
+        raise SystemExit(f"Invalid job config: {exc}") from exc
 
     if args.render_only:
         manifest = session.render_manifest(

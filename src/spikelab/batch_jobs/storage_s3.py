@@ -67,9 +67,7 @@ class S3StorageClient:
         """
         if self._client_instance is None:
             if boto3 is None:
-                raise ImportError(
-                    "boto3 is required for S3 storage: pip install boto3"
-                )
+                raise ImportError("boto3 is required for S3 storage: pip install boto3")
             self._client_instance = boto3.client("s3", **self._boto3_kwargs)
         return self._client_instance
 
@@ -186,22 +184,43 @@ class S3StorageClient:
         s3_uri = prefix + filename
         return self.download_file(s3_uri=s3_uri, local_path=str(target))
 
-    def list_output_files(self, run_id: str) -> list:
+    DEFAULT_LIST_OUTPUT_LIMIT = 10_000
+
+    def list_output_files(self, run_id: str, *, max_keys: Optional[int] = None) -> list:
         """List object keys under the output prefix of a run.
 
         Parameters:
             run_id (str): Run identifier.
+            max_keys (int | None): Cap on the number of keys returned.
+                Defaults to ``DEFAULT_LIST_OUTPUT_LIMIT`` (10000) to
+                guard against unbounded memory use on long-running jobs
+                that produced thousands of intermediate files (QC
+                figures, per-recording reports, etc.). Pass an explicit
+                larger value if the caller really needs the full list;
+                exceeding the cap raises ``ValueError`` rather than
+                silently truncating.
 
         Returns:
             keys (list[str]): S3 object keys found under the output prefix.
+
+        Raises:
+            ValueError: When more than ``max_keys`` objects exist under
+                the prefix.
         """
         prefix = self.output_prefix_for_run(run_id)
         if not prefix:
             return []
+        cap = self.DEFAULT_LIST_OUTPUT_LIMIT if max_keys is None else max_keys
         bucket, key_prefix = parse_s3_url(prefix)
         paginator = self._client.get_paginator("list_objects_v2")
-        keys = []
+        keys: list = []
         for page in paginator.paginate(Bucket=bucket, Prefix=key_prefix):
             for obj in page.get("Contents", []):
                 keys.append(obj["Key"])
+                if len(keys) > cap:
+                    raise ValueError(
+                        f"list_output_files: more than max_keys={cap} objects "
+                        f"under prefix={prefix!r}. Pass a larger ``max_keys`` "
+                        "if this is expected; otherwise narrow the run_id."
+                    )
         return keys

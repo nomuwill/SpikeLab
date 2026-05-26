@@ -22,10 +22,17 @@ class PolicyFinding:
     message: str
 
 
-_SLEEP_THRESHOLD = 86_400  # 24 hours in seconds
+_SLEEP_THRESHOLD_DEFAULT = 86_400  # 24 hours in seconds — backstop when no
+# PolicyConfig is supplied (kept as a
+# module constant for direct callers).
 
 
-def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> bool:
+def _contains_disallowed_sleep(
+    command: Sequence[str],
+    args: Sequence[str],
+    *,
+    threshold_s: int = _SLEEP_THRESHOLD_DEFAULT,
+) -> bool:
     """Detect idle-placeholder sleep patterns in batch job commands.
 
     This is a best-effort heuristic, not a security boundary. It catches
@@ -34,6 +41,14 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
     constructs like ``while true; do sleep 60; done`` or obfuscated
     variants. The goal is to flag accidental misuse, not to prevent
     determined circumvention.
+
+    Parameters:
+        command (Sequence[str]): The container's command tokens.
+        args (Sequence[str]): The container's arg tokens.
+        threshold_s (int): Cap (in seconds) above which a bare
+            ``sleep <number>`` is considered idle. Defaults to 24h.
+            Pulled from ``PolicyConfig.sleep_duration_threshold_s`` by
+            ``evaluate_policy``.
 
     Notes:
         - The bare-``sleep`` check fires only when ``sleep`` is the sole
@@ -70,7 +85,7 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
             # the actual sleep binary rejects these, and a job spec with
             # such a token is almost certainly a bug or an obfuscation
             # attempt around the literal "inf" / "infinity" check above.
-            if not math.isfinite(duration) or duration >= _SLEEP_THRESHOLD:
+            if not math.isfinite(duration) or duration >= threshold_s:
                 return True
         except (ValueError, IndexError):
             pass
@@ -106,7 +121,9 @@ def evaluate_policy(
         )
 
     sleep_present = _contains_disallowed_sleep(
-        job_spec.container.command, job_spec.container.args
+        job_spec.container.command,
+        job_spec.container.args,
+        threshold_s=cfg.sleep_duration_threshold_s,
     )
     if cfg.block_sleep_infinity and sleep_present:
         findings.append(

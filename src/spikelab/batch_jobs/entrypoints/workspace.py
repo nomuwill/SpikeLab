@@ -180,9 +180,7 @@ def main() -> None:
             "__name__": "__main__",
         }
         try:
-            runpy.run_path(
-                script_path, init_globals=run_globals, run_name="__main__"
-            )
+            runpy.run_path(script_path, init_globals=run_globals, run_name="__main__")
         except BaseException as exc:
             print(
                 f"WORKSPACE_SCRIPT_FAILED: {type(exc).__name__}: {exc}",

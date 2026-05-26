@@ -281,6 +281,15 @@ class RateData:
             - To slice by time values instead of array indices, use
               ``subtime(start, end)``.
         """
+        # Empty-times guard. ``subtime`` raises a clear "cannot apply
+        # subtime to RateData with empty times array" — match that
+        # contract here so callers from MCP (``ratedata_subtime``) see
+        # the same diagnostic regardless of which path they hit.
+        if len(self.times) == 0:
+            raise ValueError(
+                "cannot apply subtime_by_index to RateData with empty "
+                "times array (no time points to slice)."
+            )
         if start_idx < 0:
             start_idx += len(self.times)
         if end_idx < 0:

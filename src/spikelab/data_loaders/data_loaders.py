@@ -895,10 +895,25 @@ def load_spikedata_from_spikeinterface(
         sampling_frequency (float | None): Optional override for sampling
             frequency (Hz).
         unit_ids (Sequence | None): Optional subset of unit IDs to include.
+            When provided, the order of the returned SpikeData's units
+            follows the caller's order (after presence validation).
         segment_index (int): Segment index for multi-segment sortings.
 
     Returns:
         sd (SpikeData): The converted spike train data.
+
+    Notes:
+        - When ``unit_ids is None``, the resulting unit order follows
+          ``sorting.get_unit_ids()`` order, which is backend-dependent
+          (KiloSort returns sequential IDs; some SpikeInterface
+          variants reorder by sort metric). Two SpikeData objects
+          built from different backends may therefore index the same
+          physical unit at different positions. Pass an explicit
+          ``unit_ids`` sequence when the unit ordering matters across
+          backends.
+        - ``neuron_attributes[i]["unit_id"]`` records the original
+          backend ID, providing a stable mapping from position to
+          source ID irrespective of the order convention.
     """
     try:
         get_unit_ids = sorting.get_unit_ids  # type: ignore[attr-defined]

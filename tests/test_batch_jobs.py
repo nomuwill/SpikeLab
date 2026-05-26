@@ -494,7 +494,14 @@ def test_policy_blocks_sleep_infinity():
 
 
 def test_policy_uses_profile_thresholds():
-    """Policy thresholds come from the profile, not hardcoded values."""
+    """Policy thresholds come from the profile, not hardcoded values.
+
+    Tier L-C4 changed the default to ``include_passes=False`` so a
+    passing check no longer emits a PASS finding. The relaxed-profile
+    branch now asserts the absence of an ``interactive_gpu_limit``
+    finding, and passes ``include_passes=True`` to confirm the PASS
+    finding is still available for audit tooling.
+    """
     payload = _example_payload()
     payload["resources"]["requests_gpu"] = 3
     payload["resources"]["limits_gpu"] = 3
@@ -504,7 +511,7 @@ def test_policy_uses_profile_thresholds():
     findings = evaluate_policy(job_spec, profile_default)
     gpu_finding = [f for f in findings if f.code == "interactive_gpu_limit"][0]
     assert gpu_finding.level == "WARN"
-    # Raise threshold to 4 — should pass
+    # Raise threshold to 4 — should pass (silently under the default)
     from spikelab.batch_jobs.models import PolicyConfig
 
     profile_relaxed = ClusterProfile(
@@ -512,10 +519,19 @@ def test_policy_uses_profile_thresholds():
         policy=PolicyConfig(max_interactive_gpus=4),
     )
     findings_relaxed = evaluate_policy(job_spec, profile_relaxed)
-    gpu_finding_relaxed = [
+    gpu_findings_relaxed = [
         f for f in findings_relaxed if f.code == "interactive_gpu_limit"
+    ]
+    # Default (include_passes=False): no finding when the check passes.
+    assert gpu_findings_relaxed == []
+    # Audit mode: opt in to PASS findings.
+    findings_audit = evaluate_policy(
+        job_spec, profile_relaxed, include_passes=True
+    )
+    gpu_finding_audit = [
+        f for f in findings_audit if f.code == "interactive_gpu_limit"
     ][0]
-    assert gpu_finding_relaxed.level == "PASS"
+    assert gpu_finding_audit.level == "PASS"
 
 
 def test_redaction_hides_sensitive_fields():
@@ -1952,21 +1968,29 @@ class TestPolicy:
 
     def test_policy_long_runtime_pass_when_not_set(self):
         """
-        No active_deadline_seconds set produces a PASS finding (cluster
-        default applies). The other policy checks always emit a finding;
-        long_runtime now matches that pattern for audit-trail symmetry.
+        Tier L-C4: with the default ``include_passes=False``, a
+        passing long_runtime check emits NO finding. Opting in
+        with ``include_passes=True`` still produces the audit-trail
+        PASS entry naming the cluster-default fallback.
 
         Tests:
-            (Test Case 1) None deadline produces a long_runtime PASS.
-            (Test Case 2) The PASS message names the cluster-default
-                fallback so operators can see why no warning fired.
+            (Test Case 1) Default call returns no long_runtime
+                finding when active_deadline_seconds is None.
+            (Test Case 2) include_passes=True produces a PASS
+                finding whose message names the cluster-default
+                fallback.
         """
         payload = _example_payload()
         # active_deadline_seconds defaults to None
         job_spec = validate_job_spec(payload)
         profile = ClusterProfile(name="test")
+        # Default: silent on passing checks.
         findings = evaluate_policy(job_spec, profile)
-        long_finding = [f for f in findings if f.code == "long_runtime"][0]
+        long_findings = [f for f in findings if f.code == "long_runtime"]
+        assert long_findings == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        long_finding = [f for f in findings_audit if f.code == "long_runtime"][0]
         assert long_finding.level == "PASS"
         assert "cluster default" in long_finding.message
 
@@ -1982,7 +2006,12 @@ class TestPolicy:
         assert codes["request_limit_mismatch"] == "WARN"
 
     def test_policy_warn_mismatch_disabled_by_profile(self):
-        """request_limit_mismatch check can be disabled via profile."""
+        """request_limit_mismatch check can be disabled via profile.
+
+        Tier L-C4: default ``include_passes=False`` → no finding is
+        emitted when the check is disabled or passes. ``include_passes
+        =True`` restores the PASS audit entry.
+        """
         payload = _example_payload()
         payload["resources"]["requests_cpu"] = "1"
         payload["resources"]["limits_cpu"] = "4"
@@ -1991,8 +2020,12 @@ class TestPolicy:
             name="test",
             policy=PolicyConfig(warn_request_limit_mismatch=False),
         )
+        # Default: silent on disabled / passing checks.
         findings = evaluate_policy(job_spec, profile)
-        codes = {f.code: f.level for f in findings}
+        assert [f for f in findings if f.code == "request_limit_mismatch"] == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        codes = {f.code: f.level for f in findings_audit}
         assert codes["request_limit_mismatch"] == "PASS"
 
 
@@ -2038,7 +2071,13 @@ class TestBackend:
 
 class TestPolicyBoundary:
     def test_gpu_exactly_at_threshold(self):
-        """requests_gpu == max_interactive_gpus should PASS (not WARN)."""
+        """requests_gpu == max_interactive_gpus is treated as within-limit.
+
+        Tier L-C4: with the default ``include_passes=False``, an at-
+        threshold-but-not-over GPU request emits NO finding. The
+        ``include_passes=True`` opt-in still produces the PASS audit
+        entry.
+        """
         payload = _example_payload()
         payload["resources"]["requests_gpu"] = 2
         payload["resources"]["limits_gpu"] = 2
@@ -2047,8 +2086,14 @@ class TestPolicyBoundary:
             name="test",
             policy=PolicyConfig(max_interactive_gpus=2),
         )
+        # Default: silent on passing checks.
         findings = evaluate_policy(job_spec, profile)
-        gpu_finding = [f for f in findings if f.code == "interactive_gpu_limit"][0]
+        assert [f for f in findings if f.code == "interactive_gpu_limit"] == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        gpu_finding = [
+            f for f in findings_audit if f.code == "interactive_gpu_limit"
+        ][0]
         assert gpu_finding.level == "PASS"
 
     def test_block_sleep_infinity_disabled_emits_warn(self):
@@ -2073,13 +2118,15 @@ class TestPolicyBoundary:
     def test_active_deadline_at_boundary(self):
         """
         active_deadline_seconds == max_runtime_seconds is treated as
-        within-limit and produces a long_runtime PASS finding (not WARN).
+        within-limit. Tier L-C4: default ``include_passes=False`` →
+        no finding emitted (the WARN threshold is strict ``>``).
+        Opt-in ``include_passes=True`` produces the PASS audit entry.
 
         Tests:
-            (Test Case 1) Boundary deadline produces PASS (the WARN
-                threshold is strict ``>``).
-            (Test Case 2) The PASS message names both the actual
-                deadline and the configured maximum.
+            (Test Case 1) Default call returns no long_runtime
+                finding at the boundary.
+            (Test Case 2) include_passes=True produces a PASS whose
+                message names both the actual deadline and the max.
         """
         payload = _example_payload()
         payload["active_deadline_seconds"] = 1_209_600  # exactly 14 days
@@ -2088,8 +2135,12 @@ class TestPolicyBoundary:
             name="test",
             policy=PolicyConfig(max_runtime_seconds=1_209_600),
         )
+        # Default: silent.
         findings = evaluate_policy(job_spec, profile)
-        long_finding = [f for f in findings if f.code == "long_runtime"][0]
+        assert [f for f in findings if f.code == "long_runtime"] == []
+        # Audit mode: PASS entry.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        long_finding = [f for f in findings_audit if f.code == "long_runtime"][0]
         assert long_finding.level == "PASS"
         assert "1209600" in long_finding.message
 

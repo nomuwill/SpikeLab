@@ -96,8 +96,30 @@ def _contains_disallowed_sleep(
 def evaluate_policy(
     job_spec: JobSpec,
     profile: ClusterProfile,
+    *,
+    include_passes: bool = False,
 ) -> List[PolicyFinding]:
-    """Evaluate policy checks using profile-driven thresholds."""
+    """Evaluate policy checks using profile-driven thresholds.
+
+    Returns a list of :class:`PolicyFinding` entries describing the
+    outcome of each policy check.
+
+    Parameters:
+        job_spec (JobSpec): The job to evaluate.
+        profile (ClusterProfile): Cluster profile carrying the
+            :class:`PolicyConfig` thresholds.
+        include_passes (bool): When True, every check emits a
+            ``PolicyFinding(level="PASS", ...)`` entry alongside the
+            WARN / BLOCK entries — useful for compliance audit
+            tooling that needs a record that each check ran and
+            passed. Default False (Tier L-C4): the common case
+            (CLI preflight, job submission) gets terse output
+            containing only WARN / BLOCK entries, eliminating the
+            ~4 PASS-line log noise per compliant submission.
+
+    Returns:
+        findings (list[PolicyFinding]): Per-check outcomes.
+    """
     findings: List[PolicyFinding] = []
     res = job_spec.resources
     cfg: PolicyConfig = profile.policy
@@ -111,7 +133,7 @@ def evaluate_policy(
                 f"({cfg.max_interactive_gpus} GPUs).",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "interactive_gpu_limit",
@@ -136,10 +158,10 @@ def evaluate_policy(
         )
     elif sleep_present:
         # ``block_sleep_infinity`` is disabled in the profile, but a
-        # sleep pattern *was* detected. Surfacing this as a WARN keeps
-        # the audit trail honest — the previous code emitted a PASS
-        # ("No forbidden sleep patterns detected") even though the
-        # pattern was present, just not blocked.
+        # sleep pattern *was* detected. WARN keeps the audit trail
+        # honest — the previous code emitted a PASS even though the
+        # pattern was present, just not blocked. WARN is always
+        # emitted regardless of include_passes.
         findings.append(
             PolicyFinding(
                 "sleep_in_batch_job",
@@ -149,7 +171,7 @@ def evaluate_policy(
                 "but the pattern is recorded for audit.",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "sleep_in_batch_job",
@@ -168,7 +190,7 @@ def evaluate_policy(
                 "Cluster recommends requests close to limits; tune with monitoring.",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "request_limit_mismatch",
@@ -179,14 +201,15 @@ def evaluate_policy(
 
     if not job_spec.active_deadline_seconds:
         # No deadline set; the cluster's own max applies via Kubernetes.
-        # Emit a PASS finding so the audit trail is complete.
-        findings.append(
-            PolicyFinding(
-                "long_runtime",
-                "PASS",
-                "No active_deadline_seconds set; cluster default applies.",
+        # Audit-only PASS — gated by include_passes.
+        if include_passes:
+            findings.append(
+                PolicyFinding(
+                    "long_runtime",
+                    "PASS",
+                    "No active_deadline_seconds set; cluster default applies.",
+                )
             )
-        )
     elif job_spec.active_deadline_seconds > cfg.max_runtime_seconds:
         findings.append(
             PolicyFinding(
@@ -196,7 +219,7 @@ def evaluate_policy(
                 f"configured maximum ({cfg.max_runtime_seconds}s).",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "long_runtime",

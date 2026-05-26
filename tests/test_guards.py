@@ -9766,7 +9766,11 @@ class TestCheckDockerSorterDockerPyPath:
             def ping(self):
                 return True
 
-        fake_docker = SimpleNamespace(from_env=lambda: _FakeClient())
+        # ``from_env`` accepts ``**kwargs`` so the stub matches the
+        # ``timeout=5`` kwarg added to ``_check_image_cached`` in
+        # Tier L-B4 (preflight image-cache check no longer hangs
+        # on a frozen Docker daemon).
+        fake_docker = SimpleNamespace(from_env=lambda **kwargs: _FakeClient())
         monkeypatch.setitem(sys.modules, "docker", fake_docker)
 
         # ``get_docker_image`` is imported inside the function, so

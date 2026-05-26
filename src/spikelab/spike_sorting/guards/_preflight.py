@@ -854,7 +854,15 @@ def _check_image_cached(image_tag: str) -> bool:
         import docker as _docker  # type: ignore[import-not-found]
 
         try:
-            _docker.from_env().images.get(image_tag)
+            # ``timeout=5`` caps the underlying HTTP client's wait so
+            # a half-frozen Docker daemon (Desktop hung, snap-installed
+            # daemon stuck) cannot block preflight indefinitely. Older
+            # docker-py versions that don't accept the ``timeout``
+            # kwarg raise ``TypeError`` here — caught by the broad
+            # ``except Exception`` below, which returns False; the
+            # caller treats "uncertain → assume not cached → pull" as
+            # the conservative answer.
+            _docker.from_env(timeout=5).images.get(image_tag)
             return True
         except Exception:
             return False

@@ -1811,6 +1811,40 @@ class TestSpikeDataSlicing:
         assert len(result.train) == original_n
 
 
+class TestSpikeDataIdcesTimesPerf:
+    """``idces_times`` was rewritten in Tier K to use ``np.repeat`` +
+    ``np.concatenate`` instead of a Python append-loop. Pin
+    correctness against a small example (the perf optimisation must
+    not change values) plus the empty-SpikeData edge.
+    """
+
+    def test_idces_times_matches_repeat_and_concatenate(self):
+        """
+        Tests:
+            (Test Case 1) ``train=[[1.0, 2.0, 3.0], [], [10.0]]``
+                produces ``idces == [0, 0, 0, 2]`` and
+                ``times == [1.0, 2.0, 3.0, 10.0]``.
+        """
+        sd = SpikeData(
+            [np.array([1.0, 2.0, 3.0]), np.array([]), np.array([10.0])],
+            length=100.0,
+        )
+        idces, times = sd.idces_times()
+        np.testing.assert_array_equal(idces, np.array([0, 0, 0, 2]))
+        np.testing.assert_array_equal(times, np.array([1.0, 2.0, 3.0, 10.0]))
+
+    def test_idces_times_empty_spikedata_returns_two_empty_arrays(self):
+        """
+        Tests:
+            (Test Case 1) Empty ``train=[]`` returns ``(empty_int64,
+                empty_float)``.
+        """
+        sd = SpikeData([], N=0, length=100.0)
+        idces, times = sd.idces_times()
+        assert idces.size == 0
+        assert times.size == 0
+
+
 class TestSpikeDataRates:
     """Tests for SpikeData rate and binning methods: rates, raster, sparse_raster, binned, binned_meanrate, get_pop_rate, resampled_isi, interspike_intervals."""
 

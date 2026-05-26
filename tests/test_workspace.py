@@ -1029,30 +1029,34 @@ class TestMakeSummary:
     ):
         """
         ``_make_summary`` reports the per-slice length range when a
-        ``SpikeSliceStack`` has heterogeneous-duration slices (allowed
-        by the ``time_peaks + time_bounds`` constructor variant) —
-        the prior summary collapsed everything to the first slice's
-        length and silently misrepresented mixed-duration stacks.
+        ``SpikeSliceStack`` has heterogeneous-duration slice tuples.
+        Pin the defensive summary path that future heterogeneous-
+        durations support (e.g. ``time_peaks + time_bounds`` with
+        per-event bounds) would surface — for now we mutate
+        ``stack.times`` post-construction to bypass the equal-length
+        validator and exercise the same code path.
 
         Tests:
             (Test Case 1) Times ``[(0, 100), (100, 250)]`` → durations
                 ``[100.0, 150.0]`` → ``length_ms`` is a tuple
                 ``(100.0, 150.0)``.
-            (Test Case 2) A uniform-duration stack still returns a
-                single float for ``length_ms`` (round-trip with the
-                existing ``test_summary_spikeslicestack`` already
-                covered).
+            (Test Case 2) Uniform-duration stacks still return a
+                single float (covered by the existing
+                ``test_summary_spikeslicestack``).
         """
         from spikelab.spikedata.spikeslicestack import SpikeSliceStack
 
-        # Build a heterogeneous-duration stack manually so the
-        # validator doesn't reject it.
+        # Construct a uniform stack first (the validator only fires at
+        # __init__), then mutate ``stack.times`` to a heterogeneous
+        # layout to exercise the summary code path.
         sd1 = SpikeData([[10.0]], length=100.0)
-        sd2 = SpikeData([[50.0]], length=150.0)
+        sd2 = SpikeData([[50.0]], length=100.0)
         sss = SpikeSliceStack(
             spike_stack=[sd1, sd2],
-            times_start_to_end=[(0.0, 100.0), (100.0, 250.0)],
+            times_start_to_end=[(0.0, 100.0), (100.0, 200.0)],
         )
+        sss.times = [(0.0, 100.0), (100.0, 250.0)]
+
         s = _make_summary(sss)
         assert s["type"] == "SpikeSliceStack"
         assert s["length_ms"] == (100.0, 150.0)
@@ -4747,6 +4751,44 @@ class TestLoadWorkspaceFullSkipsDoubleUnderscoreGroups:
         assert "ns_a" in loaded._items
         assert "__history__" not in loaded._items
         assert "__history__" not in loaded._index
+
+
+class TestLazyAnalysisWorkspaceDelLogsCleanupFailure:
+    """``LazyAnalysisWorkspace.__del__`` is a best-effort fallback for
+    temp-file cleanup. When ``close()`` raises (read-only mount,
+    open handle on Windows), the failure is logged to ``sys.__stderr__``
+    rather than swallowed so the audit log retains a trace.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_del_close_failure_writes_marker_to_stderr(self, monkeypatch, capfd):
+        """
+        Tests:
+            (Test Case 1) Monkeypatching ``close()`` to raise
+                ``OSError("read-only")`` and triggering ``__del__``
+                writes a ``cleanup failed`` marker to ``sys.__stderr__``.
+
+        Notes:
+            - Uses ``capfd`` (file-descriptor capture) instead of
+              ``capsys`` because the source prints to ``sys.__stderr__``
+              (the original stderr fd), which bypasses Python-level
+              redirection.
+        """
+        from spikelab.workspace.workspace import LazyAnalysisWorkspace
+
+        ws = LazyAnalysisWorkspace(name="del-cleanup-test")
+
+        def failing_close(self):
+            raise OSError("read-only")
+
+        import types as _types
+
+        ws.close = _types.MethodType(failing_close, ws)
+        ws.__del__()
+
+        captured = capfd.readouterr()
+        assert "cleanup failed" in captured.err
+        assert "read-only" in captured.err
 
 
 class TestLoadWorkspaceFullBytesNameDecode:

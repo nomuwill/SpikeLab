@@ -801,6 +801,20 @@ class TestArtifactPackager:
             manifest = json.loads(zf.read("run-empty/manifest.json"))
             assert manifest["files"] == []
 
+    def test_sha256_chunk_bytes_constant_exposed(self):
+        """
+        ``_SHA256_CHUNK_BYTES`` is exposed at module scope so callers
+        can read (or override) the chunk size. The constant value is
+        1 MiB.
+
+        Tests:
+            (Test Case 1) ``_SHA256_CHUNK_BYTES`` equals ``1 << 20``
+                (1 MiB).
+        """
+        from spikelab.batch_jobs.artifact_packager import _SHA256_CHUNK_BYTES
+
+        assert _SHA256_CHUNK_BYTES == 1 << 20
+
     def test_sha256_correctness(self, tmp_path):
         """_sha256 produces correct hex digest for known content."""
         import hashlib
@@ -5982,6 +5996,91 @@ class TestSubmitPreparedJobRunIdTraversal:
         # The guard rejects traversal-style run_ids at the session boundary.
         assert "current_run_id" in body
         assert '".." in' in body or "'..' in" in body
+
+
+class TestTierKBatchJobConstants:
+    """Pin the named-constant module attributes the parallel review
+    extracted in Tier K. These constants are part of the public API
+    (callers tune the defaults via these names rather than re-reading
+    magic numbers from the source).
+    """
+
+    def test_default_image_profile_constant(self):
+        """
+        Tests:
+            (Test Case 1) ``cli.DEFAULT_IMAGE_PROFILE`` equals ``"cpu"``.
+            (Test Case 2) Passing ``image_profile=None`` resolves
+                through the constant to the cpu image.
+        """
+        from spikelab.batch_jobs import cli as cli_mod
+
+        assert cli_mod.DEFAULT_IMAGE_PROFILE == "cpu"
+
+        # The constant drives the resolution path.
+        payload = _example_payload()
+        # Force ``container.image`` to be empty so the profile fallback
+        # must fill it in.
+        payload["container"]["image"] = ""
+        profile = ClusterProfile(
+            name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+        )
+        updated = cli_mod._apply_image_selection(
+            payload,
+            profile=profile,
+            image_profile=None,
+            image_override=None,
+        )
+        assert updated["container"]["image"] == "ghcr.io/example/cpu:latest"
+
+    def test_job_name_length_constants_match_rfc1123_budget(self):
+        """
+        Tests:
+            (Test Case 1) ``_JOB_NAME_MAX_LENGTH`` == 63 (RFC 1123 DNS
+                subdomain label cap).
+            (Test Case 2) ``_JOB_NAME_TOKEN_LENGTH`` == 8 (UUID suffix
+                budget).
+            (Test Case 3) ``RunSession._build_job_name`` output never
+                exceeds ``_JOB_NAME_MAX_LENGTH`` for prefixes at the
+                budget boundary.
+        """
+        from spikelab.batch_jobs.session import (
+            RunSession,
+            _JOB_NAME_MAX_LENGTH,
+            _JOB_NAME_TOKEN_LENGTH,
+        )
+
+        assert _JOB_NAME_MAX_LENGTH == 63
+        assert _JOB_NAME_TOKEN_LENGTH == 8
+
+        # Long prefix is truncated to fit the budget.
+        long_prefix = "a" * 200
+        out = RunSession._build_job_name(long_prefix)
+        assert len(out) <= _JOB_NAME_MAX_LENGTH
+
+    def test_reconstruct_config_typeerror_names_subconfig(self):
+        """
+        ``_reconstruct_config`` wraps the bare ``TypeError`` from
+        ``f.type(**sub_dict)`` so the message names which sub-config
+        failed to reconstruct — the operator sees ``Failed to
+        reconstruct 'execution': ...`` instead of the bare ``__init__()
+        got an unexpected keyword`` from the dataclass.
+
+        Tests:
+            (Test Case 1) An unknown key in the ``execution`` sub-dict
+                raises TypeError whose message contains
+                ``"Failed to reconstruct 'execution'"``.
+        """
+        import dataclasses
+
+        from spikelab.batch_jobs.entrypoints.sorting import _reconstruct_config
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        config_dict = dataclasses.asdict(SortingPipelineConfig())
+        # Inject an unknown key into the execution sub-dict.
+        config_dict["execution"]["nonexistent_field"] = 42
+
+        with pytest.raises(TypeError, match="Failed to reconstruct 'execution'"):
+            _reconstruct_config(config_dict)
 
 
 class TestCliCmdRenderNamespaceBackfill:

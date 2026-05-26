@@ -777,6 +777,33 @@ class TestConvertToListOfRateData:
         assert rd_list[0].times[0] == pytest.approx(0.0)
         assert rd_list[0].times[1] == pytest.approx(2.0)
 
+    def test_times_start_and_span_match_slice_boundaries(self):
+        """
+        ``convert_to_list_of_RateData`` precomputes ``rel_times = np.arange(T) *
+        step_size`` once outside the loop (Tier K perf opt). Verify each
+        returned ``RateData``'s ``times[0]`` is the slice's start and
+        ``times[-1] - times[0]`` equals ``(T-1) * step_size`` — the perf
+        change must preserve value equivalence.
+
+        Tests:
+            (Test Case 1) Each of S=3 slices has ``times[0]`` equal to
+                its declared start.
+            (Test Case 2) Each slice's total time span equals
+                ``(T-1) * step_size``.
+        """
+        T = 8
+        mat = make_event_matrix(2, T, 3)
+        times = [(0.0, 20.0), (30.0, 50.0), (60.0, 80.0)]
+        step = 2.5
+        rss = RateSliceStack(
+            event_matrix=mat, times_start_to_end=times, step_size=step
+        )
+        rd_list = rss.convert_to_list_of_RateData()
+        assert len(rd_list) == 3
+        for rd, (start, _end) in zip(rd_list, times):
+            assert rd.times[0] == pytest.approx(start)
+            assert rd.times[-1] - rd.times[0] == pytest.approx((T - 1) * step)
+
     def test_convert_to_list_single_time_bin(self):
         """
         Tests convert_to_list_of_RateData with T=1 per slice.

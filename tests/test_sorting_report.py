@@ -904,3 +904,75 @@ class TestWalkDiff:
         assert out[0] is sentinel
         assert out[-1] == ("a", 1, 2)
         assert len(out) == 2
+
+
+class TestMdFilesSectionBehaviour:
+    """``_md_files_section`` uses ``os.scandir`` with cached stat() to
+    enumerate the results folder. The perf optimisation must not
+    change the rendered table content.
+    """
+
+    def test_files_section_lists_files_with_megabyte_sizes(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Files of known sizes render with their
+                relative paths and MB-formatted sizes.
+            (Test Case 2) Rows are sorted by size descending.
+        """
+        from spikelab.spike_sorting.report import _md_files_section
+
+        # Create three files of distinct sizes.
+        (tmp_path / "small.bin").write_bytes(b"x" * 1024)  # 1 KiB
+        (tmp_path / "medium.bin").write_bytes(b"x" * (5 * 1024 * 1024))  # 5 MiB
+        (tmp_path / "big.bin").write_bytes(b"x" * (8 * 1024 * 1024))  # 8 MiB
+
+        out = _md_files_section(tmp_path)
+        assert "| File | Size (MB) |" in out
+        # Sorted descending by size — big.bin appears before medium.bin
+        # which appears before small.bin.
+        big_idx = out.index("big.bin")
+        medium_idx = out.index("medium.bin")
+        small_idx = out.index("small.bin")
+        assert big_idx < medium_idx < small_idx
+        # The 8 MB file's size column shows ~8.00.
+        assert "8.00" in out
+
+
+class TestCachedGpuBannerInfoCaches:
+    """``_cached_gpu_banner_info`` runs ``nvidia-smi`` at most once
+    per process: the cache makes the second call (and beyond) return
+    the stored string without re-invoking the subprocess.
+    """
+
+    def test_subprocess_called_at_most_once_across_calls(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Two back-to-back calls invoke
+                ``subprocess.check_output`` exactly once total.
+            (Test Case 2) Resetting ``_GPU_BANNER_CACHE = None``
+                re-enables the subprocess invocation on the next call.
+        """
+        import subprocess
+
+        from spikelab.spike_sorting import pipeline as pipeline_mod
+
+        # Clear the cache so this test is hermetic.
+        monkeypatch.setattr(pipeline_mod, "_GPU_BANNER_CACHE", None)
+
+        call_count = {"n": 0}
+
+        def fake_check_output(*args, **kwargs):
+            call_count["n"] += 1
+            return "FakeGPU, 555.55, 16384 MiB\n"
+
+        monkeypatch.setattr(subprocess, "check_output", fake_check_output)
+
+        first = pipeline_mod._cached_gpu_banner_info()
+        second = pipeline_mod._cached_gpu_banner_info()
+        assert first == second
+        assert call_count["n"] == 1
+
+        # After resetting the cache the subprocess is invoked again.
+        monkeypatch.setattr(pipeline_mod, "_GPU_BANNER_CACHE", None)
+        pipeline_mod._cached_gpu_banner_info()
+        assert call_count["n"] == 2

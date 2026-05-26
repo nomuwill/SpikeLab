@@ -2715,6 +2715,41 @@ class TestResolveInactivityTimeoutS:
         cfg.sorter.sorter_path = "/fake/path"
         return Kilosort2Backend(cfg)
 
+    def test_recording_metadata_failure_logs_and_returns_none(self, caplog):
+        """
+        ``_resolve_inactivity_timeout_s`` returns ``None`` and logs an
+        INFO-level message when the recording's
+        ``get_num_samples()`` / ``get_sampling_frequency()`` raises —
+        the caller treats ``None`` as "do not start the watchdog" but
+        the operator still gets an audit trail.
+
+        Tests:
+            (Test Case 1) Recording whose ``get_num_samples`` raises
+                returns None.
+            (Test Case 2) An INFO-level log record mentioning
+                "watchdog disabled" was emitted.
+        """
+        import logging
+
+        backend = self._make_backend()
+        backend.config.execution.sorter_inactivity_timeout = True
+
+        rec = MagicMock()
+        rec.get_num_samples.side_effect = RuntimeError("metadata unavailable")
+        rec.get_sampling_frequency.return_value = 20000.0
+
+        with caplog.at_level(
+            logging.INFO, logger="spikelab.spike_sorting.backends.base"
+        ):
+            result = backend._resolve_inactivity_timeout_s(rec)
+
+        assert result is None
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert info_records, "expected an INFO log record"
+        assert any(
+            "watchdog disabled" in r.getMessage() for r in info_records
+        )
+
     def test_respects_disabled_flag(self):
         """
         sorter_inactivity_timeout=False returns None.

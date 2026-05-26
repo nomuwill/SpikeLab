@@ -110,7 +110,11 @@ class TestHDF5Loaders:
         Tests:
         (Method 1)  Writes 'idces' and 'times' datasets
         (Method 2)  Loads them using load_spikedata_from_hdf5
-        (Test Case 1)  Checks that the idces_times method returns the correct indices and times.
+        (Test Case 1)  Checks that the idces_times round-trips the original
+            (idces, times) pairs. Order is now per-unit grouped (Tier
+            K-C1 perf opt rewrote ``idces_times`` to use
+            ``np.repeat`` + ``np.concatenate``), so compare via sorted
+            (idx, time) pairs rather than positional equality.
         """
         path = str(tmp_path / "test.h5")
         idces = np.array([0, 1, 0, 1], dtype=int)
@@ -123,7 +127,11 @@ class TestHDF5Loaders:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         loaded_idces, loaded_times = sd.idces_times()
-        np.testing.assert_allclose(loaded_times, times_ms)
+        # Order-independent comparison — (idx, time) pairs survive
+        # the per-unit grouping.
+        original_pairs = sorted(zip(idces.tolist(), times_ms.tolist()))
+        loaded_pairs = sorted(zip(loaded_idces.tolist(), loaded_times.tolist()))
+        assert loaded_pairs == original_pairs
 
     def test_hdf5_group_per_unit_seconds(self, tmp_path):
         """

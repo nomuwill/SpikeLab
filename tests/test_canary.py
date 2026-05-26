@@ -914,6 +914,34 @@ class TestExtractUnitCount:
 
         assert _extract_unit_count(()) is None
 
+    def test_extract_unit_count_no_n_attr_logs_debug(self, caplog):
+        """
+        When the candidate lacks a usable ``N`` attribute, the helper
+        returns ``None`` AND emits a DEBUG-level log line naming the
+        candidate type — the upstream log line is unit-count-less and
+        the operator needs a signal that the SpikeData itself was
+        missing the attribute, not that the sort failed silently.
+
+        Tests:
+            (Test Case 1) Candidate without ``N`` returns None.
+            (Test Case 2) A DEBUG-level log record is emitted from
+                the module's logger.
+        """
+        import logging
+        from spikelab.spike_sorting.canary import _extract_unit_count
+
+        class _NoNCandidate:
+            pass
+
+        with caplog.at_level(
+            logging.DEBUG, logger="spikelab.spike_sorting.canary"
+        ):
+            result = _extract_unit_count(_NoNCandidate())
+
+        assert result is None
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert debug_records, "expected a DEBUG log record"
+
     def test_extract_unit_count_rejects_bool_n(self):
         """
         ``bool`` is a subclass of ``int``; if a SpikeData-like candidate

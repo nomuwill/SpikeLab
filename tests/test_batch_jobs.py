@@ -91,7 +91,9 @@ def test_render_job_manifest_contains_job_name():
     )
     manifest = render_job_manifest(context)
     parsed = yaml.safe_load(manifest)
-    assert "name: analysis-job-1234" in manifest
+    # Quoting in the template means the name shows up as
+    # ``name: "analysis-job-1234"`` post-J-A12.
+    assert parsed["metadata"]["name"] == "analysis-job-1234"
     assert parsed["kind"] == "Job"
     assert "run_id" in manifest
 

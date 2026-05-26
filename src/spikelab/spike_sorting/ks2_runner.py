@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from math import ceil
@@ -631,6 +632,7 @@ class ShellScript:
         self._log_path = log_path
         self._keep_temp_files = keep_temp_files
         self._process: Optional[subprocess.Popen] = None
+        self._stdout_drain_thread: Optional[threading.Thread] = None
         self._files_to_remove: List[str] = []
         self._dirs_to_remove: List[str] = []
         self._start_time: Optional[float] = None
@@ -688,13 +690,55 @@ class ShellScript:
             universal_newlines=True,
             errors="replace",
         )
-        with open(script_log_path, "w+") as script_log_file:
-            for line in self._process.stdout:
-                script_log_file.write(line)
-                if (
-                    self._verbose
-                ):  # Print onto console depending on the verbose property passed on from the sorter class
-                    print(line)
+        # Drain stdout on a daemon thread so ``start()`` returns
+        # immediately. The previous in-line ``for line in stdout``
+        # loop blocked until the subprocess exited, which meant
+        # ``start()`` only returned AFTER the process was already
+        # finished — so the caller's ``with inactivity_watchdog:
+        # wait()`` block was wrapped around an already-dead process.
+        # The watchdog only appeared to work because MATLAB writes a
+        # separate ``kilosort2.log`` file that the watchdog polls
+        # independently. With the drain on a background thread,
+        # ``wait()`` is now genuinely inside the live-process window
+        # and the watchdog can interrupt a stalled subprocess via
+        # ``stop()`` / ``stopWithSignal()`` as designed.
+        self._stdout_drain_thread = threading.Thread(
+            target=self._drain_stdout,
+            args=(script_log_path, self._verbose),
+            name=f"ShellScript-stdout-drain[{Path(cmd).name}]",
+            daemon=True,
+        )
+        self._stdout_drain_thread.start()
+
+    def _drain_stdout(self, log_path: Path, verbose: bool) -> None:
+        """Background-thread target: tee subprocess stdout to file + console.
+
+        Reads lines from ``self._process.stdout`` until EOF (process
+        exit or pipe close from ``stop()``) and writes each to the
+        log file. ``verbose=True`` additionally mirrors to stdout.
+        """
+        try:
+            with open(log_path, "w+") as log_file:
+                if self._process is None or self._process.stdout is None:
+                    return
+                for line in self._process.stdout:
+                    log_file.write(line)
+                    if verbose:
+                        # ``line`` already ends in '\n' (line-buffered
+                        # subprocess); suppress print's trailing newline.
+                        print(line, end="")
+        except Exception as exc:
+            # Drain-thread failures must not crash the main process.
+            # Log to ``sys.__stderr__`` (survives interpreter shutdown
+            # in case the process is tearing down) and exit cleanly;
+            # the subprocess and ``wait()`` are unaffected.
+            try:
+                print(
+                    f"[ShellScript._drain_stdout] drain failed: {exc!r}",
+                    file=sys.__stderr__,
+                )
+            except Exception:
+                pass
 
     def wait(self, timeout=None) -> Optional[int]:
         if not self.isRunning():
@@ -706,9 +750,16 @@ class ShellScript:
             )
         try:
             retcode = self._process.wait(timeout=timeout)
-            return retcode
         except subprocess.TimeoutExpired:
             return None
+        # Subprocess exited — join the stdout drain thread to flush
+        # the tail of the log before returning. The 5-second cap is
+        # well above the typical buffered-line drain time and prevents
+        # an unkillable join() if the thread somehow wedges (shouldn't
+        # happen — stdout closes when the subprocess exits).
+        if self._stdout_drain_thread is not None:
+            self._stdout_drain_thread.join(timeout=5.0)
+        return retcode
 
     def cleanup(self) -> None:
         if self._keep_temp_files:

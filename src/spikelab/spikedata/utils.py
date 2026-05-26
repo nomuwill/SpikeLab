@@ -642,28 +642,40 @@ def compute_cross_correlation_with_lag(ref_rate, comp_rate, max_lag=0):
     if max_lag == 0:
         max_corr = np.sum(ref_rate * comp_rate) / np.sqrt(norm_product)
         return max_corr, 0
-    # General path: use scipy.signal.correlate and normalise by the
-    # L2-norm product — the same denominator as the max_lag==0 fast
-    # path, so the two paths agree numerically regardless of max_lag.
-    # The previous denominator went through
-    # ``correlate(ref, ref, 'same')[len(ref)//2]``, which equals
-    # ref_norm in theory but can pick up a half-sample offset for
-    # even-length signals under 'same' mode — making max_lag=0 and
-    # max_lag>0 disagree by a few ULPs on the same inputs.
-    # norm_product is guaranteed > 0 after the ref_norm/comp_norm
-    # zero-checks above.
-    r = signal.correlate(ref_rate, comp_rate, mode="same") / np.sqrt(norm_product)
+    # General path: ``mode='full'`` cross-correlation, then symmetric
+    # slice around the lag-0 centre. ``mode='same'`` was the previous
+    # default but it returns an asymmetric lag window for even-length
+    # inputs (``len(r) = N``, range ``[-N/2, +N/2 - 1]``). Three
+    # downstream sites mirror via ``lag_matrix[n2, n1] = -lag``
+    # (``SpikeData.get_pairwise_ccg``,
+    # ``RateData.get_pairwise_fr_corr``,
+    # ``SpikeSliceStack.get_slice_to_slice_unit_comparison``) and rely
+    # on ``argmax(correlate(a, b))`` being exactly
+    # ``-argmax(correlate(b, a))``. That identity only holds when the
+    # lag axis is symmetric — which is guaranteed by ``mode='full'``
+    # (length ``2N-1``, always odd for equal-length inputs), and
+    # then by the symmetric ``[-max_lag, +max_lag]`` slice below.
+    # As a side benefit, the work is bounded by ``2*max_lag + 1``
+    # samples (typically ≪ N) instead of the full N-length ``same``
+    # output.
+    # Normalises by sqrt(sum(ref^2) * sum(comp^2)) — the L2-norm
+    # product, identical to the max_lag==0 fast path so both branches
+    # agree numerically regardless of max_lag.
+    full = signal.correlate(ref_rate, comp_rate, mode="full") / np.sqrt(norm_product)
 
-    center = len(r) // 2
-
-    # Search within max_lag window
-    search_start = max(0, center - max_lag)
-    search_end = min(len(r), center + max_lag + 1)
-    search_window = r[search_start:search_end]
+    # In ``mode='full'`` for equal-length inputs of length N, lag 0
+    # sits at index ``N - 1``. Slice symmetrically around that centre
+    # to the requested lag window. ``np.clip`` guards the case where
+    # ``max_lag >= N`` so the slice does not over-run the ends.
+    n = len(ref_rate)
+    centre = n - 1
+    lo = max(0, centre - max_lag)
+    hi = min(len(full), centre + max_lag + 1)
+    search_window = full[lo:hi]
 
     # NaN-safe peak detection. RateData allows NaN entries (caller-built
     # rate matrices, e.g. from external sources), so the correlation
-    # output ``r`` can contain NaN. Plain ``np.max``/``argmax`` would
+    # output can contain NaN. Plain ``np.max``/``argmax`` would
     # silently propagate NaN into the pairwise matrices; the cosine
     # sibling ``compute_cosine_similarity_with_lag`` already uses the
     # nan-safe variants. Match that behaviour, with a sentinel return
@@ -671,7 +683,7 @@ def compute_cross_correlation_with_lag(ref_rate, comp_rate, max_lag=0):
     if np.all(np.isnan(search_window)):
         return np.nan, 0
     max_corr = np.nanmax(search_window)
-    max_lag_idx = int(np.nanargmax(search_window)) + search_start - center
+    max_lag_idx = int(np.nanargmax(search_window)) + lo - centre
 
     return max_corr, max_lag_idx
 

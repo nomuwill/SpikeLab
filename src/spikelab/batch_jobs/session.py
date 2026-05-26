@@ -24,6 +24,13 @@ from .templating import build_template_context, render_job_manifest
 # Workspace path convention: save(base) produces base.h5 + base.json
 _WORKSPACE_BASE_NAME = "workspace"
 
+# Kubernetes job-name budget. RFC 1123 caps DNS subdomain labels at 63
+# characters; we reserve 8 of those for the UUID-based suffix plus 1
+# for the '-' separator. The remaining 54 are available for the
+# user-supplied name_prefix.
+_JOB_NAME_MAX_LENGTH = 63
+_JOB_NAME_TOKEN_LENGTH = 8
+
 
 class RunSession:
     """Coordinates artifact packaging, job submission, and result retrieval."""
@@ -47,8 +54,9 @@ class RunSession:
 
     @staticmethod
     def _build_job_name(prefix: str) -> str:
-        token = uuid4().hex[:8]
-        max_prefix = 63 - 1 - len(token)  # 54
+        token = uuid4().hex[:_JOB_NAME_TOKEN_LENGTH]
+        # Reserve room for the ``-`` separator and the suffix token.
+        max_prefix = _JOB_NAME_MAX_LENGTH - 1 - len(token)
         truncated = prefix[:max_prefix].rstrip("-")
         if not truncated:
             raise ValueError(

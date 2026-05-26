@@ -209,7 +209,14 @@ def evaluate_policy(
 
 
 def summarize_preflight(findings: Iterable[PolicyFinding]) -> tuple[Level, str]:
-    """Return aggregate level and text summary."""
+    """Return aggregate level and text summary.
+
+    Empty input: when *findings* is an empty iterable the function
+    returns ``("PASS", "")``. Callers that distinguish "policy ran and
+    everything passed" from "policy did not run / produced no
+    findings" must inspect the source iterable's length rather than
+    relying on the returned level alone.
+    """
     levels = {finding.level for finding in findings}
     if "BLOCK" in levels:
         status: Level = "BLOCK"

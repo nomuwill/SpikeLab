@@ -283,6 +283,24 @@ class SpikeData:
             diff = np.diff(np.array(raster, dtype=int), axis=1) == 1
             raster = np.hstack([np.zeros((diff.shape[0], 1), dtype=bool), diff])
 
+        # Warn when the threshold produced zero detections anywhere in
+        # the raster. The most common cause is an over-aggressive
+        # ``threshold_sigma`` for the recording's noise profile —
+        # callers iterating over ``threshold_sigma`` values used to
+        # see an empty SpikeData and have no signal that the
+        # threshold itself was the problem.
+        n_spikes = int(np.sum(raster))
+        if n_spikes == 0:
+            warnings.warn(
+                f"from_thresholding: zero spikes detected at "
+                f"threshold_sigma={threshold_sigma}, direction={direction!r}. "
+                "Threshold may be too aggressive for the input noise "
+                "profile; lower threshold_sigma or verify the signal "
+                "has events to detect.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         kwargs: dict = {"raw_data": data, "raw_time": fs_Hz / 1e3}
         if length is not None:
             kwargs["length"] = length
@@ -454,11 +472,20 @@ class SpikeData:
             - This method is not a property unlike ``times`` and ``events``
               because the lists must actually be constructed in memory.
         """
-        idces, times = [], []
-        for i, t in self.events:
-            idces.append(i)
-            times.append(t)
-        return np.array(idces), np.array(times)
+        # Pre-allocate from the known total-spike count rather than
+        # appending to Python lists and converting at the end. For
+        # recordings with millions of spikes the append loop allocates
+        # a new Python int object per spike and rebuilds the list
+        # capacity multiple times; np.repeat + np.concatenate runs
+        # entirely in NumPy C.
+        if not self.train:
+            return np.array([], dtype=np.int64), np.array([], dtype=float)
+        counts = np.array([len(t) for t in self.train], dtype=np.int64)
+        idces = np.repeat(np.arange(self.N, dtype=np.int64), counts)
+        times = (
+            np.concatenate(self.train) if counts.sum() else np.array([], dtype=float)
+        )
+        return idces, times
 
     @property
     def unit_locations(self) -> Optional[np.ndarray]:
@@ -1032,6 +1059,29 @@ class SpikeData:
                     stacklevel=2,
                 )
             _missing = object()
+            # Warn when ``by`` references an attribute key that NO unit
+            # actually carries. Typos like ``by="unit_idx"`` (vs the
+            # canonical ``"unit_id"``) used to silently produce empty
+            # subsets — caller saw an empty SpikeData with no clue why.
+            if not any(
+                _get_attr(self.neuron_attributes[i], by, _missing) is not _missing
+                for i in range(self.N)
+            ):
+                known_keys = sorted(
+                    {
+                        k
+                        for attrs in self.neuron_attributes
+                        if isinstance(attrs, dict)
+                        for k in attrs.keys()
+                    }
+                )
+                warnings.warn(
+                    f"subset(by={by!r}): no unit's neuron_attributes carries "
+                    f"this key; returning an empty SpikeData. Known keys "
+                    f"across neuron_attributes: {known_keys}. Check for typos.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             wanted = set(units)
             matched = [
                 i
@@ -1723,6 +1773,12 @@ class SpikeData:
                 ratio = np.where(den > 0, num / den, np.nan)
             if not np.any(np.isfinite(ratio)):
                 continue
+            # Degenerate-mean note: at the N=3-spike boundary the unit
+            # has exactly 2 ISIs and therefore one adjacent ISI pair —
+            # ``np.nanmean(ratio)`` here is the mean of a single value
+            # (technically valid, statistically not an average).
+            # Callers should treat per-unit CV2 with caution when the
+            # spike count is at or near 3.
             out[u] = float(np.nanmean(ratio))
         return out
 

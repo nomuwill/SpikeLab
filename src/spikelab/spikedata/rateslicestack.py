@@ -665,14 +665,18 @@ class RateSliceStack:
         """
         output = []
         # U x T x S
+        # Pre-compute the relative-time vector ONCE outside the loop;
+        # ``np.arange(T) * self.step_size`` is identical for every slice
+        # (only the per-slice ``start`` offset changes), so the in-loop
+        # allocation was redundant work proportional to S.
+        rel_times = np.arange(self.event_stack.shape[1]) * self.step_size
         for s_idx in range(self.event_stack.shape[2]):
             matrix = self.event_stack[:, :, s_idx]
             start, end = self.times[s_idx]
-            time = start + np.arange(matrix.shape[1]) * self.step_size
+            time = start + rel_times
             if time[-1] > end:
                 # Extremely rare edge case with floating point calculation. Should never happen but just in case
                 time = np.clip(time, start, end - np.finfo(float).eps)
-            # time = np.arange(start, end, self.step_size)
             rate_obj = RateData(matrix, time, neuron_attributes=self.neuron_attributes)
             output.append(rate_obj)
         return output

@@ -980,6 +980,10 @@ class PairwiseCompMatrixStack:
 def _min_max_normalize(mat: np.ndarray, axis: Optional[str] = None) -> np.ndarray:
     """Min-max normalize a 2-D matrix to [0, 1].
 
+    See also:
+        ``_z_score_normalize`` — companion helper that shares the same
+        ``axis`` semantics (``"row"`` / ``"col"`` / ``None``).
+
     Parameters:
         mat (np.ndarray): ``(N, N)`` input matrix.
         axis (str or None): ``"row"``, ``"col"``, or None (global).
@@ -1018,6 +1022,10 @@ def _min_max_normalize(mat: np.ndarray, axis: Optional[str] = None) -> np.ndarra
 def _z_score_normalize(mat: np.ndarray, axis: Optional[str] = None) -> np.ndarray:
     """Z-score normalize a 2-D matrix (mean=0, std=1).
 
+    See also:
+        ``_min_max_normalize`` — companion helper that shares the same
+        ``axis`` semantics (``"row"`` / ``"col"`` / ``None``).
+
     Parameters:
         mat (np.ndarray): ``(N, N)`` input matrix.
         axis (str or None): ``"row"``, ``"col"``, or None (global).
@@ -1049,4 +1057,25 @@ def _z_score_normalize(mat: np.ndarray, axis: Optional[str] = None) -> np.ndarra
     with np.errstate(divide="ignore", invalid="ignore"):
         result = np.where(sd != 0, (mat - mu) / sd, 0.0)
     result[np.isnan(mat)] = np.nan
+    # Warn when the std reduction yielded zero anywhere — the
+    # downstream ``np.where`` fills those positions with 0.0 (no
+    # division by zero), but a uniform input is almost always a
+    # caller mistake (e.g. forgot to filter NaNs, or fed an all-equal
+    # matrix). The caller's "z-scored" output is identically zero
+    # without this signal.
+    sd_arr = np.atleast_1d(np.asarray(sd))
+    zero_sd = sd_arr == 0
+    if np.any(zero_sd):
+        if axis is None:
+            scope = "the entire matrix"
+        else:
+            scope = f"{int(np.sum(zero_sd))} {axis}(s)"
+        warnings.warn(
+            f"_z_score_normalize: std is zero across {scope}; those "
+            "positions are filled with 0.0 (no division by zero). The "
+            "input is uniform — z-score is undefined and the result is "
+            "identically zero.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     return result

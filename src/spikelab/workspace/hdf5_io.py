@@ -123,8 +123,20 @@ def load_workspace_full(path: str):
                 "workspace (missing __workspace_id__ attribute)."
             )
         ws = AnalysisWorkspace.__new__(AnalysisWorkspace)
-        ws.workspace_id = str(f.attrs["__workspace_id__"])
-        name = str(f.attrs["__workspace_name__"])
+        # ``str(bytes_obj)`` returns the literal ``"b'foo'"`` repr —
+        # decode explicitly so a workspace written under h5py's
+        # variable-length-bytes mode does not silently corrupt the
+        # ``workspace_id`` / ``name`` attrs on reload.
+        wid_attr = f.attrs["__workspace_id__"]
+        ws.workspace_id = (
+            wid_attr.decode("utf-8") if isinstance(wid_attr, bytes) else str(wid_attr)
+        )
+        name_attr = f.attrs["__workspace_name__"]
+        name = (
+            name_attr.decode("utf-8")
+            if isinstance(name_attr, bytes)
+            else str(name_attr)
+        )
         ws.name = name if name else None
         ws.created_at = float(f.attrs["__created_at__"])
         ws._items = {}
@@ -459,7 +471,12 @@ def _dump_dict(grp, d: dict, created_at: float) -> None:
         stored as ``ndarray`` with ``__type__ = "set"`` /
         ``"frozenset"``. Round-trips as ``set`` / ``frozenset`` (type
         preserved, order not). Elements must be orderable and
-        homogeneous.
+        homogeneous. **Lossy for mixed-numeric content**: a set such
+        as ``{1, 2.5}`` widens to a float ndarray (``[1.0, 2.5]``)
+        and reloads as a set of floats (``{1.0, 2.5}``) — the
+        original ``int`` element is lost. Pure-int and pure-float
+        sets round-trip with dtype preserved; only the
+        int/float-mixed case widens.
       - ``dict``: recursively serialised via this function.
       - ``ndarray``, ``SpikeData``, ``RateData``, slice stacks,
         pairwise matrices, and pairwise stacks: routed through

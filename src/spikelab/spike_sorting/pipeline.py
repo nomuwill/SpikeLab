@@ -16,6 +16,7 @@ import pickle
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import shutil
@@ -1255,6 +1256,38 @@ def _bounded_host_memory(frac: float = 0.8):
             pass
 
 
+_GPU_BANNER_CACHE: Optional[str] = None
+
+
+def _cached_gpu_banner_info() -> str:
+    """Return the cached nvidia-smi banner line.
+
+    The GPU inventory is static for the life of the process. Running
+    nvidia-smi once per recording on a multi-recording batch wastes
+    a subprocess invocation per recording. First call populates the
+    cache; subsequent calls return the cached string immediately.
+    """
+    import subprocess as _subprocess
+
+    global _GPU_BANNER_CACHE
+    if _GPU_BANNER_CACHE is not None:
+        return _GPU_BANNER_CACHE
+    try:
+        gpu_info = _subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,memory.total",
+                "--format=csv,noheader",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+    except (_subprocess.SubprocessError, FileNotFoundError):
+        gpu_info = "(nvidia-smi unavailable)"
+    _GPU_BANNER_CACHE = gpu_info
+    return gpu_info
+
+
 def _print_pipeline_banner(
     sorter: str,
     rec_path: Any,
@@ -1337,19 +1370,11 @@ def _print_pipeline_banner(
     except ImportError:
         print("Heap cap:       (Windows — not enforced)")
 
-    try:
-        gpu_info = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,driver_version,memory.total",
-                "--format=csv,noheader",
-            ],
-            text=True,
-            timeout=5,
-        ).strip()
-        print(f"GPU:            {gpu_info}")
-    except (subprocess.SubprocessError, FileNotFoundError):
-        print("GPU:            (nvidia-smi unavailable)")
+    # Cache the GPU banner output. ``_print_pipeline_banner`` runs
+    # once per recording, but the GPU inventory is static for the
+    # life of the process — re-running nvidia-smi each time wastes a
+    # subprocess invocation per recording on multi-recording batches.
+    print(f"GPU:            {_cached_gpu_banner_info()}")
 
     if config.sorter.use_docker:
         if docker_image_tag:
@@ -1593,7 +1618,6 @@ def sort_recording(
     # workstation into swap or fragment GPU VRAM into a hard failure.
     # The host-memory watchdog is the primary protection on Windows,
     # where ``_bounded_host_memory`` is a no-op.
-    from contextlib import nullcontext
 
     from .guards import GpuMemoryWatchdog, HostMemoryWatchdog, resolve_active_device
 
@@ -1820,7 +1844,6 @@ def sort_recording(
                 # network mounts or unresponsive storage that the
                 # log-inactivity watchdog can miss when the sorter
                 # keeps logging while waiting on kernel I/O).
-                from contextlib import nullcontext
 
                 from .guards import IOStallWatchdog
 

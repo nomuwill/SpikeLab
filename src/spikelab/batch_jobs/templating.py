@@ -10,6 +10,17 @@ import yaml
 
 from .models import ClusterProfile, JobSpec
 
+# Characters that can break out of a double-quoted YAML scalar. Each
+# entry is documented for posterity:
+#   ``\n`` / ``\r``  — start a new YAML node; terminate the scalar early.
+#   ``\t``           — YAML rejects tabs in indentation, and many parsers
+#                       reject them inside flow scalars too.
+#   ``"``            — closes the surrounding double-quoted scalar.
+#   ``\\``           — would start a YAML escape sequence.
+# Characters that are safe inside double-quoted scalars and therefore
+# intentionally NOT in this set: ``:``, ``#``, ``{`` / ``}``, ``[`` /
+# ``]``, ``&``, ``*``, ``!``, ``|``, ``>``, ``'``, ``%``, ``@``,
+# `` ` ``. None of these can terminate a double-quoted scalar.
 _YAML_UNSAFE_CHARS = set('\n\r\t"\\')
 
 

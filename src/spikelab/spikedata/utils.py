@@ -2091,6 +2091,15 @@ def _compute_agreement_score(train1, train2, delta):
             ``n_matches / (n1 + n2 - n_matches)``.
         frac_1 (float): Fraction of train1 spikes that were matched.
         frac_2 (float): Fraction of train2 spikes that were matched.
+
+    Notes:
+        Empty inputs are treated as "no overlap possible" and return
+        ``(0.0, 0.0, 0.0)``. This differs from
+        ``_compute_footprint_similarity``, which returns ``NaN`` for
+        degenerate inputs because cosine similarity has no natural
+        zero. Callers comparing both helpers should be aware of the
+        asymmetric "undefined" sentinel: ``0.0`` here vs ``NaN`` for
+        footprint similarity.
     """
     n1 = len(train1)
     n2 = len(train2)

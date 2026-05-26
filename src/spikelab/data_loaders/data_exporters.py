@@ -286,6 +286,13 @@ def export_spikedata_to_nwb(
           array.
         - This is compatible with the load_spikedata_from_nwb function
           when prefer_pynwb=False.
+        - The ``spike_times_index`` dataset uses the NWB-spec-compliant
+          cumulative-end convention: ``index = np.cumsum(counts)`` of
+          length ``N`` (one entry per unit, pointing at the slot AFTER
+          the unit's last spike). The loader
+          ``load_spikedata_from_nwb`` accepts both this convention and
+          the alternative leading-zero (length ``N+1``) variant — see
+          its docstring for the disambiguation rules.
     """
     ensure_h5py()
     counts = [len(t) for t in sd.train]

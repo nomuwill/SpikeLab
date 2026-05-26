@@ -342,4 +342,19 @@ def _extract_unit_count(result: Any) -> Optional[int]:
     # truthy flag accidentally returned in place of a SpikeData.
     if isinstance(n, (int, np.integer)) and not isinstance(n, bool):
         return int(n)
+    # Log a hint when the helper falls back to None — the caller emits
+    # a unit-count-less log line and operators need a signal that the
+    # candidate just lacked a usable ``N`` attribute, not that the
+    # sort itself failed silently.
+    try:
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "_extract_unit_count: candidate %r has no usable N attribute "
+            "(N=%r); returning None.",
+            type(candidate).__name__,
+            n,
+        )
+    except Exception:
+        pass
     return None

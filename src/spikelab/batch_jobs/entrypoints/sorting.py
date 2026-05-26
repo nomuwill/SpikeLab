@@ -83,7 +83,18 @@ def _reconstruct_config(config_dict: dict):
     for f in fields(SortingPipelineConfig):
         sub_dict = config_dict.get(f.name, {})
         sub_cls = top_hints.get(f.name, f.type)
-        sub_instance = sub_cls(**sub_dict)
+        try:
+            sub_instance = sub_cls(**sub_dict)
+        except TypeError as exc:
+            # Wrap with the offending sub-config name so the operator
+            # sees ``Failed to reconstruct execution: unexpected
+            # keyword 'foo'`` instead of the bare ``__init__() got an
+            # unexpected keyword argument 'foo'`` that doesn't say
+            # which sub-config was being built.
+            raise TypeError(
+                f"Failed to reconstruct {f.name!r} from bundled "
+                f"sorting_config.json: {exc}"
+            ) from exc
         # Restore Path fields on the just-constructed sub-config.
         try:
             sub_hints = typing.get_type_hints(sub_cls)

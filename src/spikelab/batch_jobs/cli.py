@@ -19,6 +19,8 @@ from .session import RunSession
 from .storage_s3 import S3StorageClient
 from .validation import summarize_validation_error, validate_job_spec
 
+DEFAULT_IMAGE_PROFILE = "cpu"
+
 
 def _load_payload(path: str) -> Dict[str, Any]:
     raw = Path(path).read_text(encoding="utf-8")
@@ -58,7 +60,7 @@ def _apply_image_selection(
         container["image"] = image_override
         return payload
 
-    selected_profile = (image_profile or "cpu").strip().lower()
+    selected_profile = (image_profile or DEFAULT_IMAGE_PROFILE).strip().lower()
     default_image = profile.default_images.get(selected_profile)
     if default_image and not container.get("image"):
         container["image"] = default_image

@@ -19,10 +19,17 @@ SupportedFormat = Literal["workspace", "sorting", "custom"]
 _RESERVED_BUNDLE_FILENAMES = frozenset({"manifest.json"})
 
 
+_SHA256_CHUNK_BYTES = 1 << 20  # 1 MiB
+
+
 def _sha256(path: Path) -> str:
+    # 1 MiB chunks instead of 8 KiB. Modern disks deliver hundreds of
+    # MB/s; at 8 KiB the read syscall overhead dominated. 1 MiB keeps
+    # the working set within L2 cache while amortising the syscall
+    # rate to a small fraction of total wall time.
     digest = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(_SHA256_CHUNK_BYTES), b""):
             digest.update(chunk)
     return digest.hexdigest()
 

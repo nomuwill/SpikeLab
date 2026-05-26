@@ -115,7 +115,10 @@ class RateData:
     def __repr__(self) -> str:
         t0 = float(self.times[0]) if len(self.times) > 0 else 0.0
         t1 = float(self.times[-1]) if len(self.times) > 0 else 0.0
-        return f"RateData(shape={self.inst_Frate_data.shape}, time_range=[{t0:.1f}, {t1:.1f}])"
+        return (
+            f"RateData(shape={self.inst_Frate_data.shape}, "
+            f"time_range=[{t0:.1f}, {t1:.1f}], rate_unit={self.rate_unit!r})"
+        )
 
     def subset(self, units, by=None, preserve_order=False):
         """Extract a subset of units/neurons from the rate data.
@@ -440,6 +443,12 @@ class RateData:
             corr_matrix_this_event[n1, n2] = max_corr
             lag_matrix_this_event[n1, n2] = max_lag_idx
             corr_matrix_this_event[n2, n1] = max_corr
+            # Diagonal note: when n1 == n2 (self-correlation), the
+            # symmetric overwrite assigns ``-max_lag_idx`` over the
+            # same diagonal cell. This is benign because a unit's
+            # auto-correlation peaks at lag 0 (``-0 == 0``); the cell
+            # is therefore self-consistent regardless of which copy
+            # writes last.
             lag_matrix_this_event[n2, n1] = -max_lag_idx
 
         # Output is UxU, wrapped in PairwiseCompMatrix for API consistency

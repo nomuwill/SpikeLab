@@ -90,7 +90,14 @@ class PolicyConfig(BaseModel):
 
 
 class JobSpec(BaseModel):
-    """High-level description of a Kubernetes batch job."""
+    """High-level description of a Kubernetes batch job.
+
+    Single-container assumption: ``container`` is a single
+    :class:`ContainerSpec`, not a list. The rendered ``job.yaml.j2``
+    template targets one container per pod (named ``analysis``).
+    Multi-container patterns (sidecars for log shipping, init
+    containers for fetch) are not supported by the current template.
+    """
 
     name_prefix: str = "analysis-job"
     namespace: str = "default"

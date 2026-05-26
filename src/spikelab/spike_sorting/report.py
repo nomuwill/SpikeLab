@@ -275,6 +275,13 @@ def diff_against_default(
 
 def _walk_diff(prefix: str, default: Any, actual: Any, out: List) -> None:
     """Recurse two parallel dicts or lists; record diverging leaf values."""
+    # Short-circuit on identical subtrees. ``diff_against_default``
+    # passes whole sub-config dicts to this function; the common case
+    # is that the user changed one or two fields and the rest of the
+    # subtree matches the defaults. Bailing here avoids re-recursing
+    # into hundreds of identical leaves per call.
+    if default == actual:
+        return
     if isinstance(default, dict) and isinstance(actual, dict):
         for key in actual.keys() | default.keys():
             sub_prefix = f"{prefix}.{key}" if prefix else key
@@ -483,15 +490,29 @@ def _md_files_section(folder: Path) -> str:
     lines = ["| File | Size (MB) |", "|---|---|"]
     rows: List[Tuple[str, float]] = []
     base = folder
-    for dirpath, _dirs, files in os.walk(folder):
-        for name in files:
-            p = Path(dirpath) / name
+
+    # ``os.scandir`` returns ``DirEntry`` objects whose ``stat()`` is
+    # cached from the directory read (no extra syscall per file on
+    # Linux). For results folders with thousands of QC figures the
+    # cached stat halves wall time over ``os.walk + Path.stat``.
+    def _walk(d: Path) -> None:
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                _walk(Path(entry.path))
+                continue
             try:
-                size = p.stat().st_size / (1024 * 1024)
+                size = entry.stat(follow_symlinks=False).st_size / (1024 * 1024)
             except OSError:
                 continue
-            rel = str(p.relative_to(base)).replace("\\", "/")
+            rel = str(Path(entry.path).relative_to(base)).replace("\\", "/")
             rows.append((rel, size))
+
+    _walk(folder)
     rows.sort(key=lambda x: -x[1])
     for rel, size in rows[:50]:
         lines.append(f"| `{rel}` | {size:.2f} |")

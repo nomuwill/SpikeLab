@@ -58,8 +58,17 @@ def _natural_sort_key(s: str):
 
     `sorted(["1", "10", "2"], key=_natural_sort_key)` returns
     `["1", "2", "10"]` instead of the lexicographic `["1", "10", "2"]`.
+
+    Notes:
+        Returns a list of ``(kind, value)`` tuples so the comparison is
+        type-stable on Python 3 — mixing bare ``int`` and ``str`` tokens
+        in the same list would raise ``TypeError`` when two keys
+        compare a numeric token against a string token (e.g.
+        ``"unit_5"`` vs ``"5_unit"``). The ``kind`` prefix (``0`` for
+        numeric, ``1`` for string) puts every numeric token strictly
+        less than every string token at the same position.
     """
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.split(r"(\d+)", s)]
 
 
 def _trains_from_flat_index(
@@ -300,6 +309,15 @@ def _build_spikedata(
             # scales (~1e5 ms) that's ~1.5e-11 ms — far below any
             # measurable precision but enough to keep the inequality
             # strict.
+            #
+            # Edge case at very short recordings: when ``max_last`` is
+            # near zero (e.g. ``max_last=0.001 ms`` and ``start_time=0``),
+            # the ULP scales down with it (~1e-307 ms at the smallest
+            # float64 magnitudes). The subtraction ``max_last -
+            # start_time`` is still exact in float arithmetic, so the
+            # tiny ULP addition does not change behaviour — the comment
+            # describes the dominant case (large recordings), not the
+            # short-recording edge.
             max_last = float(max(last))
             length_ms = max_last - start_time + np.spacing(max_last)
         else:
@@ -1026,6 +1044,16 @@ def load_spikedata_from_kilosort(
         - Reads spike_times.npy (samples) and spike_clusters.npy; groups
           times per cluster and converts to ms using fs_Hz.
     """
+    # Pre-loop validation. ``to_ms`` raises ValueError for unknown
+    # ``time_unit`` values, but only when it is reached mid-loop after
+    # spike_times.npy / spike_clusters.npy / channel_map.npy I/O has
+    # already completed. Surface the typo here so a typo'd time_unit
+    # surfaces before any disk reads.
+    if time_unit not in ("samples", "s", "ms"):
+        raise ValueError(
+            f"time_unit={time_unit!r} is not one of "
+            "('samples', 's', 'ms'); pass a valid unit."
+        )
     st_path = os.path.join(folder, spike_times_file)
     sc_path = os.path.join(folder, spike_clusters_file)
     spike_times = np.load(st_path)

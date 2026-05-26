@@ -2742,6 +2742,30 @@ def _atomic_write_pickle(
     that watchdog can call ``os._exit`` mid-write, and a non-atomic
     write would leave the result file unreadable.
 
+    .. warning::
+        ``os.fsync`` can block indefinitely on a hung network mount
+        (NFS server unresponsive, SMB share down). It is a syscall
+        that does not release the GIL in a way Python can interrupt,
+        so ``_thread.interrupt_main`` from the inactivity watchdog
+        queues a ``KeyboardInterrupt`` that does not deliver until
+        the next bytecode boundary — which is never reached while
+        fsync is blocked. The pipeline's escape hatch is the
+        watchdog's grace-then-``os._exit`` sequence (typically
+        bounded by ``sorter_inactivity_in_process_grace_s``,
+        default ~10 s): the process exits hard, the half-written
+        ``.tmp`` file is removed by the ``except BaseException``
+        cleanup below the next time the path is visited, and the
+        run is reported as a sorter-inactivity failure.
+
+        Callers OUTSIDE the watchdog-wrapped ``sort_recording``
+        path (e.g. notebooks that import this private function
+        directly) get no such protection — on a hung mount the
+        process will block until SIGKILL or the OS NFS timeout
+        (typically minutes). The function is ``_``-prefixed
+        because the canonical caller is the watchdog-wrapped
+        pipeline; bare callers are responsible for their own
+        timeout discipline.
+
     Parameters:
         obj: Any picklable object.
         path: Destination path (will be coerced to ``Path``).

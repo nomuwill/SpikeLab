@@ -10,6 +10,7 @@ handled by the ``SorterBackend`` subclass passed to
 ``process_recording``.
 """
 
+import hashlib
 import json
 import os
 import pickle
@@ -304,6 +305,31 @@ def build_spikedata(
 # ---------------------------------------------------------------------------
 
 
+def _curation_cache_key(sd: Any, curate_kwargs: dict) -> str:
+    """Content fingerprint for the curate_spikedata cache.
+
+    Combines the source SpikeData's unit-id set with the resolved
+    ``curate_kwargs`` into a deterministic SHA256 string. The cache
+    files (``unit_ids.npy`` + ``curation_history.json``) are valid
+    only when this fingerprint matches — a re-sort that produces
+    different unit ids OR a config change that produces different
+    thresholds both flip the fingerprint, so the read-side falls
+    through to fresh curation rather than returning a stale result.
+    """
+    if sd.neuron_attributes is not None:
+        unit_ids = sorted(
+            int(sd.neuron_attributes[i].get("unit_id", i)) for i in range(sd.N)
+        )
+    else:
+        unit_ids = list(range(sd.N))
+    canonical = json.dumps(
+        {"unit_ids": unit_ids, "kwargs": curate_kwargs},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def curate_spikedata(
     sd: Any, curation_folder: Any, config: Any, recurate: bool = False
 ) -> Tuple[Any, dict]:
@@ -348,23 +374,39 @@ def curate_spikedata(
     unit_ids_path = curation_folder / "unit_ids.npy"
     history_path = curation_folder / "curation_history.json"
 
-    # Check cache
+    expected_cache_key = _curation_cache_key(sd, curate_kwargs)
+
+    # Check cache. A stale cache (source unit_ids changed since the
+    # cache was written, OR curate_kwargs changed) is silently
+    # invalidated by the fingerprint mismatch — fall through to fresh
+    # curation rather than return wrong results. Legacy caches written
+    # before the __cache_key__ field existed are treated as a miss for
+    # the same reason; recuration is cheap (it's thresholding on the
+    # already-loaded SpikeData, not re-running the sorter).
     if not recurate and unit_ids_path.exists() and history_path.exists():
-        cached_ids = set(int(x) for x in np.load(str(unit_ids_path)))
-        passing = [
-            i
-            for i in range(sd.N)
-            if sd.neuron_attributes is not None
-            and int(sd.neuron_attributes[i].get("unit_id", i)) in cached_ids
-        ]
-        sd_curated = sd.subset(passing)
-        with open(history_path, "r") as f:
-            history = json.load(f)
-        return sd_curated, history
+        try:
+            with open(history_path, "r") as f:
+                cached_history = json.load(f)
+        except (OSError, ValueError):
+            cached_history = None
+        if (
+            cached_history is not None
+            and cached_history.get("__cache_key__") == expected_cache_key
+        ):
+            cached_ids = set(int(x) for x in np.load(str(unit_ids_path)))
+            passing = [
+                i
+                for i in range(sd.N)
+                if sd.neuron_attributes is not None
+                and int(sd.neuron_attributes[i].get("unit_id", i)) in cached_ids
+            ]
+            sd_curated = sd.subset(passing)
+            return sd_curated, cached_history
 
     # Run curation
     sd_curated, results = sd.curate(**curate_kwargs)
     history = build_curation_history(sd, sd_curated, results, parameters=curate_kwargs)
+    history["__cache_key__"] = expected_cache_key
 
     # Save to disk
     curation_folder.mkdir(parents=True, exist_ok=True)

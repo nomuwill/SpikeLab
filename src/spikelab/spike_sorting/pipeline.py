@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import sys
 import time
 import traceback
@@ -588,16 +589,25 @@ class Compiler:
         neg_units.sort(key=lambda x: float(x[0].get("amplitude", 0)), reverse=True)
         pos_units.sort(key=lambda x: float(x[0].get("amplitude", 0)), reverse=True)
 
+        # Build a per-recording compile_dict. Each recording gets its
+        # own ``units`` list / ``locations`` / ``fs`` so multi-recording
+        # sorts produce a non-empty output (the previous code left
+        # compile_dict=None on multi-recording requests, silently
+        # dropping the user's compile_to_mat/compile_to_npz flag).
+        # For single-recording sorts the on-disk layout is unchanged
+        # (one ``sorted.{mat,npz}`` with the legacy top-level layout);
+        # multi-recording sorts write one file per recording named
+        # after the (sanitised) rec_name.
         compile_dict = None
         if self.compile_to_mat or self.compile_to_npz:
-            if len(rec_metadata) == 1:
-                rec = list(rec_metadata.keys())[0]
-                meta = rec_metadata[rec]
-                compile_dict = {
+            compile_dict = {
+                rec_name: {
                     "units": [],
                     "locations": meta["locations"],
                     "fs": meta["fs"],
                 }
+                for rec_name, meta in rec_metadata.items()
+            }
 
         if comp.compile_waveforms:
             create_folder(folder / "negative_peaks")
@@ -647,7 +657,7 @@ class Compiler:
                             }
                         if self.save_electrodes:
                             unit_dict["electrode"] = attrs.get("electrode")
-                        compile_dict["units"].append(unit_dict)
+                        compile_dict[rec_name]["units"].append(unit_dict)
 
                     if comp.compile_waveforms:
                         wf_path = attrs.get("_waveforms_path")
@@ -692,12 +702,25 @@ class Compiler:
                     fig_has_pos_peak.append(has_pos)
 
         if compile_dict is not None:
-            if self.compile_to_mat and savemat is not None:
-                savemat(folder / "sorted.mat", compile_dict)
-                print("Compiled results to .mat")
-            if self.compile_to_npz:
-                np.savez(folder / "sorted.npz", **compile_dict)
-                print("Compiled results to .npz")
+            # Single-recording: keep the legacy ``sorted.{mat,npz}``
+            # filename so existing readers don't break.
+            # Multi-recording: write one file per recording named
+            # after the rec_name, sanitised for filesystem safety.
+            if len(compile_dict) == 1:
+                only_rec = next(iter(compile_dict))
+                outputs = {"sorted": compile_dict[only_rec]}
+            else:
+                outputs = {
+                    re.sub(r"[^A-Za-z0-9._-]", "_", rec_name): per_rec
+                    for rec_name, per_rec in compile_dict.items()
+                }
+            for out_stem, per_rec_dict in outputs.items():
+                if self.compile_to_mat and savemat is not None:
+                    savemat(folder / f"{out_stem}.mat", per_rec_dict)
+                    print(f"Compiled results to {out_stem}.mat")
+                if self.compile_to_npz:
+                    np.savez(folder / f"{out_stem}.npz", **per_rec_dict)
+                    print(f"Compiled results to {out_stem}.npz")
 
         if self.create_figures:
             from .figures import plot_curation_bar, plot_std_scatter, plot_templates

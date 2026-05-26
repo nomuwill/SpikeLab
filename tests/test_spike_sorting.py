@@ -2662,6 +2662,34 @@ class TestRTSortBackendOomScaling:
         backend.restore_oom_params(snap)
         assert backend.config.rt_sort.num_processes == snap["num_processes"]
 
+    def test_scale_with_num_processes_none_and_cpu_count_none(self, monkeypatch):
+        """
+        ``scale_oom_params`` resolves a None ``num_processes`` from
+        ``os.cpu_count()``. Some container runtimes (and certain
+        Windows configs) return None from ``os.cpu_count`` — the
+        resolution path must guard against that with an ``or 1``
+        fallback rather than crashing with ``TypeError: unsupported
+        operand type(s) for *: 'NoneType' and 'int'``.
+
+        Tests:
+            (Test Case 1) ``os.cpu_count() == None`` does NOT raise
+                TypeError when ``num_processes is None`` triggers the
+                resolution branch.
+            (Test Case 2) The function returns False without raising
+                (resolved ``current == 1`` falls into the "already at
+                1, cannot scale" branch).
+        """
+        import os
+
+        backend = self._make_backend(num_processes=None)
+        monkeypatch.setattr(os, "cpu_count", lambda: None)
+
+        # Pre-fix: ``round(os.cpu_count() * 2 / 3)`` raised TypeError.
+        # Post-fix: ``cpu_count = os.cpu_count() or 1`` → current = 1 →
+        # the ``current <= 1`` branch returns False cleanly.
+        result = backend.scale_oom_params(0.5)
+        assert result is False
+
 
 # ===========================================================================
 # SorterBackend._resolve_inactivity_timeout_s
@@ -6025,6 +6053,63 @@ class TestSortStimRecordingPassesNdarray:
 
 
 @skip_no_spikeinterface
+class TestSaveTracesNumProcessesNoneResolution:
+    """``save_traces`` resolves a None ``num_processes`` from
+    ``os.cpu_count()`` via ``cpu_count // 4`` (capped at 4). Some
+    container runtimes return None from ``os.cpu_count`` — the
+    resolution path must guard against that with an ``or 1`` fallback
+    rather than crashing with ``TypeError: unsupported operand
+    type(s) for //: 'NoneType' and 'int'``.
+    """
+
+    @skip_no_torch
+    def test_num_processes_none_with_cpu_count_none_resolves_to_at_least_one(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) ``os.cpu_count() == None`` does NOT raise
+                TypeError when ``num_processes is None`` triggers the
+                resolution branch in ``save_traces``.
+            (Test Case 2) The resolved ``num_processes`` (captured at
+                the downstream ``save_traces_si`` call site) is an
+                integer ``>= 1``.
+        """
+        import os
+
+        from spikelab.spike_sorting.rt_sort import _algorithm
+
+        monkeypatch.setattr(os, "cpu_count", lambda: None)
+
+        # Stub ``load_recording`` so the real spikeinterface loader
+        # isn't invoked, and capture the ``num_processes`` value that
+        # reaches the downstream dispatch.
+        sentinel_rec = MagicMock(spec=[])  # not a MaxwellRecordingExtractor
+        monkeypatch.setattr(_algorithm, "load_recording", lambda r: sentinel_rec)
+
+        captured: dict = {}
+
+        def fake_save_traces_si(rec, out_path, **kwargs):
+            captured.update(kwargs)
+            # Write a placeholder so the caller observes the side-
+            # effect path completing.
+            np.save(str(out_path), np.zeros(1, dtype=np.float32))
+
+        monkeypatch.setattr(_algorithm, "save_traces_si", fake_save_traces_si)
+
+        # The call must not raise TypeError on the None cpu_count path.
+        _algorithm.save_traces(
+            sentinel_rec,
+            tmp_path,
+            num_processes=None,
+            verbose=False,
+        )
+
+        resolved = captured.get("num_processes")
+        assert isinstance(resolved, int)
+        assert resolved >= 1
+
+
 class TestSaveTracesSiFastPath:
     """save_traces_si fast-paths in-memory recordings.
 

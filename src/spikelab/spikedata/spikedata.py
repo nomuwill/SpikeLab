@@ -39,8 +39,23 @@ from .utils import (
 from concurrent.futures import ThreadPoolExecutor
 
 __all__ = [
+    # Primary class
     "SpikeData",
+    # Re-exports from utils — kept on this module's public surface
+    # because they are the documented entry points for spike-train
+    # analysis (the ``utils`` module is treated as internal). Tier
+    # L-E4: expand the previous minimal ``[SpikeData, get_sttc]``
+    # list to cover the comparison / similarity helpers and the
+    # shuffle / threshold-crossing utilities that callers reach for
+    # directly. ``plot_utils.py`` is intentionally NOT listed —
+    # matplotlib helpers are not part of the data-class API.
     "get_sttc",
+    "swap",
+    "randomize",
+    "trough_between",
+    "extract_unit_waveforms",
+    "compute_cross_correlation_with_lag",
+    "compute_cosine_similarity_with_lag",
 ]
 
 
@@ -571,33 +586,20 @@ class SpikeData:
               stride.
         """
         from .spikeslicestack import SpikeSliceStack
+        from .utils import _frame_window_starts
 
-        if overlap < 0:
-            raise ValueError(
-                f"overlap must be non-negative, got {overlap}. The parameter "
-                "represents an overlap, not a stride; use a smaller `length` "
-                "and post-filter slices for gapped windows."
-            )
-        step = length - overlap
-        if step <= 0:
-            raise ValueError("overlap must be less than length")
-        end_time = self.start_time + self.length
-        # Count frames explicitly instead of relying on
-        # ``np.arange(stop=end_time - length + 1e-9, ...)`` and praying
-        # the float-arithmetic ULPs land favourably. The previous form
-        # emitted a window-end one ULP past ``end_time`` for inputs
-        # where ``(end_time - length - start_time) / step`` is very
-        # close to an integer, then the strict ``>`` check inside
-        # ``_validate_time_start_to_end`` rejected the otherwise-valid
-        # frame. ``floor + 1`` makes the frame count deterministic.
-        slot_span = end_time - length - self.start_time
-        if slot_span < 0:
-            raise ValueError(
-                f"Recording length ({self.length} ms) is shorter than frame length ({length} ms)"
-            )
-        n_frames = int(np.floor(slot_span / step)) + 1
-        starts = self.start_time + np.arange(n_frames) * step
-        times = [(float(s), float(s) + length) for s in starts]
+        # Tier L-E5: window-generation logic factored out to
+        # ``_frame_window_starts`` and shared with ``RateData.frames``.
+        # Behaviour preserved: ``effective_end = self.start_time +
+        # self.length`` (one past the last raster bin), windows that
+        # extend past it are excluded, frame count is deterministic
+        # via ``floor(slot_span / step) + 1`` (no ULP-padding magic).
+        times = _frame_window_starts(
+            t0=self.start_time,
+            effective_end=self.start_time + self.length,
+            length=length,
+            overlap=overlap,
+        )
         return SpikeSliceStack(self, times_start_to_end=times)
 
     def align_to_events(

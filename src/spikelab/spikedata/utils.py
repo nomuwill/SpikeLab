@@ -533,6 +533,60 @@ def swap(ar, idxs, rng):
     return True
 
 
+def _frame_window_starts(
+    t0: float, effective_end: float, length: float, overlap: float = 0
+) -> List[tuple]:
+    """Compute the (start, end) tuples for fixed-length framing windows.
+
+    Shared helper for ``SpikeData.frames`` and ``RateData.frames``
+    (Tier L-E5). Both methods consume a uniform recording timeline
+    and partition it into ``length``-wide windows with the given
+    ``overlap``. Windows that would extend past ``effective_end``
+    are excluded; the frame count is derived as ``floor(slot_span /
+    step) + 1`` from the slot span ``effective_end - length - t0``,
+    deterministic in float arithmetic (no ULP-padding magic).
+
+    Parameters:
+        t0 (float): Start of the recording timeline (ms).
+        effective_end (float): One past the last sample of the
+            timeline. For ``SpikeData`` this is
+            ``start_time + length``; for ``RateData`` this is
+            ``times[-1] + step_size`` (one bin past the last
+            sample).
+        length (float): Window length (ms).
+        overlap (float): Overlap between consecutive windows (ms).
+            Must satisfy ``0 <= overlap < length``.
+
+    Returns:
+        windows (list[tuple[float, float]]): Sorted list of
+            ``(start, start + length)`` tuples ready to pass to
+            ``SpikeSliceStack`` / ``RateSliceStack``.
+
+    Raises:
+        ValueError: If ``overlap`` is negative, ``length - overlap``
+            is non-positive, or the timeline is shorter than one
+            window.
+    """
+    if overlap < 0:
+        raise ValueError(
+            f"overlap must be non-negative, got {overlap}. The parameter "
+            "represents an overlap, not a stride; use a smaller `length` "
+            "and post-filter slices for gapped windows."
+        )
+    step = length - overlap
+    if step <= 0:
+        raise ValueError("overlap must be less than length")
+    slot_span = effective_end - length - t0
+    if slot_span < 0:
+        raise ValueError(
+            f"Recording length ({effective_end - t0:.1f} ms) is shorter "
+            f"than frame length ({length} ms)"
+        )
+    n_frames = int(np.floor(slot_span / step)) + 1
+    starts = t0 + np.arange(n_frames) * step
+    return [(float(s), float(s) + length) for s in starts]
+
+
 def randomize(ar, swap_per_spike=5, seed=None):
     """Randomize a binary spike raster using degree-preserving double-edge swaps.
 

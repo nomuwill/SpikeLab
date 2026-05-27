@@ -32,9 +32,20 @@ class S3StorageClient:
         aws_secret_access_key: Optional[str] = None,
         aws_session_token: Optional[str] = None,
     ) -> None:
-        self.prefix = (
-            (prefix if prefix.endswith("/") else f"{prefix}/") if prefix else None
-        )
+        # ``prefix`` normalisation: ``None`` or empty string stays
+        # ``None`` (no bucket-level base configured); a non-empty
+        # string gets a trailing ``/`` appended if missing so
+        # downstream ``prefix + filename`` concatenation produces
+        # a valid S3 URI. Spelt out as three branches instead of a
+        # nested ternary for readability. The ``not prefix`` check
+        # (rather than ``is None``) is intentional — empty string
+        # is a documented synonym for "no prefix".
+        if not prefix:
+            self.prefix = None
+        elif prefix.endswith("/"):
+            self.prefix = prefix
+        else:
+            self.prefix = f"{prefix}/"
         self.endpoint_url = endpoint_url
         self.region_name = region_name
         self._templates = path_templates or StoragePathTemplates()

@@ -333,16 +333,7 @@ class RateData:
               stride.
         """
         from .rateslicestack import RateSliceStack
-
-        if overlap < 0:
-            raise ValueError(
-                f"overlap must be non-negative, got {overlap}. The parameter "
-                "represents an overlap, not a stride; use a smaller `length` "
-                "and post-filter slices for gapped windows."
-            )
-        step = length - overlap
-        if step <= 0:
-            raise ValueError("overlap must be less than length")
+        from .utils import _frame_window_starts
 
         if len(self.times) < 2:
             raise ValueError(
@@ -351,18 +342,16 @@ class RateData:
                 "required to infer the bin step_size."
             )
 
-        t0 = float(self.times[0])
-        t_end = float(self.times[-1])
-
-        # frames() places windows on the uniform grid implied by
-        # ``np.median(np.diff(times))``. Using the median (rather than
-        # ``times[1] - times[0]``) is robust to a single anomalous
-        # gap or duplicate-time pair at the start that
-        # ``RateData.__init__`` allows under its monotonically-
-        # non-decreasing contract — without this, the first-pair
-        # step could poison the uniformity check below for an
-        # otherwise-uniform grid.
+        # Tier L-E5: window-generation logic factored out to
+        # ``_frame_window_starts`` and shared with ``SpikeData.frames``.
+        # Uniform-grid validation stays here because it's
+        # RateData-specific — the helper consumes pre-validated
+        # ``effective_end`` (one bin past the last sample).
         diffs = np.diff(np.asarray(self.times, dtype=float))
+        # ``np.median`` (not ``times[1] - times[0]``) is robust to a
+        # single anomalous gap or duplicate-time pair at the start
+        # that ``RateData.__init__`` allows under its monotonically-
+        # non-decreasing contract.
         step_size = float(np.median(diffs))
         if not np.allclose(diffs, step_size, rtol=1e-6, atol=1e-9):
             raise ValueError(
@@ -372,24 +361,12 @@ class RateData:
                 "uniform grid before framing."
             )
 
-        # The downstream RateSliceStack's recording range is
-        # ``(times[0], times[-1] + step_size)``, so the effective
-        # ``end_time`` for framing is ``t_end + step_size`` (one bin
-        # past the last sample). Count frames explicitly instead of
-        # padding the ``np.arange`` stop with a magic ``+1e-9`` and
-        # hoping the ULPs land favourably — the explicit form is
-        # deterministic and doesn't drift past the strict bounds
-        # check in ``_validate_time_start_to_end``.
-        effective_end = t_end + step_size
-        slot_span = effective_end - length - t0
-        if slot_span < 0:
-            raise ValueError(
-                f"Recording length ({t_end - t0 + step_size:.1f} ms) is shorter "
-                f"than frame length ({length} ms)"
-            )
-        n_frames = int(np.floor(slot_span / step)) + 1
-        starts = t0 + np.arange(n_frames) * step
-        times = [(float(s), float(s) + length) for s in starts]
+        times = _frame_window_starts(
+            t0=float(self.times[0]),
+            effective_end=float(self.times[-1]) + step_size,
+            length=length,
+            overlap=overlap,
+        )
         return RateSliceStack(self, times_start_to_end=times)
 
     def get_pairwise_fr_corr(

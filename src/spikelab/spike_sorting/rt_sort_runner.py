@@ -56,6 +56,7 @@ def spike_sort(
     output_folder: Any,
     *,
     config: Optional[SortingPipelineConfig] = None,
+    rt_sort_pickle_path: Optional[Any] = None,
 ) -> Any:
     """Run RT-Sort offline spike sorting on a single recording.
 
@@ -113,12 +114,21 @@ def spike_sort(
     output_folder.mkdir(parents=True, exist_ok=True)
 
     log_path = output_folder / "rt_sort.log"
-    # rt_sort.pickle is saved to the recording dir (parent of inter_path),
-    # NOT inside the inter dir. This keeps it persistent across spikelab's
-    # inter cleanup (RTSortConfig.delete_inter=True default would otherwise
-    # remove the pickle along with the cache npy files). Stable path used
-    # for the cache-hit reuse check below and for sort_stim_recording reuse.
-    rt_sort_pickle = output_folder.parent.parent / "rt_sort.pickle"
+    # rt_sort.pickle is saved to a path persistent across spikelab's
+    # inter cleanup (RTSortConfig.delete_inter=True default would
+    # otherwise remove the pickle along with the cache npy files).
+    # The caller (RTSortBackend) computes the canonical path and
+    # passes it explicitly via ``rt_sort_pickle_path``. When omitted,
+    # we fall back to ``output_folder.parent.parent / "rt_sort.pickle"``
+    # — the pre-Tier-L-E3 default that worked for the canonical
+    # ``get_paths()`` layout (output_folder lives two levels below
+    # the recording dir). Bare callers using a different folder
+    # structure should pass ``rt_sort_pickle_path`` explicitly to
+    # avoid silently writing the pickle to the wrong location.
+    if rt_sort_pickle_path is not None:
+        rt_sort_pickle = Path(rt_sort_pickle_path)
+    else:
+        rt_sort_pickle = output_folder.parent.parent / "rt_sort.pickle"
     cached_sorting_npz = output_folder / "sorting.npz"
 
     with Tee(log_path, file_mode="w"):

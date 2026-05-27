@@ -246,6 +246,14 @@ class RTSortBackend(SorterBackend):
             recording, sorter="rt_sort"
         )
 
+        # Tier L-E3: compute the persistent rt_sort.pickle path at
+        # the backend level rather than letting the runner infer it
+        # via ``output_folder.parent.parent``. The pickle lives in
+        # the recording's results dir (parent of inter_path); pass
+        # it explicitly so a caller that uses a non-canonical folder
+        # structure doesn't silently write to the wrong location.
+        rt_sort_pickle_path = Path(output_folder).parent.parent / "rt_sort.pickle"
+
         def _do_sort():
             return spike_sort(
                 rec_cache=recording,
@@ -253,6 +261,7 @@ class RTSortBackend(SorterBackend):
                 recording_dat_path=recording_dat_path,
                 output_folder=output_folder,
                 config=self.config,
+                rt_sort_pickle_path=rt_sort_pickle_path,
             )
 
         if watchdog is None:

@@ -197,17 +197,3 @@ class SubmitResult(BaseModel):
     output_prefix: str
     logs_prefix: str
     job_type: Literal["workspace", "sorting", "prepared"]
-
-
-class RunConfig(BaseModel):
-    """User-facing run config consumed by CLI/session."""
-
-    profile_name: str = "defaults"
-    input_path: str
-    output_prefix: Optional[str] = None
-    workspace_id: Optional[str] = None
-    namespace: Optional[str] = None
-    allow_policy_risk: bool = False
-    max_wait_seconds: int = Field(default=3600, ge=1)
-    wait_for_completion: bool = False
-    follow_logs: bool = False

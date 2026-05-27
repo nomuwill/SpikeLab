@@ -13,7 +13,6 @@ def __getattr__(name):
         "ContainerSpec",
         "JobSpec",
         "ResourceSpec",
-        "RunConfig",
         "SubmitResult",
         "VolumeMountSpec",
         "RunSession",
@@ -27,7 +26,6 @@ def __getattr__(name):
                 "ContainerSpec",
                 "JobSpec",
                 "ResourceSpec",
-                "RunConfig",
                 "SubmitResult",
                 "VolumeMountSpec",
             }:
@@ -36,7 +34,6 @@ def __getattr__(name):
                     ContainerSpec,
                     JobSpec,
                     ResourceSpec,
-                    RunConfig,
                     SubmitResult,
                     VolumeMountSpec,
                 )
@@ -82,7 +79,6 @@ __all__ = [
     "ContainerSpec",
     "JobSpec",
     "ResourceSpec",
-    "RunConfig",
     "SubmitResult",
     "VolumeMountSpec",
     "RunSession",

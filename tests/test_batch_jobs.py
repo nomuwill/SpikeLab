@@ -329,9 +329,7 @@ class TestSanitizeYamlValueRaisesOnUnsafeChars:
         job_spec = validate_job_spec(payload)
         profile = ClusterProfile(name="vol-raise")
         with pytest.raises(ValueError, match="YAML-unsafe character"):
-            build_template_context(
-                job_name="job-x", job_spec=job_spec, profile=profile
-            )
+            build_template_context(job_name="job-x", job_spec=job_spec, profile=profile)
 
     def test_safe_punctuation_passes_through(self):
         """
@@ -505,9 +503,7 @@ class TestSleepDetection:
             (Test Case 2) ``sleep 100`` with ``threshold_s=200`` → False.
         """
         assert _contains_disallowed_sleep(["sleep"], ["100"], threshold_s=50)
-        assert not _contains_disallowed_sleep(
-            ["sleep"], ["100"], threshold_s=200
-        )
+        assert not _contains_disallowed_sleep(["sleep"], ["100"], threshold_s=200)
 
     def test_evaluate_policy_propagates_sleep_duration_threshold(self):
         """
@@ -539,8 +535,7 @@ class TestSleepDetection:
         # A BLOCK-level sleep finding fires because the duration
         # exceeds the strict threshold.
         assert any(
-            "sleep" in code and level == "BLOCK"
-            for code, level in levels_strict
+            "sleep" in code and level == "BLOCK" for code, level in levels_strict
         )
 
         # Default profile: 24 h threshold lets ``sleep 100`` through.
@@ -548,8 +543,7 @@ class TestSleepDetection:
         findings_default = evaluate_policy(job_spec, default_profile)
         levels_default = {(f.code, f.level) for f in findings_default}
         assert not any(
-            "sleep" in code and level == "BLOCK"
-            for code, level in levels_default
+            "sleep" in code and level == "BLOCK" for code, level in levels_default
         )
 
     def test_sleep_as_substring_allowed(self):
@@ -621,9 +615,7 @@ def test_policy_uses_profile_thresholds():
     # Default (include_passes=False): no finding when the check passes.
     assert gpu_findings_relaxed == []
     # Audit mode: opt in to PASS findings.
-    findings_audit = evaluate_policy(
-        job_spec, profile_relaxed, include_passes=True
-    )
+    findings_audit = evaluate_policy(job_spec, profile_relaxed, include_passes=True)
     gpu_finding_audit = [
         f for f in findings_audit if f.code == "interactive_gpu_limit"
     ][0]
@@ -1141,7 +1133,10 @@ class TestS3StorageClient:
         with patch("spikelab.batch_jobs.storage_s3.boto3", None):
             client = S3StorageClient(prefix="s3://bucket/pfx/")
             # URI-only operations work without boto3.
-            assert client.output_prefix_for_run("run-1") == "s3://bucket/pfx/outputs/run-1/"
+            assert (
+                client.output_prefix_for_run("run-1")
+                == "s3://bucket/pfx/outputs/run-1/"
+            )
             # Client-using operations raise the deferred ImportError.
             with pytest.raises(ImportError, match="boto3 is required"):
                 client.upload_file(local_path=__file__, s3_uri="s3://bucket/pfx/x.bin")
@@ -1169,9 +1164,7 @@ class TestS3StorageClient:
             # Yield 1000 keys per page.
             for start in range(0, n_keys, 1000):
                 stop = min(start + 1000, n_keys)
-                yield {
-                    "Contents": [{"Key": f"k{i}"} for i in range(start, stop)]
-                }
+                yield {"Contents": [{"Key": f"k{i}"} for i in range(start, stop)]}
 
         # 10_001 keys → exceeds the default cap.
         with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
@@ -1241,9 +1234,7 @@ class TestS3StorageClient:
                 category="not-a-real-category",
             )
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "build_uri" in m]
         assert relevant, warn_msgs
         # Known categories listed in the warning.
@@ -1645,9 +1636,7 @@ class TestProfiles:
             _warnings.simplefilter("always")
             profile = load_profile_from_name("not-a-real-profile")
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "Unknown profile" in m]
         assert relevant, warn_msgs
         assert "defaults" in relevant[0]
@@ -1845,37 +1834,18 @@ class TestModelValidation:
 # Validation module edge cases
 # ---------------------------------------------------------------------------
 
-from spikelab.batch_jobs.validation import (
-    validate_run_config,
-    summarize_validation_error,
-)
+from spikelab.batch_jobs.validation import summarize_validation_error
 
 
 class TestValidationModule:
-    def test_validate_run_config_happy_path(self):
-        """validate_run_config parses a valid RunConfig payload."""
-        config = validate_run_config({"input_path": "/data/recording.h5"})
-        assert config.input_path == "/data/recording.h5"
-        assert config.profile_name == "defaults"
-
-    def test_validate_run_config_missing_required_field(self):
-        """validate_run_config raises for missing input_path."""
-        with pytest.raises(PydanticValidationError):
-            validate_run_config({})
-
-    def test_validate_run_config_invalid_wait(self):
-        """validate_run_config rejects max_wait_seconds below minimum."""
-        with pytest.raises(PydanticValidationError):
-            validate_run_config({"input_path": "/data/x.h5", "max_wait_seconds": 0})
-
     def test_summarize_validation_error_format(self):
         """summarize_validation_error produces a readable string."""
         try:
-            validate_run_config({})
+            validate_job_spec({})
         except PydanticValidationError as exc:
             summary = summarize_validation_error(exc)
-            assert "input_path" in summary
             assert isinstance(summary, str)
+            assert summary.startswith("Invalid job config")
 
     def test_summarize_validation_error_multiple_errors(self):
         """summarize_validation_error puts each error on its own line.
@@ -2200,9 +2170,7 @@ class TestPolicy:
         job_spec = validate_job_spec(payload)
         profile = ClusterProfile(name="test")
         findings_default = evaluate_policy(job_spec, profile)
-        block_findings = [
-            f for f in findings_default if f.code == "sleep_in_batch_job"
-        ]
+        block_findings = [f for f in findings_default if f.code == "sleep_in_batch_job"]
         assert len(block_findings) == 1
         assert block_findings[0].level == "BLOCK"
         findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
@@ -2324,9 +2292,9 @@ class TestPolicyBoundary:
         assert [f for f in findings if f.code == "interactive_gpu_limit"] == []
         # Audit mode: PASS entry returns.
         findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
-        gpu_finding = [
-            f for f in findings_audit if f.code == "interactive_gpu_limit"
-        ][0]
+        gpu_finding = [f for f in findings_audit if f.code == "interactive_gpu_limit"][
+            0
+        ]
         assert gpu_finding.level == "PASS"
 
     def test_block_sleep_infinity_disabled_emits_warn(self):
@@ -2429,23 +2397,11 @@ class TestBuildJobName:
 
 
 # ---------------------------------------------------------------------------
-# RunConfig validation edge cases
+# PolicyConfig validation edge cases
 # ---------------------------------------------------------------------------
 
-from spikelab.batch_jobs.models import RunConfig
 
-
-class TestRunConfigValidation:
-    def test_max_wait_seconds_zero_rejected(self):
-        """max_wait_seconds=0 should fail validation (ge=1)."""
-        with pytest.raises(PydanticValidationError):
-            RunConfig(input_path="/data/test.h5", max_wait_seconds=0)
-
-    def test_max_wait_seconds_one_accepted(self):
-        """max_wait_seconds=1 is the minimum allowed value."""
-        config = RunConfig(input_path="/data/test.h5", max_wait_seconds=1)
-        assert config.max_wait_seconds == 1
-
+class TestPolicyConfigValidation:
     def test_max_runtime_seconds_zero_rejected(self):
         """PolicyConfig max_runtime_seconds=0 should fail validation (ge=1)."""
         with pytest.raises(PydanticValidationError):
@@ -3469,9 +3425,7 @@ class TestWorkspaceEntrypoint:
         ws.save(ws_base)
 
         script = tmp_path / "failing_script.py"
-        script.write_text(
-            "raise RuntimeError('synthetic failure')\n", encoding="utf-8"
-        )
+        script.write_text("raise RuntimeError('synthetic failure')\n", encoding="utf-8")
 
         bundle_dir = tmp_path / "bundle" / "run-1"
         bundle_dir.mkdir(parents=True)
@@ -3868,9 +3822,7 @@ class TestSortingEntrypoint:
         original = dict(SortingPipelineConfig.__annotations__)
         new_annotations = dict(original)
         new_annotations["recording"] = "RecordingConfig"
-        monkeypatch.setattr(
-            SortingPipelineConfig, "__annotations__", new_annotations
-        )
+        monkeypatch.setattr(SortingPipelineConfig, "__annotations__", new_annotations)
 
         reconstructed = _reconstruct_config(config_dict)
         assert isinstance(reconstructed.recording, RecordingConfig)
@@ -4358,12 +4310,8 @@ class TestJobSpecNamePrefix:
             _warnings.simplefilter("always")
             job_spec = validate_job_spec(payload)
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
-        relevant = [
-            m for m in warn_msgs if "name_prefix" in m and "truncated" in m
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "name_prefix" in m and "truncated" in m]
         assert relevant, warn_msgs
         # Both the original and the truncated 40-char form appear.
         assert original in relevant[0]
@@ -4526,9 +4474,7 @@ class TestWaitForCompletionRetryBackoff:
         import subprocess
 
         session, backend = self._make_session()
-        backend.job_status.side_effect = subprocess.CalledProcessError(
-            1, "kubectl"
-        )
+        backend.job_status.side_effect = subprocess.CalledProcessError(1, "kubectl")
         from spikelab.batch_jobs import session as session_mod
 
         monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
@@ -4771,9 +4717,7 @@ class TestKubernetesBatchJobBackendK8sClientPath:
         backend.use_kubectl_fallback = True
 
         # Stub the kubectl invocation so the test stays hermetic.
-        backend._run_kubectl = lambda cmd: (
-            "job.batch/clean-job-name created\n"
-        )
+        backend._run_kubectl = lambda cmd: ("job.batch/clean-job-name created\n")
 
         manifest_file = tmp_path / "job.yaml"
         manifest_file.write_text(
@@ -5043,9 +4987,7 @@ class TestK8sBackendConfigException:
         monkeypatch.setattr(
             "spikelab.batch_jobs.backend_k8s.tempfile.mkstemp", tracking_mkstemp
         )
-        monkeypatch.setattr(
-            "spikelab.batch_jobs.backend_k8s.os.fdopen", failing_fdopen
-        )
+        monkeypatch.setattr("spikelab.batch_jobs.backend_k8s.os.fdopen", failing_fdopen)
 
         manifest = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: my-job\n"
         with pytest.raises(OSError, match="simulated write failure"):
@@ -5083,18 +5025,14 @@ class TestK8sBackendConfigException:
         mock_config = MagicMock()
         mock_config.ConfigException = type("ConfigException", (Exception,), {})
 
-        with caplog.at_level(
-            logging.DEBUG, logger="spikelab.batch_jobs.backend_k8s"
-        ):
+        with caplog.at_level(logging.DEBUG, logger="spikelab.batch_jobs.backend_k8s"):
             with patch("spikelab.batch_jobs.backend_k8s.client", mock_client):
                 with patch("spikelab.batch_jobs.backend_k8s.config", mock_config):
                     backend = KubernetesBatchJobBackend(namespace="test")
 
         assert backend._batch_api is None
         assert backend._core_api is None
-        debug_records = [
-            r for r in caplog.records if r.levelno == logging.DEBUG
-        ]
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
         assert debug_records, "expected a DEBUG-level log record on fallback"
 
 
@@ -6364,8 +6302,8 @@ class TestContainsDisallowedSleepBoundaries:
 
 
 class TestValidationModuleBoundaries:
-    """``validation.validate_job_spec`` and ``validate_run_config``
-    rejection contracts at the type-shape boundary.
+    """``validation.validate_job_spec`` rejection contracts at the
+    type-shape boundary.
     """
 
     def test_validate_job_spec_none_payload_raises(self):
@@ -6388,19 +6326,6 @@ class TestValidationModuleBoundaries:
 
         with pytest.raises(ValidationError):
             validate_job_spec([])
-
-    def test_validate_run_config_none_input_path_raises(self):
-        """
-        Tests:
-            (Test Case 1) ``{"input_path": None}`` raises (required
-                non-Optional string).
-        """
-        from pydantic import ValidationError
-
-        from spikelab.batch_jobs.validation import validate_run_config
-
-        with pytest.raises(ValidationError):
-            validate_run_config({"input_path": None})
 
 
 class TestTemplatingSanitizers:
@@ -6690,9 +6615,7 @@ class TestCliCmdDeployInvalidConfigMessages:
     through the pydantic summariser.
     """
 
-    def test_validation_error_routes_through_summariser(
-        self, tmp_path, monkeypatch
-    ):
+    def test_validation_error_routes_through_summariser(self, tmp_path, monkeypatch):
         """
         Tests:
             (Test Case 1) An invalid job_config payload (e.g. empty
@@ -6757,9 +6680,7 @@ class TestCliCmdDeployInvalidConfigMessages:
         from spikelab.batch_jobs import cli as cli_mod
 
         config_path = tmp_path / "job.json"
-        config_path.write_text(
-            json.dumps(_example_payload()), encoding="utf-8"
-        )
+        config_path.write_text(json.dumps(_example_payload()), encoding="utf-8")
 
         monkeypatch.setattr(
             cli_mod,
@@ -6803,9 +6724,7 @@ class TestCliCmdDeployRenderOnlyCreatesParentDirs:
     directory like ``./out/dry-run/`` when ``./out`` doesn't exist).
     """
 
-    def test_render_only_creates_missing_parent_dirs(
-        self, tmp_path, monkeypatch
-    ):
+    def test_render_only_creates_missing_parent_dirs(self, tmp_path, monkeypatch):
         """
         Tests:
             (Test Case 1) Output path under a non-existent nested
@@ -6992,9 +6911,7 @@ class TestPackageAnalysisBundleSortingRecordingFiles:
                 output_format="sorting",
             )
 
-    def test_workspace_bundle_omits_recording_files_when_unspecified(
-        self, tmp_path
-    ):
+    def test_workspace_bundle_omits_recording_files_when_unspecified(self, tmp_path):
         """
         Tests:
             (Test Case 1) ``output_format='workspace'`` without

@@ -14,6 +14,7 @@ attributed to van der Molen, Lim et al. 2024 (PLOS ONE, DOI
 10.1371/journal.pone.0312438).
 """
 
+import logging
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,6 +24,8 @@ from ._classifier import classify_rt_sort_failure
 from ._exceptions import SpikeSortingClassifiedError
 from .config import SortingPipelineConfig
 from .sorting_utils import Stopwatch, Tee, print_stage
+
+_logger = logging.getLogger(__name__)
 
 
 def _load_detection_model(model_path, probe):
@@ -138,7 +141,7 @@ def spike_sort(
             and rt_sort_pickle.exists()
             and cached_sorting_npz.exists()
         ):
-            print("Loading existing RT-Sort results")
+            _logger.info("Loading existing RT-Sort results")
             try:
                 sorting = _load_cached_sorting(cached_sorting_npz, rec_cache)
                 root_elecs_path = output_folder / "root_elecs.npy"
@@ -150,7 +153,7 @@ def spike_sort(
                 stopwatch.log_time("Done loading existing results.")
                 return sorting, root_elecs
             except Exception as exc:
-                print(f"Failed to load cached sorting ({exc}); recomputing.")
+                _logger.info(f"Failed to load cached sorting ({exc}); recomputing.")
 
         try:
             detection_model = _load_detection_model(
@@ -170,7 +173,7 @@ def spike_sort(
                     start_ms + float(det_window_s) * 1000.0,
                 )
                 if rt_verbose:
-                    print(
+                    _logger.info(
                         f"[rt_sort] Detection window narrowed to "
                         f"{detect_window_ms[0]/1000:.1f}-"
                         f"{detect_window_ms[1]/1000:.1f} s "
@@ -201,7 +204,7 @@ def spike_sort(
         except SpikeSortingClassifiedError:
             raise
         except Exception as exc:
-            print(f"RT-Sort sequence detection failed: {exc}")
+            _logger.info(f"RT-Sort sequence detection failed: {exc}")
             stopwatch.log_time("Sequence detection failed.")
             classified = classify_rt_sort_failure(output_folder, exc)
             if classified is not None:
@@ -219,7 +222,7 @@ def spike_sort(
         except SpikeSortingClassifiedError:
             raise
         except Exception as exc:
-            print(f"RT-Sort offline sorting failed: {exc}")
+            _logger.info(f"RT-Sort offline sorting failed: {exc}")
             stopwatch.log_time("Offline sorting failed.")
             classified = classify_rt_sort_failure(output_folder, exc)
             if classified is not None:

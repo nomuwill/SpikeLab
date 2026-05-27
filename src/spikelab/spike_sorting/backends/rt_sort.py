@@ -19,6 +19,7 @@ Requirements:
     # see https://pytorch.org/get-started/locally/
 """
 
+import logging
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -27,6 +28,8 @@ import numpy as np
 from ..config import SortingPipelineConfig, WaveformConfig
 from ..sorting_utils import _check_unit_id_density
 from .base import SorterBackend
+
+_logger = logging.getLogger(__name__)
 
 
 def _numpy_sorting_to_ks_extractor(
@@ -338,7 +341,7 @@ class RTSortBackend(SorterBackend):
             except Exception:
                 current = 4
         if current <= 1:
-            print(
+            _logger.info(
                 "[oom retry] rt_sort: num_processes already at 1 — "
                 "no further scaling possible."
             )
@@ -347,7 +350,7 @@ class RTSortBackend(SorterBackend):
         if new_n >= current:
             return False
         rt.num_processes = new_n
-        print(
+        _logger.info(
             f"[oom retry] rt_sort: scaled num_processes {current} -> "
             f"{new_n} (factor={factor})."
         )

@@ -10,10 +10,13 @@ Requirements:
     # Plus PyTorch with CUDA — see https://pytorch.org/get-started/locally/
 """
 
+import logging
 from typing import Any
 
 from ..config import SortingPipelineConfig
 from .base import SorterBackend
+
+_logger = logging.getLogger(__name__)
 
 DEFAULT_KILOSORT4_PARAMS = {
     "do_CAR": True,
@@ -148,14 +151,14 @@ class Kilosort4Backend(SorterBackend):
         batch = params.get("batch_size", 60000)
         new_batch = int(int(batch) * float(factor))
         if new_batch < 1024:
-            print(
+            _logger.info(
                 f"[oom retry] kilosort4: batch_size would drop to "
                 f"{new_batch} after scaling — refusing to scale further."
             )
             return False
         params["batch_size"] = new_batch
         self.config.sorter.sorter_params = params
-        print(
+        _logger.info(
             f"[oom retry] kilosort4: scaled batch_size {batch} -> "
             f"{new_batch} (factor={factor})."
         )

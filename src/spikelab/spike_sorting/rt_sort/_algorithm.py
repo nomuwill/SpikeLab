@@ -26,10 +26,13 @@ Changes from the braindance upstream version:
       module rather than ``braindance.core.spikedetector.model``.
 """
 
+import logging
 from copy import deepcopy
 from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool, Manager
+
+_logger = logging.getLogger(__name__)
 
 
 def _thread_map(num_workers, fn, items):
@@ -376,7 +379,7 @@ def detect_sequences(
             num_processes_save_traces = num_processes
 
         if debug and verbose and (inter_path / "scaled_traces.npy").exists():
-            print(
+            _logger.info(
                 "Skipping saving scaled traces because file scaled_traces.npy already exists and debug=True"
             )
         else:
@@ -394,7 +397,7 @@ def detect_sequences(
         pre_median_frames = round(pre_median_ms * samp_freq)
 
         if debug and verbose and (model_inter_path / "model_outputs.npy").exists():
-            print(
+            _logger.info(
                 "Skipping running detection model because file model_outputs.npy already exists and debug=True"
             )
         else:
@@ -478,7 +481,7 @@ def detect_sequences(
         # Form prelim prop seqs
         if debug and (inter_path / "all_clusters.pickle").exists():
             if verbose:
-                print(
+                _logger.info(
                     "Skipping detecting preliminary propagation sequences because file all_clusters.pickle already exists and debug=True"
                 )
             all_clusters = pickle_load(inter_path / "all_clusters.pickle")
@@ -496,7 +499,7 @@ def detect_sequences(
         # Reassign spikes
         if debug and (inter_path / "all_clusters_reassigned.pickle").exists():
             if verbose:
-                print(
+                _logger.info(
                     "Skipping reassigning spikes because file all_clusters_reassigned.pickle already exists and debug=True"
                 )
             all_clusters_reassigned = pickle_load(
@@ -513,7 +516,7 @@ def detect_sequences(
                 )
         if len(all_clusters_reassigned) == 0:
             if verbose:
-                print(
+                _logger.info(
                     "0 preliminary propagation sequences remain after reassigning spikes and filtering"
                 )
             if return_spikes:
@@ -527,7 +530,7 @@ def detect_sequences(
             len(intra_merged_clusters) == 0
         ):  # It should't be possible for this to be True, but just in case
             if verbose:
-                print("0 sequences remain first merging")
+                _logger.info("0 sequences remain first merging")
             if return_spikes:
                 return []
             else:
@@ -538,7 +541,7 @@ def detect_sequences(
             len(inter_merged_clusters) == 0
         ):  # It should't be possible for this to be True, but just in case
             if verbose:
-                print("0 sequences remain second merging")
+                _logger.info("0 sequences remain second merging")
             if return_spikes:
                 return []
             else:
@@ -553,7 +556,7 @@ def detect_sequences(
 
         if return_spikes:  # Reassign spikes
             if verbose:
-                print("Final spike assignment for final spike times:")
+                _logger.info("Final spike assignment for final spike times:")
             all_spike_trains = rt_sort.sort_offline(
                 inter_path / "scaled_traces.npy", verbose=verbose
             )  # NOTE: These spikes may be a few frames offset from the actual peak on the root electrode when compared to model_traces.npy and model_outputs.npy because different windows are used --> will cause problems if doing any setup_cluster
@@ -1021,7 +1024,7 @@ class RTSort:
         all_start_frames = range(0, scaled_traces.shape[1], self.buffer_size)
 
         if verbose:
-            print("Sorting recording")
+            _logger.info("Sorting recording")
             all_start_frames = tqdm(all_start_frames)
 
         all_detections = [[] for _ in range(self.num_seqs)]
@@ -1552,7 +1555,7 @@ def save_traces(
     This is resolved through parallel processing.
     """
     if verbose:
-        print("Saving traces:")
+        _logger.info("Saving traces:")
     recording = load_recording(recording)
 
     if num_processes is None:
@@ -1644,7 +1647,7 @@ def save_traces_si(
     # investigation.  np.save here writes the array directly.
     if _is_in_memory_recording(recording):
         if verbose:
-            print("In-memory recording detected — direct save (no pool)")
+            _logger.info("In-memory recording detected — direct save (no pool)")
         traces = recording.get_traces(
             start_frame=start_frame,
             end_frame=end_frame,
@@ -1662,7 +1665,7 @@ def save_traces_si(
     # RAM allocation.
     n_samples = end_frame - start_frame
     if verbose:
-        print(
+        _logger.info(
             f"Alllocating disk space for traces ({num_elecs} ch × "
             f"{n_samples} samples, {dtype})..."
         )
@@ -1685,7 +1688,7 @@ def save_traces_si(
     chunk_samples = max(1, int(round(chunk_seconds * fs_Hz)))
     n_chunks = (n_samples + chunk_samples - 1) // chunk_samples
     if verbose:
-        print(
+        _logger.info(
             f"Extracting traces in time chunks ({chunk_seconds:.1f} s × "
             f"{n_chunks} chunks, all channels per chunk — one filter pass "
             f"per chunk)"
@@ -1812,7 +1815,9 @@ def save_traces_mea(
     else:
         gain = np.full_like(chan_ind, default_gain, dtype="float16")
         if verbose:
-            print(f"Recording does not have channel gains. Setting gain to {gain}")
+            _logger.info(
+                f"Recording does not have channel gains. Setting gain to {gain}"
+            )
     gain = gain[:, None]
 
     # Allocate the .npy file directly on disk via open_memmap.  The
@@ -1909,7 +1914,7 @@ def run_detection_model(
             If None, set to scaled_traces_path.parent / "model_outputs.npy"
     """
     if verbose:
-        print("Running detection model:")
+        _logger.info("Running detection model:")
 
     if model_traces_path is None:
         model_traces_path = Path(scaled_traces_path).parent / "model_traces.npy"
@@ -1927,7 +1932,9 @@ def run_detection_model(
     input_scale = model.input_scale
     # Compile detection model
     if verbose:
-        print(f"Compiling detection model for {recording.get_num_channels()} elecs ...")
+        _logger.info(
+            f"Compiling detection model for {recording.get_num_channels()} elecs ..."
+        )
     model_compiled = model.compile(
         recording.get_num_channels(), model_save_path=model_inter_path, device=device
     )
@@ -1944,7 +1951,7 @@ def run_detection_model(
     )  # Some frames at the end of the recording may not be included because they can not be a part of a window that 1) does not overlap with a previous window 2) is duration sample_size (10ms)
 
     if verbose:
-        print("Allocating disk space to save model traces and outputs ...")
+        _logger.info("Allocating disk space to save model traces and outputs ...")
     # Allocate the .npy files directly on disk via open_memmap. The previous
     # np.zeros_like + np.save + np.load round-trip materialised two full-sized
     # arrays (traces and outputs) in RAM before reassigning to memmaps — for a
@@ -1971,11 +1978,11 @@ def run_detection_model(
         inference_scaling = inference_scaling_numerator / median
     else:
         inference_scaling = 1
-    print(f"Inference scaling: {inference_scaling}")
+    _logger.info(f"Inference scaling: {inference_scaling}")
     # endregion
 
     # region Run model
-    print("Running model ...")
+    _logger.info("Running model ...")
     with torch.no_grad():
         for start_frame in tqdm(all_start_frames, file=sys.stdout):
             traces_torch = torch.tensor(
@@ -2169,8 +2176,8 @@ def form_coc_clusters(root_elec, params):
     all_times = crossing_output_frames / samp_freq  # Convert to ms in recording
 
     if verbose:
-        print(f"Starting with elec {root_elec}, loc: {elec_locs[root_elec]}")
-        print("\nFinding coocurrences")
+        _logger.info(f"Starting with elec {root_elec}, loc: {elec_locs[root_elec]}")
+        _logger.info("\nFinding coocurrences")
         # all_times = tqdm(all_times)
 
     coc_dict = {}  # root time to cocs [(elec, latency)]
@@ -2239,21 +2246,23 @@ def form_coc_clusters(root_elec, params):
 
     allowed_root_times = set(coc_dict.keys())
     if verbose:
-        print(f"{len(allowed_root_times)} cocs total")
+        _logger.info(f"{len(allowed_root_times)} cocs total")
 
     all_coc_clusters = []
     root_cluster = CocCluster(root_elec, {root_elec}, [])
     # for allowed_root_times in amps_allowed_root_times:
     if verbose and len(allowed_root_times) > 1:
-        print(f"-" * 50)
-        print(f"Starting on amp/median group with {len(allowed_root_times)} cocs")
+        _logger.info(f"-" * 50)
+        _logger.info(
+            f"Starting on amp/median group with {len(allowed_root_times)} cocs"
+        )
     # allowed_root_times = set(allowed_root_times)
 
     # patience_counter = 0
     # Compare root to each comp elec
     for c in range(len(comp_elecs)):
         if verbose:
-            print(
+            _logger.info(
                 f"\nComparing to elec {comp_elecs[c]}, loc: {elec_locs[comp_elecs[c]]}"
             )
 
@@ -2273,18 +2282,18 @@ def form_coc_clusters(root_elec, params):
             all_coc_clusters.append(cluster)
 
         if verbose:
-            print(f"Found {len(coc_clusters)} clusters")
-            print(f"{len(allowed_root_times)} cocs remaining")
+            _logger.info(f"Found {len(coc_clusters)} clusters")
+            _logger.info(f"{len(allowed_root_times)} cocs remaining")
 
         if len(allowed_root_times) < min_coc_n:
             if verbose:
-                print(f"\nEnding early because too few cocs remaining")
+                _logger.info(f"\nEnding early because too few cocs remaining")
             break
 
     # region Split coc_clusters based on root amp medians
     if not split_coc_clusters_amps:
         if verbose:
-            print(f"\nTotal: {len(all_coc_clusters)} clusters")
+            _logger.info(f"\nTotal: {len(all_coc_clusters)} clusters")
 
         return all_coc_clusters
 
@@ -2302,7 +2311,7 @@ def form_coc_clusters(root_elec, params):
             all_split_coc_clusters.append(cluster)
             continue
         if verbose:
-            print(f"\nCluster {i}: p-val={pval:.4f}")
+            _logger.info(f"\nCluster {i}: p-val={pval:.4f}")
 
         # Reshape to (n_samples, n_features)
         root_amp_medians = root_amp_medians.reshape(-1, 1)
@@ -2335,11 +2344,11 @@ def form_coc_clusters(root_elec, params):
             if len(cluster._spike_train) >= min_coc_n:
                 all_split_coc_clusters.append(cluster)
         if verbose:
-            print(f"Split cluster {i} into {len(split_coc_clusters)} clusters")
+            _logger.info(f"Split cluster {i} into {len(split_coc_clusters)} clusters")
     # endregion
 
     if verbose:
-        print(f"\nTotal: {len(all_split_coc_clusters)} clusters")
+        _logger.info(f"\nTotal: {len(all_split_coc_clusters)} clusters")
 
     return all_split_coc_clusters
 
@@ -2366,7 +2375,7 @@ def form_all_clusters(params):
     verbose = params["verbose"]
 
     if verbose:
-        print("Detecting sequences")
+        _logger.info("Detecting sequences")
 
     # np.random.seed(1150)
     all_clusters = []
@@ -2380,7 +2389,7 @@ def form_all_clusters(params):
             all_clusters += clusters
 
     if verbose:
-        print(f"Detected {len(all_clusters)} preliminary propagation sequences")
+        _logger.info(f"Detected {len(all_clusters)} preliminary propagation sequences")
     return all_clusters
 
 
@@ -2405,7 +2414,7 @@ def branch_coc_cluster(
     comp_elec = comp_elecs[0]
 
     if verbose:
-        print(f"Comparing to elec {comp_elec}, loc: {elec_locs[comp_elec]}")
+        _logger.info(f"Comparing to elec {comp_elec}, loc: {elec_locs[comp_elec]}")
 
     """
     Pseudocode:
@@ -2579,7 +2588,7 @@ class Patience:
         return False
 
     def verbose(self):
-        print(f"Patience: {self.counter}/{self.patience_end}")
+        _logger.info(f"Patience: {self.counter}/{self.patience_end}")
 
 
 # endregion
@@ -2602,7 +2611,7 @@ def reassign_spikes_to_clusters(all_clusters, model, params):
 
     # all_clusters = all_clusters[:2415]
     if verbose:
-        print("Reassigning spikes to preliminary propagation sequences")
+        _logger.info("Reassigning spikes to preliminary propagation sequences")
 
     # Sequences will stay together like this unless using cuda and not enough free GPU memory
     seq_groups = [all_clusters]
@@ -2615,7 +2624,7 @@ def reassign_spikes_to_clusters(all_clusters, model, params):
         memory_needed = gb_per_sequence_per_elec * len(all_clusters) * num_elecs
         if memory_needed > free_memory:
             if verbose:
-                print(
+                _logger.info(
                     f"To handle all {len(all_clusters)} sequences at once, the GPU needs approximately {memory_needed:.1f}GB, but only {free_memory:.1f}GB is free.\nSeparating sequences into groups ..."
                 )
 
@@ -2668,16 +2677,16 @@ def reassign_spikes_to_clusters(all_clusters, model, params):
             seq_groups = new_seq_groups
 
             if verbose:
-                print(
+                _logger.info(
                     f"Created {len(seq_groups)} groups of sizes: {[len(group) for group in seq_groups]}"
                 )
 
     for group_idx, seqs in enumerate(seq_groups):
         if verbose:
             if len(seq_groups) > 1:
-                print(f"Initializing group {group_idx} ...")
+                _logger.info(f"Initializing group {group_idx} ...")
             else:
-                print("Initializing ...")
+                _logger.info("Initializing ...")
         rt_sort = RTSort(seqs, model, params, device=device)
         all_detections = rt_sort.sort_offline(
             model_inter_path / "model_traces.npy",
@@ -2725,7 +2734,7 @@ def setup_coc_clusters_parallel(coc_clusters, params):
     verbose = params["verbose"]
 
     if verbose:
-        print("Extracting sequences' detections, intervals, and amplitudes")
+        _logger.info("Extracting sequences' detections, intervals, and amplitudes")
 
     new_coc_clusters = []
     tasks = [(cluster, params) for cluster in coc_clusters]
@@ -2737,7 +2746,7 @@ def setup_coc_clusters_parallel(coc_clusters, params):
             if cluster is not None:
                 new_coc_clusters.append(cluster)
     if verbose:
-        print(f"{len(new_coc_clusters)} clusters remain after filtering")
+        _logger.info(f"{len(new_coc_clusters)} clusters remain after filtering")
     return new_coc_clusters
 
 
@@ -3270,18 +3279,18 @@ def merge_verbose(merge, update_history=True):
             cluster_i.merge_history += cluster_j.merge_history[1:]
     else:
         message += f"{cluster_j.idx}"
-    print(message)
-    print(
+    _logger.info(message)
+    _logger.info(
         f"Latency diff: {merge.latency_diff:.2f}. Amp median diff: {merge.amp_median_diff:.2f}"
     )
-    print(f"Amp dist p-value {merge.dip_p:.4f}")
+    _logger.info(f"Amp dist p-value {merge.dip_p:.4f}")
 
-    print(f"#spikes:")
+    _logger.info(f"#spikes:")
     num_overlaps = Comparison.count_matching_events(
         cluster_i.spike_train, cluster_j.spike_train, delta=OVERLAP_TIME
     )
     # num_overlaps = len(set(cluster_i.spike_train).intersection(cluster_j.spike_train))
-    print(
+    _logger.info(
         f"Merge base: {len(cluster_i.spike_train)}, Add: {len(cluster_j.spike_train)}, Overlaps: {num_overlaps}"
     )
 
@@ -3521,25 +3530,25 @@ def merge_coc_clusters(coc_clusters, params):
 
         dead_clusters.add(best_merge.merge(params))
         if verbose:
-            print(f"After merging: {len(best_merge.cluster_i.spike_train)}")
+            _logger.info(f"After merging: {len(best_merge.cluster_i.spike_train)}")
 
     merged_clusters = [
         cluster for cluster in coc_clusters if cluster not in dead_clusters
     ]
 
     if verbose:
-        print(f"\nFormed {len(merged_clusters)} merged clusters:")
+        _logger.info(f"\nFormed {len(merged_clusters)} merged clusters:")
         for m, cluster in enumerate(merged_clusters):
             # message = f"cluster {m}: {cluster.idx}"
             # if hasattr(cluster, "merge_history"):
             #     message += f",{cluster.merge_history}"
-            # print(message)
+            # _logger.info(message)
 
             # Without +[]
             if hasattr(cluster, "merge_history"):
-                print(f"cluster {m}: {cluster.merge_history}")
+                _logger.info(f"cluster {m}: {cluster.merge_history}")
             else:
-                print(f"cluster {m}: {cluster.idx}")
+                _logger.info(f"cluster {m}: {cluster.idx}")
         # print(f"Formed {len(merged_clusters)} merged clusters")  # Reprint this because jupyter notebook cuts of middle of long outputs
     return merged_clusters
 
@@ -3562,7 +3571,7 @@ def intra_merge(all_clusters, params):
     verbose = params["verbose"]
 
     if verbose:
-        print("Merging preliminary propagation sequences - first round")
+        _logger.info("Merging preliminary propagation sequences - first round")
 
     root_elec_to_clusters = {}
     for cluster in all_clusters:
@@ -3581,7 +3590,7 @@ def intra_merge(all_clusters, params):
             intra_merged_clusters.extend(clusters)
 
     if verbose:
-        print(f"{len(intra_merged_clusters)} sequences after first merging")
+        _logger.info(f"{len(intra_merged_clusters)} sequences after first merging")
 
     return intra_merged_clusters
 
@@ -3593,7 +3602,7 @@ def inter_merge(intra_merged_clusters, params):
     min_spikes = params["min_seq_spikes"]
     verbose = params["verbose"]
     if verbose:
-        print("Merging preliminary propagation sequences - second round ...")
+        _logger.info("Merging preliminary propagation sequences - second round ...")
 
     merged_sequences = merge_coc_clusters(intra_merged_clusters, params)
     merged_sequences = [
@@ -3609,7 +3618,7 @@ def inter_merge(intra_merged_clusters, params):
         seq.formation_spike_train = seq.spike_train
 
     if verbose:
-        print(f"\nRT-Sort detected {len(merged_sequences)} sequences")
+        _logger.info(f"\nRT-Sort detected {len(merged_sequences)} sequences")
     return merged_sequences
 
 

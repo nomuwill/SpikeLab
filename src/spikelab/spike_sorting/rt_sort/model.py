@@ -28,10 +28,13 @@ Changes from the braindance upstream version:
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 try:
     import torch
@@ -422,7 +425,7 @@ class ModelSpikeSorter(_ModelBase):
 
         # Get performance before any training
         train_log = f"\nBefore Training"
-        print(train_log)
+        _logger.info(train_log)
         train_perf_all = [self.perf(dataloader_train)]
         train_report_preface = "     Train" if dataloader_val is not None else None
         train_log += "\n" + self.perf_report(train_report_preface, train_perf_all[0])
@@ -444,7 +447,7 @@ class ModelSpikeSorter(_ModelBase):
         # Start training
         for epoch in range(1, num_epochs + 1):
             epoch_formatted = f"\nEpoch: {epoch}/{num_epochs}"
-            print(epoch_formatted)
+            _logger.info(epoch_formatted)
             train_log += "\n" + epoch_formatted
 
             time_start = time.time()
@@ -454,7 +457,7 @@ class ModelSpikeSorter(_ModelBase):
             train_log += "\n" + self.perf_report(train_report_preface, train_perf)
             train_perf_all.append(train_perf)
             if np.isnan(train_perf[0]):
-                print("Loss is nan, ending training")
+                _logger.info("Loss is nan, ending training")
                 return np.nan
 
             if dataloader_val is not None:
@@ -471,7 +474,7 @@ class ModelSpikeSorter(_ModelBase):
                 start = "Validation loss" if dataloader_val is not None else "Loss"
                 msg = f"{start} hasn't decreased in {lr_patience} epochs. Decreasing learning from {last_lr:.2e} to {new_lr:.2e}"
                 train_log += "\n" + msg
-                print(msg)
+                _logger.info(msg)
                 last_lr = new_lr
 
             if best_loss - cur_loss >= training_thresh:
@@ -485,24 +488,26 @@ class ModelSpikeSorter(_ModelBase):
             time_end = time.time()
             duration = time_end - time_start
             duration_formatted = f"Time: {duration:.2f}s"
-            print(duration_formatted)
+            _logger.info(duration_formatted)
             train_log += "\n" + duration_formatted
 
             if tune_thresh_every is not None and epoch % tune_thresh_every == 0:
                 train_log += "\n" + f"\nTuning detection threshold ..."
-                print(f"\nTuning detection threshold ...")
+                _logger.info(f"\nTuning detection threshold ...")
                 thresh = self.get_loc_prob_thresh()
                 self.tune_loc_prob_thresh(dataloader_train, verbose=False)
                 train_log += (
                     f"Threshold: {thresh:.1f}% --> {self.get_loc_prob_thresh():.1f}%"
                 )
-                print(f"Threshold: {thresh:.1f}% --> {self.get_loc_prob_thresh():.1f}%")
+                _logger.info(
+                    f"Threshold: {thresh:.1f}% --> {self.get_loc_prob_thresh():.1f}%"
+                )
 
             if epoch_patience is not None and epoch_patience_counter == epoch_patience:
                 loss_type = "validation" if dataloader_val is not None else "training"
                 ending = f"\nEnding training early because {loss_type} loss has not increased in {epoch_patience} epochs"
                 train_log += "\n" + ending
-                print(ending)
+                _logger.info(ending)
                 break
 
         self.logs["train.log"] = train_log
@@ -512,18 +517,18 @@ class ModelSpikeSorter(_ModelBase):
 
         if save_best:
             train_log += "\n\nLoading best weights ..."
-            print("\nLoading best weights ...")
+            _logger.info("\nLoading best weights ...")
             self.load_state_dict(best_weights)
 
         train_log += "\n\n" + f"Tuning detection threshold ..."
-        print(f"\nTuning detection threshold ...")
+        _logger.info(f"\nTuning detection threshold ...")
         thresh = self.get_loc_prob_thresh()
         threshes, thresh_perfs = self.tune_loc_prob_thresh(
             dataloader_train, stop=100, verbose=False
         )
         best_thresh = self.get_loc_prob_thresh()
         train_log += f"Threshold: {thresh:.1f}% --> {best_thresh:.1f}%"
-        print(f"Threshold: {thresh:.1f}% --> {best_thresh:.1f}%")
+        _logger.info(f"Threshold: {thresh:.1f}% --> {best_thresh:.1f}%")
 
         train_end = time.time()
 
@@ -538,7 +543,7 @@ class ModelSpikeSorter(_ModelBase):
         loose_thresh = loose_threshes[closest_thresh_idx]
 
         train_log += "\n\nFinal performance:"
-        print("\nFinal performance:")
+        _logger.info("\nFinal performance:")
         dataloader_final = (
             dataloader_val if dataloader_val is not None else dataloader_train
         )
@@ -561,7 +566,7 @@ class ModelSpikeSorter(_ModelBase):
 
         msg = f"Recommended detection thresholds: stringent={best_thresh:.1f}%, loose={loose_thresh:.1f}%"
         train_log += "\n" + msg
-        print(msg)
+        _logger.info(msg)
 
         train_log += "\n\n" + f"Time: {train_end-train_start:.1f}s"
 
@@ -1118,7 +1123,7 @@ class ModelSpikeSorter(_ModelBase):
                     f.write(contents)
 
         if verbose:
-            print(f"Saved trained model at {folder_model}")
+            _logger.info(f"Saved trained model at {folder_model}")
 
         return name
 
@@ -1172,14 +1177,14 @@ class ModelSpikeSorter(_ModelBase):
             f1_score = perf[4]
             if verbose:
                 self.perf_report(f"Prob Thresh: {thresh:.1f}%", perf)
-                print(f"F1 Score: {f1_score:.1f}%\n")
+                _logger.info(f"F1 Score: {f1_score:.1f}%\n")
             if f1_score > best_score:
                 best_score = f1_score
                 best_thresh = thresh
             perfs.append(perf[2:5])
 
         if verbose:
-            print(f"Best thresh: {best_thresh:.1f}%")
+            _logger.info(f"Best thresh: {best_thresh:.1f}%")
         self.set_loc_prob_thresh(best_thresh)
         return threshes, np.array(perfs)
 
@@ -1249,7 +1254,7 @@ class ModelSpikeSorter(_ModelBase):
             ],
         )
         if not TENSORRT:
-            print(
+            _logger.info(
                 "torch_tensorrt is not installed — skipping TensorRT compilation.\n"
                 "The model will still work with standard PyTorch (slower inference).\n"
                 "TensorRT is optional and only supported on Linux. "
@@ -1335,7 +1340,7 @@ class ModelSpikeSorter(_ModelBase):
         if remove_start:
             report = report[2:]
 
-        print(report)
+        _logger.info(report)
         return report
 
     @staticmethod
@@ -1655,8 +1660,8 @@ def main():
     # from torchsummary import summary
     # summary(model, (NUM_CHANNELS_IN, SAMPLE_SIZE))
 
-    print(*inputs.shape)
-    print(*model(inputs).shape)
+    _logger.info(" ".join(str(s) for s in inputs.shape))
+    _logger.info(" ".join(str(s) for s in model(inputs).shape))
 
 
 if __name__ == "__main__":

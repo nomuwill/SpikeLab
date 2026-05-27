@@ -5,6 +5,7 @@ Mirrors the structure of ``ks2_runner.py`` for symmetry — backends
 should delegate sorting to a dedicated runner module.
 """
 
+import logging
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -15,6 +16,8 @@ from .config import SortingPipelineConfig
 from .docker_utils import get_docker_image, patched_container_client
 from .sorting_extractor import KilosortSortingExtractor
 from .sorting_utils import Stopwatch, Tee, print_stage
+
+_logger = logging.getLogger(__name__)
 
 
 def spike_sort(
@@ -87,7 +90,7 @@ def spike_sort(
             and output_folder_path.exists()
             and (output_folder_path / "spike_times.npy").exists()
         ):
-            print("Loading existing Kilosort4 results")
+            _logger.info("Loading existing Kilosort4 results")
             sorting = KilosortSortingExtractor(
                 folder_path=output_folder_path,
                 keep_good_only=bool(
@@ -137,7 +140,7 @@ def spike_sort(
             classified = classify_ks4_failure(Path(output_folder), e)
             if classified is not None:
                 raise classified from e
-            print(f"Kilosort4 sorting failed: {e}")
+            _logger.info(f"Kilosort4 sorting failed: {e}")
             stopwatch.log_time("Sorting failed.")
             return e
 

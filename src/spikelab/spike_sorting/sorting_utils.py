@@ -5,6 +5,7 @@ in this separate module to avoid circular imports.
 """
 
 import datetime
+import logging
 import os
 import shutil
 import sys
@@ -14,6 +15,72 @@ from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+# Tier L-F4: spike_sorting/ historically mixed ``print(...)`` (captured
+# by ``Tee`` via ``sys.stdout``) and ``_logger.warning(...)`` (default
+# ``StreamHandler`` writes to ``sys.stderr``). Watchdog warnings via
+# the logger never made it into the Tee log file. Standardising on
+# logger style requires the loggers to follow whatever ``sys.stdout``
+# currently is — the Tee swap, in particular. ``logging.StreamHandler``
+# captures the stream at handler-init time, so a plain
+# ``StreamHandler(sys.stdout)`` installed at import time would keep
+# writing to the *original* stdout even after Tee swaps it.
+#
+# ``_StdoutFollowingHandler`` resolves ``sys.stdout`` on each emit so
+# the handler tracks the active Tee writer transparently.
+
+
+class _StdoutFollowingHandler(logging.Handler):
+    """Logging handler that writes to whichever ``sys.stdout`` is current.
+
+    Unlike ``logging.StreamHandler`` (which captures its target
+    stream at handler-init), this resolves ``sys.stdout`` on every
+    emit so the Tee context manager's stdout-swap is followed
+    automatically.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+        try:
+            msg = self.format(record)
+            stream = sys.stdout
+            stream.write(msg + "\n")
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        except Exception:
+            self.handleError(record)
+
+
+def _configure_spike_sorting_logger() -> None:
+    """Wire the stdout-following handler onto ``spikelab.spike_sorting``.
+
+    Idempotent: a second call from another module-load path is a
+    no-op. Sets the logger level to INFO so ``_logger.info(...)``
+    calls reach the handler. Propagation is left at its default
+    (``True``) so test harnesses like pytest's ``caplog`` — which
+    attach their handler to the root logger — can still observe
+    records from ``spikelab.spike_sorting.*`` modules. Host
+    applications that configure their own root handlers will see
+    SpikeLab output in their own logs in addition to the Tee
+    capture; that's the standard library convention for libraries.
+    """
+    logger = logging.getLogger("spikelab.spike_sorting")
+    if any(isinstance(h, _StdoutFollowingHandler) for h in logger.handlers):
+        return
+    handler = _StdoutFollowingHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+_configure_spike_sorting_logger()
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _check_unit_id_density(
@@ -127,10 +194,10 @@ def print_stage(text: Any) -> None:
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     indent = int((BANNER_WIDTH - len(text)) / 2)
 
-    print("\n" + BANNER_WIDTH * BANNER_CHAR)
-    print(indent * " " + text)
-    print(f"  [{timestamp}]".center(BANNER_WIDTH))
-    print(BANNER_WIDTH * BANNER_CHAR)
+    _logger.info("\n" + BANNER_WIDTH * BANNER_CHAR)
+    _logger.info(indent * " " + text)
+    _logger.info(f"  [{timestamp}]".center(BANNER_WIDTH))
+    _logger.info(BANNER_WIDTH * BANNER_CHAR)
 
 
 class Stopwatch:
@@ -150,15 +217,15 @@ class Stopwatch:
             if use_print_stage:
                 print_stage(start_msg)
             else:
-                print(start_msg)
+                _logger.info(start_msg)
 
         self._time_start = time.time()
 
     def log_time(self, text: Optional[str] = None) -> None:
         if text is None:
-            print(f"Time: {time.time() - self._time_start:.2f}s")
+            _logger.info(f"Time: {time.time() - self._time_start:.2f}s")
         else:
-            print(f"{text} Time: {time.time() - self._time_start:.2f}s")
+            _logger.info(f"{text} Time: {time.time() - self._time_start:.2f}s")
 
 
 class _TeeWriter:
@@ -262,9 +329,9 @@ class Tee:
             # behaviour was to restore ``_file.write`` to the unwrapped
             # ``file_write`` so traceback lines went to the file only.
             self._writer.mirror_to_stdout = False
-            print("Traceback (most recent call last):")
+            _logger.info("Traceback (most recent call last):")
             traceback.print_tb(exc_tb, file=self._writer)
-            print(f"{exc_type.__name__}: {exc_val}")
+            _logger.info(f"{exc_type.__name__}: {exc_val}")
         sys.stdout = self._writer.stdout  # original stdout captured at __init__
         self._writer.close()
 
@@ -279,7 +346,7 @@ def create_folder(folder: Union[str, Path], parents: bool = True) -> None:
     folder = Path(folder)
     if not folder.exists():
         folder.mkdir(parents=parents)
-        print(f"Created folder: {folder}")
+        _logger.info(f"Created folder: {folder}")
 
 
 def delete_folder(folder: Union[str, Path]) -> None:
@@ -292,10 +359,10 @@ def delete_folder(folder: Union[str, Path]) -> None:
     if folder.exists():
         if folder.is_dir():
             shutil.rmtree(folder)
-            print(f"Deleted folder: {folder}")
+            _logger.info(f"Deleted folder: {folder}")
         else:
             folder.unlink()
-            print(f"Deleted file: {folder}")
+            _logger.info(f"Deleted file: {folder}")
 
 
 def get_paths(
@@ -335,9 +402,9 @@ def get_paths(
             curation_second_folder, results_path)`` as ``Path`` objects.
     """
     print_stage("PROCESSING RECORDING")
-    print(f"Recording path: {rec_path}")
-    print(f"Intermediate results path: {inter_path}")
-    print(f"Compiled results path: {results_path}")
+    _logger.info(f"Recording path: {rec_path}")
+    _logger.info(f"Intermediate results path: {inter_path}")
+    _logger.info(f"Compiled results path: {results_path}")
 
     rec_path = Path(rec_path)
     # Path.stem strips only the final suffix, preserving interior dots —

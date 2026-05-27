@@ -959,9 +959,7 @@ class TestShellScriptDaemonThreadDrain:
         from spikelab.spike_sorting.ks2_runner import ShellScript
 
         # Use the current Python interpreter so the test is hermetic.
-        script = (
-            f'"{_sys.executable}" -c "import time; time.sleep(2); print(\'done\')"'
-        )
+        script = f'"{_sys.executable}" -c "import time; time.sleep(2); print(\'done\')"'
         ss = ShellScript(script, log_path=str(tmp_path / "log"))
 
         t0 = time.monotonic()
@@ -991,9 +989,7 @@ class TestShellScriptDaemonThreadDrain:
         log_dir = tmp_path / "log_dir"
         log_dir.mkdir()
         log_base = log_dir / "ss"
-        script = (
-            f'"{_sys.executable}" -c "print(\'hello-from-subprocess\')"'
-        )
+        script = f'"{_sys.executable}" -c "print(\'hello-from-subprocess\')"'
         ss = ShellScript(script, log_path=str(log_base))
         ss.start()
         ss.wait()
@@ -2814,9 +2810,7 @@ class TestResolveInactivityTimeoutS:
         assert result is None
         info_records = [r for r in caplog.records if r.levelno == logging.INFO]
         assert info_records, "expected an INFO log record"
-        assert any(
-            "watchdog disabled" in r.getMessage() for r in info_records
-        )
+        assert any("watchdog disabled" in r.getMessage() for r in info_records)
 
     def test_respects_disabled_flag(self):
         """
@@ -6908,6 +6902,65 @@ class TestTee:
             mock_stdout.write.assert_not_called()
         assert "x" in log_file.read_text(encoding="utf-8")
 
+    def test_logger_calls_reach_tee_log_file(self, tmp_path):
+        """
+        Tier L-F4: ``_logger.info`` / ``_logger.warning`` calls from
+        any ``spikelab.spike_sorting.*`` module must reach the Tee
+        log file. The ``_StdoutFollowingHandler`` installed by
+        ``_configure_spike_sorting_logger`` resolves ``sys.stdout``
+        on every emit so that the Tee's stdout swap also captures
+        logger output — closing the historical gap where watchdog
+        ``_logger.warning`` messages bypassed the Tee log.
+
+        Tests:
+            (Test Case 1) An ``_logger.info`` call from inside the
+                Tee context appears in the log file.
+            (Test Case 2) An ``_logger.warning`` call appears in the
+                log file (this is the case the reviewer flagged).
+        """
+        import logging
+
+        from spikelab.spike_sorting.sorting_utils import Tee
+
+        log_file = tmp_path / "logger_to_tee.log"
+        child_logger = logging.getLogger("spikelab.spike_sorting._lf4_test")
+        with Tee(log_file, "w"):
+            child_logger.info("hello from logger.info")
+            child_logger.warning("hello from logger.warning")
+
+        log_text = log_file.read_text(encoding="utf-8")
+        assert "hello from logger.info" in log_text
+        assert "hello from logger.warning" in log_text
+
+    def test_print_and_logger_both_reach_tee_log(self, tmp_path):
+        """
+        Tier L-F4: prints and logger calls coexist inside a Tee
+        context and both write to the underlying log file. Pins the
+        property that the L-F4 sweep preserves: switching from
+        ``print(...)`` to ``_logger.info(...)`` does not lose
+        output when Tee is active.
+
+        Tests:
+            (Test Case 1) A direct ``print()`` call lands in the log.
+            (Test Case 2) A ``_logger.info()`` call also lands in the
+                log, interleaved with the prints.
+        """
+        import logging
+
+        from spikelab.spike_sorting.sorting_utils import Tee
+
+        log_file = tmp_path / "interleaved.log"
+        child_logger = logging.getLogger("spikelab.spike_sorting._lf4_mix")
+        with Tee(log_file, "w"):
+            print("via print")
+            child_logger.info("via logger")
+            print("via print again")
+
+        log_text = log_file.read_text(encoding="utf-8")
+        assert "via print" in log_text
+        assert "via logger" in log_text
+        assert "via print again" in log_text
+
 
 # ===========================================================================
 # Edge Case Tests -- Utils._mem_to_int
@@ -7236,9 +7289,7 @@ class TestGetNoiseLevels:
             captured["called_with"] = seed
             return original_default_rng(seed)
 
-        monkeypatch.setattr(
-            pipeline_mod.np.random, "default_rng", tracking_default_rng
-        )
+        monkeypatch.setattr(pipeline_mod.np.random, "default_rng", tracking_default_rng)
         recording = _make_mock_recording(num_samples=200_000, num_channels=2)
         pipeline_mod._get_noise_levels(recording, seed=7)
         assert captured["called_with"] == 7
@@ -7487,9 +7538,7 @@ class TestCurateSpikedataCache:
             captured["called_with"] = seed
             return original_default_rng(seed)
 
-        monkeypatch.setattr(
-            pipeline_mod.np.random, "default_rng", tracking_default_rng
-        )
+        monkeypatch.setattr(pipeline_mod.np.random, "default_rng", tracking_default_rng)
         recording = _make_mock_recording(num_samples=200_000, num_channels=2)
         pipeline_mod._get_noise_levels(recording, seed=7)
         assert captured["called_with"] == 7
@@ -9460,9 +9509,7 @@ class TestKilosortSortingExtractorQuoteSafeGroupFilter:
 
     @pytest.mark.skipif(not _has_pandas, reason="pandas not installed")
     @skip_no_spikeinterface
-    def test_single_quote_in_group_name_excluded_without_parser_error(
-        self, tmp_path
-    ):
+    def test_single_quote_in_group_name_excluded_without_parser_error(self, tmp_path):
         """
         Tests:
             (Test Case 1) ``exclude_cluster_groups="foo's"`` removes
@@ -9474,9 +9521,7 @@ class TestKilosortSortingExtractorQuoteSafeGroupFilter:
             KilosortSortingExtractor,
         )
 
-        path = self._make_phy_dir_with_quoted_group(
-            tmp_path, ["foo's", "good", "good"]
-        )
+        path = self._make_phy_dir_with_quoted_group(tmp_path, ["foo's", "good", "good"])
         ext = KilosortSortingExtractor(
             folder_path=str(path),
             exclude_cluster_groups="foo's",
@@ -13191,9 +13236,7 @@ class TestCompilerSaveResultsPerRecordingLayout:
                 ``compile_to_mat=False``, no ``.npz`` / ``.mat`` files
                 are written regardless of recording count.
         """
-        compiler = self._new_compiler(
-            compile_to_mat=False, compile_to_npz=False
-        )
+        compiler = self._new_compiler(compile_to_mat=False, compile_to_npz=False)
         sd = _make_sd_with_unit_ids([1, 2])
         compiler.add_recording("rec_a", sd, curation_history=None)
 

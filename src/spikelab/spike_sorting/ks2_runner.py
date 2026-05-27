@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import logging
 import os
 import shutil
 import signal
@@ -17,6 +18,8 @@ from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spikeinterface.core import BaseRecording
@@ -442,9 +445,9 @@ end"""
 
         if verbose:
             if has_error:
-                print("Error running kilosort2")
+                _logger.info("Error running kilosort2")
             else:
-                print(f"kilosort2 run time: {run_time:0.2f}s")
+                _logger.info(f"kilosort2 run time: {run_time:0.2f}s")
 
         if has_error and raise_error:
             classified = classify_ks2_failure(
@@ -465,7 +468,7 @@ end"""
         *,
         inactivity_timeout_s: Optional[float] = None,
     ):
-        print("Running kilosort file")
+        _logger.info("Running kilosort file")
 
         if "win" in sys.platform and sys.platform != "darwin":
             shell_cmd = f"""cd "{output_folder}"
@@ -542,13 +545,12 @@ end"""
         path = str(Path(kilosort_path).absolute())
 
         try:
-            print(
-                "Setting KILOSORT_PATH environment variable for subprocess calls to:",
-                path,
+            _logger.info(
+                f"Setting KILOSORT_PATH environment variable for subprocess calls to: {path}"
             )
             os.environ["KILOSORT_PATH"] = path
         except Exception as e:
-            print("Could not set KILOSORT_PATH environment variable:", e)
+            _logger.info(f"Could not set KILOSORT_PATH environment variable: {e}")
 
         return path
 
@@ -634,7 +636,7 @@ class ShellScript:
                 if len(line.strip()) > 0:
                     n = self._get_num_initial_spaces(line)
                     if n < num_initial_spaces:
-                        print(script)
+                        _logger.info(script)
                         raise Exception(
                             "Problem in script. First line must not be indented relative to others"
                         )
@@ -692,7 +694,7 @@ class ShellScript:
 
         self.write(script_path)
         cmd = str(script_path)
-        print("RUNNING SHELL SCRIPT: " + cmd)
+        _logger.info("RUNNING SHELL SCRIPT: " + cmd)
         self._start_time = time.time()
         self._process = subprocess.Popen(
             cmd,
@@ -737,13 +739,18 @@ class ShellScript:
                     log_file.write(line)
                     if verbose:
                         # ``line`` already ends in '\n' (line-buffered
-                        # subprocess); suppress print's trailing newline.
-                        print(line, end="")
+                        # subprocess); ``_logger.info`` adds its own
+                        # newline via the StdoutFollowingHandler, so
+                        # strip the trailing newline before emit.
+                        _logger.info(line.rstrip("\n"))
         except Exception as exc:
             # Drain-thread failures must not crash the main process.
-            # Log to ``sys.__stderr__`` (survives interpreter shutdown
-            # in case the process is tearing down) and exit cleanly;
-            # the subprocess and ``wait()`` are unaffected.
+            # Print directly to ``sys.__stderr__`` (which survives
+            # interpreter shutdown in case the process is tearing
+            # down) and exit cleanly; the subprocess and ``wait()``
+            # are unaffected. The logger would also work here but it
+            # routes through ``sys.stdout`` which may have been
+            # swapped or closed during shutdown.
             try:
                 print(
                     f"[ShellScript._drain_stdout] drain failed: {exc!r}",
@@ -820,7 +827,7 @@ class ShellScript:
         try:
             self._process.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            print("WARNING: unable to kill shell script.")
+            _logger.warning("unable to kill shell script.")
 
     def stopWithSignal(self, sig, timeout) -> bool:
         if not self.isRunning():
@@ -892,7 +899,7 @@ class ShellScript:
                 break
             except OSError:
                 if retry_num < num_retries:
-                    print("Retrying to remove directory: {}".format(dirname))
+                    _logger.info("Retrying to remove directory: {}".format(dirname))
                     time.sleep(delay_between_tries)
                 else:
                     raise Exception(
@@ -968,12 +975,12 @@ def write_recording(
             "n_jobs": 1,
             "total_memory": "100G",
         }
-        print("Converting entire recording at once with 1 job")
+        _logger.info("Converting entire recording at once with 1 job")
 
-    print(f"Kilosort2's .dat path: {recording_dat_path}")
+    _logger.info(f"Kilosort2's .dat path: {recording_dat_path}")
     if not recording_dat_path.exists():
         # dtype has to be 'int16' (that's what Kilosort2 expects--but can change in config)
-        print("Converting raw Maxwell recording to .dat format for Kilosort2")
+        _logger.info("Converting raw Maxwell recording to .dat format for Kilosort2")
         BinaryRecordingExtractor.write_recording(
             recording_filtered,
             file_paths=recording_dat_path,
@@ -981,7 +988,7 @@ def write_recording(
             **job_kwargs,
         )
     else:
-        print(f"Using existing .dat as recording file for Kilosort2")
+        _logger.info(f"Using existing .dat as recording file for Kilosort2")
 
     stopwatch.log_time("Done converting recording.")
 
@@ -1051,10 +1058,10 @@ def _spike_sort_docker(
     dat_dir.mkdir(exist_ok=True, parents=True)
     dat_path = dat_dir / "recording.dat"
     if not dat_path.exists():
-        print("Writing binary recording for Docker container...")
+        _logger.info("Writing binary recording for Docker container...")
         write_binary_recording(recording, file_paths=[str(dat_path)], dtype="int16")
     else:
-        print(f"Reusing existing binary recording at {dat_path}")
+        _logger.info(f"Reusing existing binary recording at {dat_path}")
 
     bin_recording = BinaryRecordingExtractor(
         file_paths=[str(dat_path)],
@@ -1067,7 +1074,7 @@ def _spike_sort_docker(
     # Map kilosort_params to SpikeInterface's run_sorter kwargs.
     si_params = {k: v for k, v in kilosort_params.items()}
 
-    print("Running Kilosort2 via Docker container")
+    _logger.info("Running Kilosort2 via Docker container")
 
     # Inject MW_CUDA_FORWARD_COMPATIBILITY=1 into the Docker container so
     # that the compiled MATLAB Runtime supports newer GPU architectures
@@ -1101,7 +1108,7 @@ def _spike_sort_docker(
     # Keep the pre-converted binary for potential reuse (recompute_recording=False).
     # It will be cleaned up with the rest of the intermediates if delete_inter=True.
     if dat_path.exists():
-        print(
+        _logger.info(
             f"Keeping pre-converted binary for reuse ({dat_path.stat().st_size / 1e9:.1f} GB)"
         )
 
@@ -1180,7 +1187,7 @@ def spike_sort(
 
     try:
         if not recompute_sorting and (output_folder / "spike_times.npy").exists():
-            print("Loading Kilosort2's sorting results")
+            _logger.info("Loading Kilosort2's sorting results")
             sorting = KilosortSortingExtractor(
                 folder_path=output_folder,
                 keep_good_only=bool(
@@ -1214,7 +1221,7 @@ def spike_sort(
                     use_parallel=use_parallel,
                 )
             except Exception as e:
-                print(
+                _logger.info(
                     f"Could not convert recording because of {e}.\nMoving on to next recording"
                 )
                 return e
@@ -1233,10 +1240,10 @@ def spike_sort(
         # without inspecting a returned sentinel.
         raise
     except Exception as e:
-        print(f"Kilosort2 failed on recording {rec_path}\n{e}")
-        print("Moving on to next recording")
+        _logger.info(f"Kilosort2 failed on recording {rec_path}\n{e}")
+        _logger.info("Moving on to next recording")
         return e
 
     stopwatch.log_time("Done sorting.")
-    print(f"Kilosort detected {len(sorting.unit_ids)} units")
+    _logger.info(f"Kilosort detected {len(sorting.unit_ids)} units")
     return sorting

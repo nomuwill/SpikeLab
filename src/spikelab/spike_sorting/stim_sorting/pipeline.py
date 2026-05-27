@@ -31,9 +31,12 @@ protocols) are grouped into a single chunk so sort_offline sees them
 together.
 """
 
+import logging
 from pathlib import Path
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 # Extra margin beyond the peri-event + recentering + artifact-removal
 # window.  Gives RT-Sort's detection model a few ms to warm up before
@@ -199,7 +202,9 @@ def sort_stim_recording(
     # Path or BaseRecording → chunked path.
     if isinstance(stim_recording, (str, Path)):
         if verbose:
-            print(f"Opening recording {stim_recording} (lazy, for chunked reads)...")
+            _logger.info(
+                f"Opening recording {stim_recording} (lazy, for chunked reads)..."
+            )
         from ..recording_io import load_single_recording
 
         rec = load_single_recording(stim_recording)
@@ -295,7 +300,7 @@ def _sort_stim_chunked(
     )
     n_dropped = int(np.sum(~valid_mask))
     if n_dropped > 0 and verbose:
-        print(
+        _logger.info(
             f"  Dropping {n_dropped} event(s) whose peri-event window would "
             f"extend outside the recording / recording_window_ms bounds"
         )
@@ -307,7 +312,7 @@ def _sort_stim_chunked(
     # Group adjacent events into chunks.
     groups = _group_stim_events_into_chunks(kept_times_ms, chunk_pre_ms, chunk_post_ms)
     if verbose:
-        print(
+        _logger.info(
             f"Chunking {len(kept_times_ms)} stim events into {len(groups)} "
             f"time chunk(s)  (chunk window ≈ "
             f"{chunk_pre_ms + chunk_post_ms:.0f} ms per event)"
@@ -331,7 +336,7 @@ def _sort_stim_chunked(
         chunk_len_ms = (end_frame - start_frame) * 1000.0 / fs_Hz
 
         if verbose:
-            print(
+            _logger.info(
                 f"  chunk {chunk_idx + 1}/{len(groups)}: "
                 f"{len(group_events_ms)} event(s), "
                 f"{chunk_len_ms:.0f} ms ({end_frame - start_frame} samples)"
@@ -447,7 +452,7 @@ def _sort_stim_chunked(
 
     if verbose:
         n_slices = len(stim_slices.spike_stack)
-        print(
+        _logger.info(
             f"Produced SpikeSliceStack with {n_slices} slices "
             f"(peri-event windows [-{pre_ms}, +{post_ms}] ms)"
         )
@@ -535,7 +540,7 @@ def _sort_stim_full_recording(
     fs_Hz = float(fs_Hz)
 
     if verbose:
-        print("Recentering stim times (full-recording path)...")
+        _logger.info("Recentering stim times (full-recording path)...")
     corrected_stim_ms = recenter_stim_times(
         traces,
         stim_times_ms,
@@ -551,12 +556,12 @@ def _sort_stim_full_recording(
     )
     if verbose:
         offsets = corrected_stim_ms - stim_times_ms
-        print(
+        _logger.info(
             f"  Stim time corrections: "
             f"mean={np.mean(offsets):.2f} ms  "
             f"max={np.max(np.abs(offsets)):.2f} ms"
         )
-        print(f"Removing artifacts (method={artifact_method!r})...")
+        _logger.info(f"Removing artifacts (method={artifact_method!r})...")
 
     cleaned, blanked_mask = remove_stim_artifacts(
         traces,
@@ -573,8 +578,8 @@ def _sort_stim_full_recording(
         raw_traces=None,
     )
     if verbose:
-        print(f"  {100.0 * np.mean(blanked_mask):.1f}% of samples blanked")
-        print("Running RT-Sort offline sorting on cleaned traces...")
+        _logger.info(f"  {100.0 * np.mean(blanked_mask):.1f}% of samples blanked")
+        _logger.info("Running RT-Sort offline sorting on cleaned traces...")
 
     sorting = rt_sort_obj.sort_offline(
         recording=cleaned,
@@ -586,14 +591,16 @@ def _sort_stim_full_recording(
     # associated recording; pass n_samples explicitly.
     sd = _sorting_to_spikedata(sorting, fs_Hz, n_samples=cleaned.shape[1])
     if verbose:
-        print(f"  {sd.N} units, {sum(len(t) for t in sd.train)} total spikes")
-        print(
+        _logger.info(f"  {sd.N} units, {sum(len(t) for t in sd.train)} total spikes")
+        _logger.info(
             f"Aligning to {len(corrected_stim_ms)} stim events "
             f"(window: -{pre_ms} to +{post_ms} ms)..."
         )
     stim_slices = sd.align_to_events(corrected_stim_ms, pre_ms, post_ms, kind="spike")
     if verbose:
-        print(f"  Produced SpikeSliceStack with {len(stim_slices.spike_stack)} slices")
+        _logger.info(
+            f"  Produced SpikeSliceStack with {len(stim_slices.spike_stack)} slices"
+        )
     return stim_slices
 
 
@@ -638,7 +645,7 @@ def _load_rt_sort(rt_sort, model, model_path, verbose):
     """Load or return an RTSort object."""
     if isinstance(rt_sort, (str, Path)):
         if verbose:
-            print(f"Loading RTSort from {rt_sort}...")
+            _logger.info(f"Loading RTSort from {rt_sort}...")
         from ..rt_sort_runner import load_rt_sort as _load
 
         return _load(Path(rt_sort), model=model, model_path=model_path)

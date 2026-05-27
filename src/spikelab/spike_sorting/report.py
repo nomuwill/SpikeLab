@@ -707,7 +707,7 @@ def generate_sorting_report(
         os.replace(tmp, output_path)
         return output_path
     except Exception as exc:
-        print(f"[sorting report] failed to write {output_path}: {exc!r}")
+        _logger.warning(f"[sorting report] failed to write {output_path}: {exc!r}")
         return None
 
 
@@ -825,15 +825,17 @@ def apply_tee_log_policy(log_path: Any, policy: str) -> Optional[Path]:
             p.unlink()
             return target
         except Exception as exc:
-            print(f"[tee log policy] gzip failed for {p}: {exc!r}")
+            _logger.warning(f"[tee log policy] gzip failed for {p}: {exc!r}")
             return p
     if policy == "delete_on_success":
         try:
             p.unlink()
             return None
         except Exception as exc:
-            print(f"[tee log policy] delete failed for {p}: {exc!r}")
+            _logger.warning(f"[tee log policy] delete failed for {p}: {exc!r}")
             return p
     # Unknown policy → keep, with a warning.
-    print(f"[tee log policy] unknown policy {policy!r}; keeping log untouched.")
+    _logger.warning(
+        f"[tee log policy] unknown policy {policy!r}; keeping log untouched."
+    )
     return p

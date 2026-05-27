@@ -4688,6 +4688,60 @@ class TestComputeCrossCorrelationWithLagAllNaN:
         assert np.isnan(score)
         assert lag == 0
 
+    @pytest.mark.parametrize("N", [4, 5, 6, 8, 9, 16, 17])
+    def test_anti_symmetric_lag_under_swap_for_any_N(self, N):
+        """
+        ``compute_cross_correlation_with_lag(a, b)`` returns a lag
+        that is exactly the negation of the lag returned by
+        ``compute_cross_correlation_with_lag(b, a)``. The new
+        ``mode='full'`` + symmetric-slice implementation makes this
+        identity hold for both even and odd ``N``; the previous
+        ``mode='same'`` path failed it for even ``N`` at the
+        boundary because the lag window was ``[-N/2, +N/2 - 1]``.
+
+        Tests:
+            (Test Case 1) For ``N`` in {4, 5, 6, 8, 9, 16, 17}, random
+                ``a, b`` of length ``N`` produce ``lag(a,b) + lag(b,a)
+                == 0``.
+        """
+        from spikelab.spikedata.utils import (
+            compute_cross_correlation_with_lag,
+        )
+
+        rng = np.random.default_rng(N)
+        a = rng.standard_normal(N)
+        b = rng.standard_normal(N)
+        _, lag_ab = compute_cross_correlation_with_lag(a, b, max_lag=N // 2)
+        _, lag_ba = compute_cross_correlation_with_lag(b, a, max_lag=N // 2)
+        assert lag_ab + lag_ba == 0
+
+    def test_extreme_lag_boundary_even_N_now_reachable(self):
+        """
+        With ``N=6``, a delta at sample 0 (``a``) vs a delta at
+        sample 5 (``b``) has a true peak at lag ``-5`` for
+        ``corr(a, b)``. The new ``mode='full'`` path reaches lag
+        ``+N/2`` symmetrically — pre-Tier-L this lag value was
+        unreachable for even N because ``mode='same'`` exposed lags
+        only up to ``+N/2 - 1``.
+
+        Tests:
+            (Test Case 1) ``lag(a, b) == -5``.
+            (Test Case 2) ``lag(b, a) == +5`` (the new symmetric
+                positive boundary).
+        """
+        from spikelab.spikedata.utils import (
+            compute_cross_correlation_with_lag,
+        )
+
+        a = np.zeros(6)
+        a[0] = 1.0
+        b = np.zeros(6)
+        b[5] = 1.0
+        _, lag_ab = compute_cross_correlation_with_lag(a, b, max_lag=5)
+        _, lag_ba = compute_cross_correlation_with_lag(b, a, max_lag=5)
+        assert lag_ab == -5
+        assert lag_ba == 5
+
     def test_both_signals_all_nan_returns_nan_with_lag(self):
         """
         With ``max_lag>0``, the general path normalises by

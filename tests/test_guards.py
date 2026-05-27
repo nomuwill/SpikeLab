@@ -9792,6 +9792,66 @@ class TestCheckDockerSorterDockerPyPath:
         # image-missing finding.
         assert "sorter_dependency_missing" not in codes
 
+    def test_check_image_cached_passes_timeout_5_to_docker_py(self, monkeypatch):
+        """
+        ``_check_image_cached`` passes ``timeout=5`` to
+        ``docker.from_env`` so a half-frozen Docker daemon cannot
+        block preflight indefinitely.
+
+        Tests:
+            (Test Case 1) ``docker.from_env`` is invoked with
+                ``timeout=5`` in its kwargs.
+            (Test Case 2) When the image is found, the function
+                returns True.
+        """
+        from spikelab.spike_sorting.guards._preflight import _check_image_cached
+
+        captured_kwargs: dict = {}
+
+        class _FakeImages:
+            def get(self, _tag):
+                return SimpleNamespace()
+
+        class _FakeClient:
+            images = _FakeImages()
+
+        def fake_from_env(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _FakeClient()
+
+        fake_docker = SimpleNamespace(from_env=fake_from_env)
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        result = _check_image_cached("some:tag")
+        assert result is True
+        assert captured_kwargs.get("timeout") == 5
+
+    def test_check_image_cached_old_docker_py_without_timeout_kwarg(
+        self, monkeypatch
+    ):
+        """
+        Older docker-py versions raise ``TypeError`` when
+        ``from_env(timeout=5)`` is called. The function catches the
+        error and returns False (caller falls through to "pull the
+        image" — the conservative answer).
+
+        Tests:
+            (Test Case 1) ``from_env(timeout=...)`` raising TypeError
+                results in False (no exception propagates).
+        """
+        from spikelab.spike_sorting.guards._preflight import _check_image_cached
+
+        def old_from_env(**kwargs):
+            raise TypeError(
+                "from_env() got an unexpected keyword argument 'timeout'"
+            )
+
+        fake_docker = SimpleNamespace(from_env=old_from_env)
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        result = _check_image_cached("some:tag")
+        assert result is False
+
     def test_docker_py_ping_raises_yields_fail(self, monkeypatch):
         """
         ``docker.from_env().ping()`` raising marks the daemon as

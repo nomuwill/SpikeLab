@@ -252,6 +252,102 @@ def test_job_yaml_quoting_handles_special_characters():
     assert parsed["spec"]["template"]["spec"]["containers"][0]["image"] == "img"
 
 
+class TestSanitizeYamlValueRaisesOnUnsafeChars:
+    """``_sanitize_yaml_value`` raises ``ValueError`` on unsafe
+    characters instead of silently stripping them. The field-path
+    argument is included in the error message so operators can
+    locate the offending entry in the job spec.
+    """
+
+    def test_unsafe_char_raises_with_repr_in_message(self):
+        """
+        Tests:
+            (Test Case 1) Newline in the value raises ValueError.
+            (Test Case 2) The error message includes the substring
+                "YAML-unsafe character" and the offending char's repr.
+            (Test Case 3) A clean value passes through unchanged.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value("hello\nworld")
+
+        assert _sanitize_yaml_value("safe value") == "safe value"
+
+    def test_field_argument_appears_in_error(self):
+        """
+        Tests:
+            (Test Case 1) ``field="container.env.FOO"`` shows up in
+                the raised error so operators can locate the failing
+                entry in their job spec.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        with pytest.raises(ValueError, match="container.env.FOO"):
+            _sanitize_yaml_value("bad\nval", field="container.env.FOO")
+
+    def test_sanitize_map_names_offending_subkey(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_map({"FOO": "x\\ny"},
+                field="container.env")`` raises ValueError naming
+                ``container.env.FOO``.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_map
+
+        with pytest.raises(ValueError, match=r"container\.env\.FOO"):
+            _sanitize_map({"FOO": "x\nY"}, field="container.env")
+
+    def test_sanitize_list_names_offending_index(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_list(["ok", "bad\\nval"],
+                field="container.command")`` raises ValueError naming
+                ``container.command[1]``.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_list
+
+        with pytest.raises(ValueError, match=r"container\.command\[1\]"):
+            _sanitize_list(["ok", "bad\nval"], field="container.command")
+
+    def test_volume_mount_unsafe_name_raises_from_build_template_context(self):
+        """
+        Tests:
+            (Test Case 1) ``build_template_context`` with a
+                VolumeMountSpec whose ``name`` contains a newline
+                raises ValueError naming the volume entry.
+        """
+        payload = _example_payload()
+        payload["namespace"] = "ns"
+        payload["volumes"] = [
+            {
+                "name": "bad\nname",
+                "mount_path": "/x",
+                "secret_name": "test-secret",
+            }
+        ]
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="vol-raise")
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            build_template_context(
+                job_name="job-x", job_spec=job_spec, profile=profile
+            )
+
+    def test_safe_punctuation_passes_through(self):
+        """
+        Tests:
+            (Test Case 1) Characters like ``:``, ``#``, ``{``, ``[``,
+                ``&``, ``*``, ``!``, ``|``, ``>``, ``'``, ``%``,
+                ``@``, ``` ` ``` are safe inside double-quoted YAML
+                scalars and pass through ``_sanitize_yaml_value``
+                unchanged.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        safe = "a:b#c{d}e[f]g&h*i!j|k>l'm%n@o`p"
+        assert _sanitize_yaml_value(safe) == safe
+
+
 def test_namespace_hooks_preserve_user_affinity():
     """Namespace hooks do not override user-specified affinity."""
     payload = _example_payload()
@@ -2027,6 +2123,143 @@ class TestPolicy:
         findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
         codes = {f.code: f.level for f in findings_audit}
         assert codes["request_limit_mismatch"] == "PASS"
+
+    def test_default_suppresses_pass_on_fully_compliant_spec(self):
+        """
+        Tier L-C4: a fully compliant job spec produces NO findings by
+        default, and exactly four PASS findings under
+        ``include_passes=True``.
+
+        Tests:
+            (Test Case 1) Default ``include_passes=False`` returns an
+                empty list when every check passes — eliminating the
+                ~4 PASS-line log noise per compliant submission.
+            (Test Case 2) ``include_passes=True`` returns four PASS
+                findings, one per check
+                (interactive_gpu_limit, sleep_in_batch_job,
+                 request_limit_mismatch, long_runtime).
+        """
+        job_spec = validate_job_spec(_example_payload())
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        assert findings_default == []
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        codes_levels = {f.code: f.level for f in findings_audit}
+        assert codes_levels == {
+            "interactive_gpu_limit": "PASS",
+            "sleep_in_batch_job": "PASS",
+            "request_limit_mismatch": "PASS",
+            "long_runtime": "PASS",
+        }
+
+    def test_warn_emitted_regardless_of_include_passes(self):
+        """
+        Tier L-C4: WARN findings are emitted regardless of
+        ``include_passes``. Only PASS findings are gated by the flag.
+
+        Tests:
+            (Test Case 1) A WARN-triggering interactive_gpu_limit
+                spec emits the WARN finding under
+                ``include_passes=False`` (the default).
+            (Test Case 2) The same WARN finding is also present under
+                ``include_passes=True``, alongside the PASS entries
+                for the other checks.
+        """
+        payload = _example_payload()
+        payload["resources"]["requests_gpu"] = 8
+        payload["resources"]["limits_gpu"] = 8
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        warn_findings = [
+            f for f in findings_default if f.code == "interactive_gpu_limit"
+        ]
+        assert len(warn_findings) == 1
+        assert warn_findings[0].level == "WARN"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        warn_findings_audit = [
+            f for f in findings_audit if f.code == "interactive_gpu_limit"
+        ]
+        assert len(warn_findings_audit) == 1
+        assert warn_findings_audit[0].level == "WARN"
+
+    def test_block_emitted_regardless_of_include_passes(self):
+        """
+        Tier L-C4: BLOCK findings are emitted regardless of
+        ``include_passes`` — the flag only gates PASS entries.
+
+        Tests:
+            (Test Case 1) A BLOCK-triggering sleep_in_batch_job
+                payload emits the BLOCK finding under the default
+                ``include_passes=False``.
+            (Test Case 2) The same BLOCK finding is also present
+                under ``include_passes=True``.
+        """
+        payload = _example_payload()
+        payload["container"]["args"] = ["sleep", "infinity"]
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        block_findings = [
+            f for f in findings_default if f.code == "sleep_in_batch_job"
+        ]
+        assert len(block_findings) == 1
+        assert block_findings[0].level == "BLOCK"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        block_findings_audit = [
+            f for f in findings_audit if f.code == "sleep_in_batch_job"
+        ]
+        assert len(block_findings_audit) == 1
+        assert block_findings_audit[0].level == "BLOCK"
+
+    def test_mixed_compliance_default_returns_only_warn(self):
+        """
+        Tier L-C4: a spec that triggers ONE WARN and passes the
+        other three checks returns exactly one finding by default
+        (the WARN). ``include_passes=True`` returns four findings
+        (1 WARN + 3 PASS).
+
+        Tests:
+            (Test Case 1) Default call returns one finding —
+                the request_limit_mismatch WARN.
+            (Test Case 2) ``include_passes=True`` returns four
+                findings — one WARN plus three PASS entries.
+        """
+        payload = _example_payload()
+        payload["resources"]["requests_cpu"] = "1"
+        payload["resources"]["limits_cpu"] = "4"
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        assert len(findings_default) == 1
+        assert findings_default[0].code == "request_limit_mismatch"
+        assert findings_default[0].level == "WARN"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        assert len(findings_audit) == 4
+        levels = sorted(f.level for f in findings_audit)
+        assert levels == ["PASS", "PASS", "PASS", "WARN"]
+
+    def test_summarize_preflight_compliant_spec_empty_text(self):
+        """
+        Tier L-C4: a fully compliant job spec evaluated under the
+        default ``include_passes=False`` produces an empty findings
+        list. ``summarize_preflight`` on that empty list returns
+        ``("PASS", "")`` — the level stays PASS, the text body is
+        empty (no more ``[PASS] ... [PASS] ...`` noise).
+
+        Tests:
+            (Test Case 1) ``evaluate_policy`` on a compliant spec
+                returns ``[]`` by default.
+            (Test Case 2) ``summarize_preflight([])`` returns
+                ``("PASS", "")`` — the level stays PASS, text empty.
+        """
+        job_spec = validate_job_spec(_example_payload())
+        profile = ClusterProfile(name="test")
+        findings = evaluate_policy(job_spec, profile)
+        assert findings == []
+        level, text = summarize_preflight(findings)
+        assert level == "PASS"
+        assert text == ""
 
 
 # ---------------------------------------------------------------------------
@@ -4208,6 +4441,200 @@ class TestPolicySummarizePreflight:
         ]
         level, _ = summarize_preflight(findings)
         assert level == "PASS"
+
+
+class TestWaitForCompletionRetryBackoff:
+    """``wait_for_completion`` retries transient backend errors with
+    exponential backoff capped at ``max_backoff_seconds``. Persistent
+    failures eventually surface as ``"Backend unavailable"`` after
+    ``max_consecutive_failures`` consecutive raises. A 404 from the
+    K8s client returns ``"Failed"`` immediately (no retry — job
+    deleted out-of-band). A successful poll resets both the failure
+    counter and the backoff to ``poll_interval_seconds``.
+    """
+
+    @staticmethod
+    def _make_session(backend=None):
+        from spikelab.batch_jobs.session import RunSession
+
+        profile = ClusterProfile(name="test")
+        backend = backend or MagicMock(spec=KubernetesBatchJobBackend)
+        storage = MagicMock(spec=S3StorageClient)
+        return (
+            RunSession(
+                profile=profile,
+                backend=backend,
+                storage_client=storage,
+                credentials=MagicMock(),
+            ),
+            backend,
+        )
+
+    def test_immediate_complete_single_poll(self):
+        """
+        Tests:
+            (Test Case 1) ``job_status`` returning "Complete" causes
+                ``wait_for_completion`` to return after exactly one
+                call.
+        """
+        session, backend = self._make_session()
+        backend.job_status.return_value = "Complete"
+        state = session.wait_for_completion(
+            job_name="job-x", max_wait_seconds=10, poll_interval_seconds=1
+        )
+        assert state == "Complete"
+        assert backend.job_status.call_count == 1
+
+    def test_transient_recovery_after_calledprocesserror(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After 3 transient ``CalledProcessError``
+                raises followed by a "Complete" return, the loop
+                surfaces "Complete" with exactly 4 total calls.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = [
+            subprocess.CalledProcessError(1, "kubectl"),
+            subprocess.CalledProcessError(1, "kubectl"),
+            subprocess.CalledProcessError(1, "kubectl"),
+            "Complete",
+        ]
+        # Patch time.sleep to a no-op so the test is fast.
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=60,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Complete"
+        assert backend.job_status.call_count == 4
+
+    def test_persistent_failure_returns_backend_unavailable(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After ``max_consecutive_failures`` raises in
+                a row, the loop returns "Backend unavailable" and
+                ``job_status`` was called exactly
+                ``max_consecutive_failures`` times.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = subprocess.CalledProcessError(
+            1, "kubectl"
+        )
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=600,
+            poll_interval_seconds=1,
+            max_consecutive_failures=3,
+        )
+        assert state == "Backend unavailable"
+        assert backend.job_status.call_count == 3
+
+    def test_apiexception_404_returns_failed_immediately(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) An ``ApiException(status=404)`` from the K8s
+                client returns "Failed" on the first poll (no retry).
+        """
+        try:
+            from kubernetes.client.exceptions import ApiException
+        except ImportError:
+            pytest.skip("kubernetes client not installed")
+
+        session, backend = self._make_session()
+        # Build a 404 ApiException.
+        exc = ApiException(status=404, reason="Not Found")
+        backend.job_status.side_effect = exc
+
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=60,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Failed"
+        assert backend.job_status.call_count == 1
+
+    def test_running_then_timeout(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) ``job_status`` returning "Running"
+                indefinitely yields "Timeout" once
+                ``max_wait_seconds`` elapses.
+        """
+        session, backend = self._make_session()
+        backend.job_status.return_value = "Running"
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        # Use a tiny budget and a counter-based fake time to keep the
+        # test deterministic and fast.
+        time_now = {"t": 0.0}
+
+        def fake_time():
+            time_now["t"] += 0.6  # each call ticks 0.6s
+            return time_now["t"]
+
+        monkeypatch.setattr(session_mod.time, "time", fake_time)
+        state = session.wait_for_completion(
+            job_name="job-x", max_wait_seconds=2, poll_interval_seconds=1
+        )
+        assert state == "Timeout"
+
+    def test_successful_poll_resets_backoff(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After two failures, one success, then
+                another failure followed by Complete — the second
+                failure's sleep starts back at
+                ``poll_interval_seconds``, not the prior backoff
+                value. The reset is asserted by capturing
+                ``time.sleep`` arg-lists and checking the pattern.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = [
+            subprocess.CalledProcessError(1, "kubectl"),  # fail 1
+            subprocess.CalledProcessError(1, "kubectl"),  # fail 2
+            "Running",  # success — resets counter+backoff
+            subprocess.CalledProcessError(1, "kubectl"),  # fail again
+            "Complete",
+        ]
+
+        sleeps: list = []
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda s: sleeps.append(s))
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=600,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Complete"
+        # Pattern: fail→2, fail→4, success→1 (reset to poll_interval),
+        # fail→2, then success returns without sleeping after the
+        # final iteration. Pin the reset by asserting the third sleep
+        # is exactly poll_interval_seconds.
+        assert len(sleeps) >= 3
+        assert sleeps[2] == 1
 
 
 class TestWaitForCompletion:
@@ -6495,6 +6922,107 @@ class TestPackageAnalysisBundleMetadataValidation:
         first = manifest["files"][0]
         assert isinstance(first["size_bytes"], int)
         assert first["size_bytes"] == len(b"hello world")
+
+
+class TestPackageAnalysisBundleSortingRecordingFiles:
+    """``package_analysis_bundle(output_format='sorting', ...)``
+    declares ``recording_files`` in the manifest. The sorting
+    entrypoint uses that whitelist instead of a permissive name
+    blacklist. Sorting output requires the field; workspace / custom
+    bundles only include it when the caller passes it explicitly.
+    """
+
+    def test_sorting_manifest_carries_sorted_recording_files(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``output_format='sorting'`` writes
+                ``manifest.json["recording_files"]`` as a sorted list
+                of the supplied basenames.
+            (Test Case 2) Duplicates are deduplicated via ``set`` →
+                sorted.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "rec_a.bin").write_bytes(b"a")
+        (in_dir / "rec_b.bin").write_bytes(b"b")
+        (in_dir / "sorting_config.json").write_text("{}")
+
+        zip_path = package_analysis_bundle(
+            input_paths=[
+                str(in_dir / "rec_a.bin"),
+                str(in_dir / "rec_b.bin"),
+                str(in_dir / "sorting_config.json"),
+            ],
+            run_id="run-1",
+            output_dir=str(tmp_path / "out"),
+            output_format="sorting",
+            recording_files=["rec_b.bin", "rec_a.bin", "rec_a.bin"],
+        )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+        assert manifest["recording_files"] == ["rec_a.bin", "rec_b.bin"]
+
+    def test_sorting_bundle_requires_recording_files(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``output_format='sorting'`` without
+                ``recording_files=`` raises ValueError naming the
+                missing parameter.
+        """
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "rec.bin").write_bytes(b"x")
+
+        with pytest.raises(ValueError, match="recording_files"):
+            package_analysis_bundle(
+                input_paths=[str(in_dir / "rec.bin")],
+                run_id="run-1",
+                output_dir=str(tmp_path / "out"),
+                output_format="sorting",
+            )
+
+    def test_workspace_bundle_omits_recording_files_when_unspecified(
+        self, tmp_path
+    ):
+        """
+        Tests:
+            (Test Case 1) ``output_format='workspace'`` without
+                ``recording_files=`` produces a manifest without the
+                ``recording_files`` key.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "data.pkl").write_bytes(b"x")
+
+        zip_path = package_analysis_bundle(
+            input_paths=[str(in_dir / "data.pkl")],
+            run_id="run-1",
+            output_dir=str(tmp_path / "out"),
+            output_format="workspace",
+        )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+        assert "recording_files" not in manifest
 
 
 class TestPackageAnalysisBundleManifestCollision:

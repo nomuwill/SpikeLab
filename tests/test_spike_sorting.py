@@ -939,6 +939,74 @@ class TestWaveformExtractorToSpikeData:
 
 
 @skip_no_spikeinterface
+class TestShellScriptDaemonThreadDrain:
+    """``ShellScript.start()`` runs the stdout-drain loop on a daemon
+    thread so it returns immediately and the caller's
+    ``with inactivity_watchdog: wait()`` block wraps a live subprocess.
+    """
+
+    def test_start_returns_immediately_for_slow_subprocess(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``start()`` on a subprocess that sleeps for
+                2 seconds returns in well under 1 second.
+            (Test Case 2) ``isRunning()`` is True while the sleep is
+                in progress.
+            (Test Case 3) ``wait()`` blocks until the subprocess exits.
+        """
+        import time
+        import sys as _sys
+        from spikelab.spike_sorting.ks2_runner import ShellScript
+
+        # Use the current Python interpreter so the test is hermetic.
+        script = (
+            f'"{_sys.executable}" -c "import time; time.sleep(2); print(\'done\')"'
+        )
+        ss = ShellScript(script, log_path=str(tmp_path / "log"))
+
+        t0 = time.monotonic()
+        ss.start()
+        elapsed_start = time.monotonic() - t0
+        assert elapsed_start < 1.0
+        assert ss.isRunning() is True
+
+        # wait() blocks until subprocess exits.
+        t1 = time.monotonic()
+        retcode = ss.wait()
+        elapsed_wait = time.monotonic() - t1
+        assert retcode == 0
+        assert elapsed_wait >= 1.5  # subprocess slept ~2s
+
+    def test_drain_thread_captures_subprocess_stdout(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) After ``wait()`` returns, the log file
+                contains the subprocess's stdout — validates the
+                daemon thread didn't drop characters across the
+                start/wait boundary.
+        """
+        import sys as _sys
+        from spikelab.spike_sorting.ks2_runner import ShellScript
+
+        log_dir = tmp_path / "log_dir"
+        log_dir.mkdir()
+        log_base = log_dir / "ss"
+        script = (
+            f'"{_sys.executable}" -c "print(\'hello-from-subprocess\')"'
+        )
+        ss = ShellScript(script, log_path=str(log_base))
+        ss.start()
+        ss.wait()
+
+        # ShellScript writes the log to ``{log_path}.txt`` when the
+        # original path had no extension.
+        log_files = list(log_dir.rglob("*"))
+        log_text_files = [p for p in log_files if p.is_file()]
+        assert log_text_files, list(log_dir.rglob("*"))
+        text = log_text_files[0].read_text(encoding="utf-8", errors="replace")
+        assert "hello-from-subprocess" in text
+
+
 class TestShellScriptStartUsesErrorsReplace:
     """``ShellScript.start`` passes ``errors="replace"`` to
     ``subprocess.Popen`` so a sorter that writes invalid UTF-8 to
@@ -6756,6 +6824,90 @@ class TestTee:
             mirror_writes = [c.args[0] for c in mock_stdout.write.call_args_list]
             assert mirror_writes == ["\n", " ", "hello"]
 
+    def test_print_to_tee_writer_log_and_mirror_agree(self, tmp_path):
+        """
+        Pre-Tier-L the file got ``"a b\\n"`` while the mirror got
+        ``"ab\\n"`` because the skip dropped the space write.
+        Post-fix, both surfaces see identical bytes.
+
+        Tests:
+            (Test Case 1) ``print("a", "b", file=tee_writer)`` produces
+                ``"a b\\n"`` in both the log file and the mirror
+                capture.
+        """
+        from spikelab.spike_sorting.sorting_utils import Tee
+        from unittest.mock import MagicMock
+
+        log_file = tmp_path / "tee.log"
+        with Tee(log_file, "w") as f:
+            mock_stdout = MagicMock()
+            mirror_chunks: list = []
+            mock_stdout.write.side_effect = lambda s: mirror_chunks.append(s)
+            f.stdout = mock_stdout
+            print("a", "b", file=f)
+
+        log_text = log_file.read_text(encoding="utf-8")
+        mirror_text = "".join(mirror_chunks)
+        assert log_text == "a b\n"
+        assert mirror_text == "a b\n"
+
+    def test_fileno_delegates_to_stdout(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``tee.fileno()`` returns the value of
+                ``tee.stdout.fileno()`` — Click / IPython /
+                ``subprocess.run(stdout=...)`` callers need this
+                delegation.
+        """
+        from spikelab.spike_sorting.sorting_utils import Tee
+        from unittest.mock import MagicMock
+
+        log_file = tmp_path / "fileno.log"
+        with Tee(log_file, "w") as f:
+            mock_stdout = MagicMock()
+            mock_stdout.fileno.return_value = 42
+            f.stdout = mock_stdout
+            assert f.fileno() == 42
+
+    def test_isatty_delegates_to_stdout(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``tee.isatty()`` returns ``True`` when
+                ``stdout.isatty()`` is True.
+            (Test Case 2) ``tee.isatty()`` returns ``False`` when
+                ``stdout.isatty()`` is False.
+        """
+        from spikelab.spike_sorting.sorting_utils import Tee
+        from unittest.mock import MagicMock
+
+        log_file = tmp_path / "tty.log"
+        with Tee(log_file, "w") as f:
+            mock_stdout = MagicMock()
+            mock_stdout.isatty.return_value = True
+            f.stdout = mock_stdout
+            assert f.isatty() is True
+
+            mock_stdout.isatty.return_value = False
+            assert f.isatty() is False
+
+    def test_mirror_toggle_off_skips_stdout_write(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Setting ``f.mirror_to_stdout = False`` skips
+                the mirror; the log file still receives the write.
+        """
+        from spikelab.spike_sorting.sorting_utils import Tee
+        from unittest.mock import MagicMock
+
+        log_file = tmp_path / "toggle.log"
+        with Tee(log_file, "w") as f:
+            mock_stdout = MagicMock()
+            f.stdout = mock_stdout
+            f.mirror_to_stdout = False
+            f.write("x")
+            mock_stdout.write.assert_not_called()
+        assert "x" in log_file.read_text(encoding="utf-8")
+
 
 # ===========================================================================
 # Edge Case Tests -- Utils._mem_to_int
@@ -7031,6 +7183,316 @@ class TestGetNoiseLevels:
         noise = _get_noise_levels(recording)
         assert noise.shape == (1,)
         assert np.isfinite(noise[0])
+
+    def test_same_seed_produces_identical_noise_estimate(self):
+        """
+        ``_get_noise_levels`` uses ``np.random.default_rng(seed)`` so
+        two calls with the same seed produce bit-identical output.
+        This pins the migration off the legacy ``RandomState`` —
+        consistency with ``config.execution.random_seed`` callers
+        elsewhere in the pipeline.
+
+        Tests:
+            (Test Case 1) Two calls with ``seed=42`` produce
+                bit-identical noise arrays (not just close).
+        """
+        from spikelab.spike_sorting.pipeline import _get_noise_levels
+
+        # Recording must be long enough to take the random-chunk path
+        # (length > chunk_size, default 10_000).
+        recording = _make_mock_recording(num_samples=200_000, num_channels=4)
+        a = _get_noise_levels(recording, seed=42)
+        b = _get_noise_levels(recording, seed=42)
+        np.testing.assert_array_equal(a, b)
+
+    def test_different_seeds_produce_different_noise_estimates(self):
+        """
+        Tests:
+            (Test Case 1) ``seed=42`` and ``seed=43`` produce numerically
+                different noise arrays — proves the seed actually
+                takes effect, not a constant hard-coded internally.
+        """
+        from spikelab.spike_sorting.pipeline import _get_noise_levels
+
+        recording = _make_mock_recording(num_samples=200_000, num_channels=4)
+        a = _get_noise_levels(recording, seed=42)
+        b = _get_noise_levels(recording, seed=43)
+        # At least one channel differs; otherwise the seed is ignored.
+        assert not np.array_equal(a, b)
+
+    def test_default_rng_used_not_legacy_random_state(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) ``np.random.default_rng`` is invoked during
+                the random-chunk path (proves the migration off
+                ``np.random.RandomState`` did not silently regress).
+        """
+        from spikelab.spike_sorting import pipeline as pipeline_mod
+
+        captured = {"called_with": None}
+        original_default_rng = np.random.default_rng
+
+        def tracking_default_rng(seed=None):
+            captured["called_with"] = seed
+            return original_default_rng(seed)
+
+        monkeypatch.setattr(
+            pipeline_mod.np.random, "default_rng", tracking_default_rng
+        )
+        recording = _make_mock_recording(num_samples=200_000, num_channels=2)
+        pipeline_mod._get_noise_levels(recording, seed=7)
+        assert captured["called_with"] == 7
+
+
+class TestCurationCacheKey:
+    """``_curation_cache_key`` hashes ``(sorted unit_ids, curate_kwargs)``
+    so identical-content inputs produce identical hashes and any change
+    (unit-id set, kwarg value) flips the hash. The sort guarantees
+    order-insensitivity (a re-sorted SpikeData with the same units
+    still hits the cache).
+    """
+
+    @staticmethod
+    def _make_sd(unit_ids):
+        """Minimal SpikeData with neuron_attributes carrying unit_id."""
+        from spikelab.spikedata.spikedata import SpikeData
+
+        n = len(unit_ids)
+        trains = [np.array([1.0 * (i + 1)]) for i in range(n)]
+        attrs = [{"unit_id": int(u)} for u in unit_ids]
+        return SpikeData(trains, length=100.0, neuron_attributes=attrs)
+
+    def test_same_content_same_hash(self):
+        """
+        Tests:
+            (Test Case 1) Identical ``(sd, curate_kwargs)`` produce
+                identical hashes.
+        """
+        from spikelab.spike_sorting.pipeline import _curation_cache_key
+
+        sd = self._make_sd([0, 1, 2])
+        kw = {"min_rate_hz": 0.05, "min_spikes": 10}
+        assert _curation_cache_key(sd, kw) == _curation_cache_key(sd, kw)
+
+    def test_reordered_unit_ids_same_hash(self):
+        """
+        Tests:
+            (Test Case 1) ``unit_ids=[2, 0, 1]`` hashes the same as
+                ``[0, 1, 2]`` (the helper sorts before hashing).
+        """
+        from spikelab.spike_sorting.pipeline import _curation_cache_key
+
+        sd_a = self._make_sd([0, 1, 2])
+        sd_b = self._make_sd([2, 0, 1])
+        kw = {"min_rate_hz": 0.05}
+        assert _curation_cache_key(sd_a, kw) == _curation_cache_key(sd_b, kw)
+
+    def test_changed_unit_id_different_hash(self):
+        """
+        Tests:
+            (Test Case 1) Replacing one unit_id (``[0, 1, 2]`` →
+                ``[0, 1, 99]``) flips the hash.
+        """
+        from spikelab.spike_sorting.pipeline import _curation_cache_key
+
+        kw = {"min_rate_hz": 0.05}
+        h1 = _curation_cache_key(self._make_sd([0, 1, 2]), kw)
+        h2 = _curation_cache_key(self._make_sd([0, 1, 99]), kw)
+        assert h1 != h2
+
+    def test_changed_kwarg_different_hash(self):
+        """
+        Tests:
+            (Test Case 1) Changing ``min_rate_hz`` from 0.05 to 0.1
+                flips the hash (sd unchanged).
+        """
+        from spikelab.spike_sorting.pipeline import _curation_cache_key
+
+        sd = self._make_sd([0, 1, 2])
+        h1 = _curation_cache_key(sd, {"min_rate_hz": 0.05})
+        h2 = _curation_cache_key(sd, {"min_rate_hz": 0.10})
+        assert h1 != h2
+
+    def test_neuron_attributes_none_falls_back_to_range_N(self):
+        """
+        Tests:
+            (Test Case 1) ``sd.neuron_attributes is None`` does not
+                crash — the helper falls back to ``range(N)`` as the
+                unit-id set.
+        """
+        from spikelab.spike_sorting.pipeline import _curation_cache_key
+        from spikelab.spikedata.spikedata import SpikeData
+
+        sd = SpikeData(
+            [np.array([1.0]), np.array([2.0])],
+            length=100.0,
+            neuron_attributes=None,
+        )
+        # Should not raise.
+        h = _curation_cache_key(sd, {"min_rate_hz": 0.05})
+        assert isinstance(h, str) and len(h) == 64  # SHA256 hex digest
+
+
+class TestCurateSpikedataCache:
+    """``curate_spikedata`` writes a content-hash cache. The cache is
+    invalidated when ``unit_ids`` change (re-sort) or when
+    ``curate_kwargs`` change (reparam). A legacy cache without
+    ``__cache_key__`` is treated as a miss.
+    """
+
+    @staticmethod
+    def _make_sd_and_config(unit_ids, fr_min=0.05):
+        """Build SpikeData + config that survive ``curate_spikedata``
+        without needing real waveforms — only the firing-rate filter
+        path fires."""
+        from spikelab.spikedata.spikedata import SpikeData
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        n = len(unit_ids)
+        # ~10 spikes over 1000 ms → 10 Hz, well above fr_min thresholds.
+        trains = [np.linspace(10.0, 990.0, 10) for _ in range(n)]
+        attrs = [{"unit_id": int(u)} for u in unit_ids]
+        sd = SpikeData(trains, length=1000.0, neuron_attributes=attrs)
+
+        cfg = SortingPipelineConfig()
+        cfg.curation.curate_first = True
+        cfg.curation.curate_second = False
+        cfg.curation.fr_min = fr_min
+        cfg.curation.isi_viol_max = None
+        cfg.curation.snr_min = None
+        cfg.curation.spikes_min_first = None
+        return sd, cfg
+
+    def test_cache_hit_does_not_recurate(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) A second identical call returns immediately
+                via the cache — ``sd.curate`` is invoked exactly once
+                across two ``curate_spikedata`` calls.
+        """
+        from spikelab.spike_sorting.pipeline import curate_spikedata
+        from spikelab.spikedata.spikedata import SpikeData
+
+        sd, cfg = self._make_sd_and_config([0, 1, 2])
+        original_curate = SpikeData.curate
+        call_count = {"n": 0}
+
+        def tracking_curate(self, *args, **kwargs):
+            call_count["n"] += 1
+            return original_curate(self, *args, **kwargs)
+
+        monkeypatch.setattr(SpikeData, "curate", tracking_curate)
+
+        folder = tmp_path / "cache"
+        curate_spikedata(sd, folder, cfg)
+        curate_spikedata(sd, folder, cfg)
+        assert call_count["n"] == 1
+
+    def test_resort_invalidates_cache(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A re-sort that renumbers unit ids (``[0, 1,
+                2]`` → ``[10, 11, 12]``) invalidates the cache —
+                ``unit_ids.npy`` mtime changes on the second call.
+            (Test Case 2) The returned curated SpikeData is non-empty
+                (not the stale-id intersection empty set the old code
+                produced).
+        """
+        from spikelab.spike_sorting.pipeline import curate_spikedata
+
+        sd_v1, cfg = self._make_sd_and_config([0, 1, 2])
+        sd_v2, _ = self._make_sd_and_config([10, 11, 12])
+
+        folder = tmp_path / "cache"
+        curate_spikedata(sd_v1, folder, cfg)
+        first_mtime = (folder / "unit_ids.npy").stat().st_mtime_ns
+
+        # Force the second call's mtime to be measurably different
+        # under filesystem granularity.
+        import time
+
+        time.sleep(0.01)
+        sd_v2_curated, _ = curate_spikedata(sd_v2, folder, cfg)
+        second_mtime = (folder / "unit_ids.npy").stat().st_mtime_ns
+
+        assert second_mtime != first_mtime
+        assert sd_v2_curated.N > 0
+
+    def test_reparam_invalidates_cache(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Changing ``fr_min`` from 0.5 to 0.1 on the
+                same SpikeData + folder invalidates the cache — the
+                second call returns the result of the new threshold.
+        """
+        from spikelab.spike_sorting.pipeline import curate_spikedata
+
+        # 5 units with rates ~10 Hz; fr_min=0.5 keeps all, fr_min=0.1
+        # also keeps all but the cache key still changes (different
+        # threshold value).
+        sd, cfg_strict = self._make_sd_and_config([0, 1, 2], fr_min=0.5)
+        _, cfg_loose = self._make_sd_and_config([0, 1, 2], fr_min=0.1)
+
+        folder = tmp_path / "cache"
+        _, history_strict = curate_spikedata(sd, folder, cfg_strict)
+        _, history_loose = curate_spikedata(sd, folder, cfg_loose)
+        # Different cache keys for the two threshold values.
+        assert history_strict["__cache_key__"] != history_loose["__cache_key__"]
+
+    def test_legacy_cache_without_cache_key_treated_as_miss(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) A pre-existing ``curation_history.json``
+                without a ``__cache_key__`` field is treated as a
+                cache miss — the second call invokes ``sd.curate``.
+        """
+        import json
+        from spikelab.spike_sorting.pipeline import curate_spikedata
+        from spikelab.spikedata.spikedata import SpikeData
+
+        sd, cfg = self._make_sd_and_config([0, 1, 2])
+        folder = tmp_path / "cache"
+        folder.mkdir()
+
+        # Write a legacy cache (no __cache_key__).
+        np.save(str(folder / "unit_ids.npy"), np.array([0, 1, 2]))
+        with open(folder / "curation_history.json", "w") as f:
+            json.dump({"curated_final": [0, 1, 2]}, f)
+
+        call_count = {"n": 0}
+        original_curate = SpikeData.curate
+
+        def tracking_curate(self, *args, **kwargs):
+            call_count["n"] += 1
+            return original_curate(self, *args, **kwargs)
+
+        monkeypatch.setattr(SpikeData, "curate", tracking_curate)
+        curate_spikedata(sd, folder, cfg)
+        # Legacy miss → curate runs.
+        assert call_count["n"] == 1
+        """
+        Tests:
+            (Test Case 1) ``np.random.default_rng`` is invoked during
+                the random-chunk path (proves the migration off
+                ``np.random.RandomState`` did not silently regress).
+        """
+        from spikelab.spike_sorting import pipeline as pipeline_mod
+
+        captured = {"called_with": None}
+        original_default_rng = np.random.default_rng
+
+        def tracking_default_rng(seed=None):
+            captured["called_with"] = seed
+            return original_default_rng(seed)
+
+        monkeypatch.setattr(
+            pipeline_mod.np.random, "default_rng", tracking_default_rng
+        )
+        recording = _make_mock_recording(num_samples=200_000, num_channels=2)
+        pipeline_mod._get_noise_levels(recording, seed=7)
+        assert captured["called_with"] == 7
 
 
 # ===========================================================================
@@ -12621,6 +13083,127 @@ def _new_compiler(include_failed_units_cfg=False):
     cfg.compilation.save_electrodes = False
     cfg.compilation.include_failed_units = include_failed_units_cfg
     return Compiler(cfg)
+
+
+class TestCompilerSaveResultsPerRecordingLayout:
+    """``Compiler.save_results`` writes one output file per recording:
+
+    - Single recording → ``sorted.npz`` (legacy filename for backward
+      compatibility with existing readers).
+    - Multiple recordings → one ``{rec_name}.npz`` per recording, with
+      ``rec_name`` sanitised for filesystem safety.
+    """
+
+    @staticmethod
+    def _new_compiler(compile_to_mat=False, compile_to_npz=True):
+        from spikelab.spike_sorting.pipeline import Compiler
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        cfg = SortingPipelineConfig()
+        cfg.figures.create_figures = False
+        cfg.compilation.compile_to_mat = compile_to_mat
+        cfg.compilation.compile_to_npz = compile_to_npz
+        cfg.compilation.compile_waveforms = False
+        cfg.compilation.save_electrodes = False
+        cfg.compilation.include_failed_units = False
+        return Compiler(cfg)
+
+    def test_single_recording_writes_sorted_npz(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) One recording → ``sorted.npz`` (legacy
+                filename).
+            (Test Case 2) Top-level keys include ``units`` /
+                ``locations`` / ``fs``.
+        """
+        compiler = self._new_compiler()
+        sd = _make_sd_with_unit_ids([101, 202])
+        compiler.add_recording("rec_a", sd, curation_history=None)
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        assert (out_folder / "sorted.npz").is_file()
+        loaded = np.load(str(out_folder / "sorted.npz"), allow_pickle=True)
+        assert "units" in loaded
+        assert "locations" in loaded
+        assert "fs" in loaded
+
+    def test_multi_recording_writes_one_file_per_rec_name(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Two recordings → ``rec_a.npz`` and
+                ``rec_b.npz`` (not a single ``sorted.npz``).
+            (Test Case 2) Each file contains only its own recording's
+                units.
+        """
+        compiler = self._new_compiler()
+        sd_a = _make_sd_with_unit_ids([1, 2, 3])
+        sd_b = _make_sd_with_unit_ids([10, 20])
+        compiler.add_recording("rec_a", sd_a, curation_history=None)
+        compiler.add_recording("rec_b", sd_b, curation_history=None)
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        assert (out_folder / "rec_a.npz").is_file()
+        assert (out_folder / "rec_b.npz").is_file()
+        # No legacy sorted.npz when there are multiple recordings.
+        assert not (out_folder / "sorted.npz").exists()
+
+        loaded_a = np.load(str(out_folder / "rec_a.npz"), allow_pickle=True)
+        loaded_b = np.load(str(out_folder / "rec_b.npz"), allow_pickle=True)
+        a_ids = {int(u["unit_id"]) for u in loaded_a["units"]}
+        b_ids = {int(u["unit_id"]) for u in loaded_b["units"]}
+        assert a_ids == {1, 2, 3}
+        assert b_ids == {10, 20}
+
+    def test_rec_name_with_unsafe_chars_sanitised_in_filename(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A rec_name with ``/`` and ``:`` is
+                sanitised to ``rec_with_colon.npz`` (non-alphanumeric
+                replaced with underscore).
+            (Test Case 2) The resulting file round-trips via
+                ``np.load``.
+        """
+        compiler = self._new_compiler()
+        sd_a = _make_sd_with_unit_ids([1])
+        sd_b = _make_sd_with_unit_ids([2])
+        compiler.add_recording("rec/with:colon", sd_a, curation_history=None)
+        # Add a second recording so the multi-rec naming path fires.
+        compiler.add_recording("rec_b", sd_b, curation_history=None)
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        # Slash and colon replaced with underscore.
+        expected = out_folder / "rec_with_colon.npz"
+        assert expected.is_file()
+        # Round-trips via np.load.
+        loaded = np.load(str(expected), allow_pickle=True)
+        assert "units" in loaded
+
+    def test_compile_flags_off_writes_nothing(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) With both ``compile_to_npz=False`` and
+                ``compile_to_mat=False``, no ``.npz`` / ``.mat`` files
+                are written regardless of recording count.
+        """
+        compiler = self._new_compiler(
+            compile_to_mat=False, compile_to_npz=False
+        )
+        sd = _make_sd_with_unit_ids([1, 2])
+        compiler.add_recording("rec_a", sd, curation_history=None)
+
+        out_folder = tmp_path / "out"
+        compiler.save_results(out_folder)
+
+        npz_files = list(out_folder.glob("*.npz"))
+        mat_files = list(out_folder.glob("*.mat"))
+        assert npz_files == []
+        assert mat_files == []
 
 
 class TestCompilerWaveformCompileMmapBranch:

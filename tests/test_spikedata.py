@@ -10738,11 +10738,19 @@ class TestSpikeDataLatenciesToIndexContract:
 
     def test_latencies_to_index_matches_latencies_with_unit_i(self):
         """
+        Tier L-F1: ``latencies_to_index`` now returns the same
+        ``(N_units, len(self.train[i]))`` NaN-padded ndarray that
+        ``latencies(self.train[i], ...)`` returns. Pin both the
+        type/shape contract AND the per-unit value equivalence so a
+        regression that accidentally re-wrapped the output as a
+        list-of-lists would fail here too.
+
         Tests:
-            (Test Case 1) ``latencies_to_index(0, window_ms=50)``
-                returns the same per-unit results as
+            (Test Case 1) Return value is an ndarray with shape
+                ``(sd.N, len(sd.train[ref_index]))``.
+            (Test Case 2) Per-unit rows match
                 ``latencies(self.train[0], window_ms=50)`` for
-                non-self units.
+                non-self units, including the NaN positions.
         """
         sd = SpikeData(
             [
@@ -10755,14 +10763,28 @@ class TestSpikeDataLatenciesToIndexContract:
         ref_index = 0
         via_index = sd.latencies_to_index(ref_index, window_ms=50.0)
         via_direct = sd.latencies(sd.train[ref_index], window_ms=50.0)
-        assert len(via_index) == len(via_direct)
+
+        # Type/shape contract (Test Case 1).
+        assert isinstance(via_index, np.ndarray)
+        assert via_index.shape == (sd.N, len(sd.train[ref_index]))
+        assert via_index.shape == via_direct.shape
+
+        # Per-unit value equivalence (Test Case 2). Includes NaN
+        # positions: both rows must agree on which slots are NaN AND
+        # on the numeric values at the non-NaN slots.
         for u in range(sd.N):
             if u == ref_index:
                 continue
+            np.testing.assert_array_equal(
+                np.isnan(via_index[u]),
+                np.isnan(via_direct[u]),
+                err_msg=f"NaN-mask mismatch at unit {u}",
+            )
+            mask = ~np.isnan(via_direct[u])
             np.testing.assert_allclose(
-                np.sort(np.asarray(via_index[u])),
-                np.sort(np.asarray(via_direct[u])),
-                err_msg=f"mismatch at unit {u}",
+                via_index[u][mask],
+                via_direct[u][mask],
+                err_msg=f"value mismatch at unit {u}",
             )
 
 

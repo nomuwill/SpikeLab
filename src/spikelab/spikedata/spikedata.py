@@ -2189,13 +2189,21 @@ class SpikeData:
     def latencies_to_index(self, i, window_ms=100.0):
         """Compute the latency from one unit to all other units.
 
+        Thin wrapper around :meth:`latencies` that uses unit ``i``'s
+        spike train as the query times.
+
         Parameters:
-            i (int): Index of the unit.
+            i (int): Index of the reference unit.
             window_ms (float): Window in milliseconds (default: 100.0).
 
         Returns:
-            latencies (list): 2D list, each row is a list of latencies per
-                neuron.
+            latencies (np.ndarray): Shape ``(N_units, len(self.train[i]))``
+                float64 ndarray. Entry ``[u, k]`` is the signed latency
+                from the ``k``-th spike of unit ``i`` to the nearest
+                spike of unit ``u`` (within ``window_ms``), or ``NaN``
+                when no spike of unit ``u`` falls within the window.
+                Row ``i`` contains zeros where self-latencies match
+                exactly.
         """
         return self.latencies(self.train[i], window_ms)
 

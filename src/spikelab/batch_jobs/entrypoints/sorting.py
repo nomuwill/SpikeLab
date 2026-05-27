@@ -3,10 +3,19 @@
 Invoked as ``python -m spikelab.batch_jobs.entrypoints.sorting``
 inside a Kubernetes job container.
 
-Environment variables:
+Environment variables (required):
     INPUT_URI: S3 URI of the input bundle zip containing recordings +
         sorting_config.json.
     OUTPUT_PREFIX: S3 URI prefix for uploading sorted results.
+
+Environment variables (optional, consulted by the S3 client):
+    S3_ENDPOINT_URL: Override the AWS S3 endpoint. Used by
+        non-AWS S3-compatible stores (MinIO, Wasabi, etc.). Default:
+        unset → boto3 routes to AWS S3.
+    AWS_DEFAULT_REGION: AWS region name passed to ``boto3.client``.
+        Required by some AWS regions to disambiguate the endpoint.
+        Default: unset → boto3 uses its own region-resolution chain
+        (env, profile, instance metadata).
 """
 
 from __future__ import annotations
@@ -134,9 +143,11 @@ def main() -> None:
         work = Path(work_dir)
 
         # --- Download and extract input bundle ---
+        print(f"[entrypoint] download: {input_uri}", flush=True)
         bundle_zip = str(work / "input.zip")
         storage.download_file(s3_uri=input_uri, local_path=bundle_zip)
 
+        print("[entrypoint] extract: validating zip members + unpacking", flush=True)
         extract_dir = work / "input"
         # Validate zip members against the target directory before
         # extracting. Without this, a malicious bundle (compromised S3,
@@ -149,6 +160,7 @@ def main() -> None:
             _safe_extractall(zf, extract_dir)
 
         # --- Load sorting config ---
+        print("[entrypoint] config: loading sorting_config.json", flush=True)
         config_files = list(extract_dir.rglob("sorting_config.json"))
         if not config_files:
             raise FileNotFoundError("sorting_config.json not found in input bundle")
@@ -247,6 +259,11 @@ def main() -> None:
         # even when some recordings had degraded or partial results.
         from spikelab.spike_sorting.pipeline import SortRunReport
 
+        print(
+            f"[entrypoint] sort: {len(recording_files)} recording(s) "
+            f"with {config.sorter.sorter_name}",
+            flush=True,
+        )
         sort_report = SortRunReport()
         spikedata_results = sort_recording(
             recording_files=recording_files,
@@ -270,6 +287,11 @@ def main() -> None:
                 f"SpikeData but bundle contains {len(recording_files)} "
                 "recordings; cannot map results to recording names."
             )
+        print(
+            f"[entrypoint] upload: {len(spikedata_results)} curated SpikeData pickle(s) "
+            f"-> {output_prefix}",
+            flush=True,
+        )
         for sd, rec_path in zip(spikedata_results, recording_files):
             rec_name = Path(rec_path).stem
             pkl_name = f"{rec_name}_curated.pkl"

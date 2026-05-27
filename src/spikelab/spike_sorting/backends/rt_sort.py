@@ -20,7 +20,7 @@ Requirements:
 """
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 
@@ -166,8 +166,19 @@ class RTSortBackend(SorterBackend):
         self._check_dependencies()
 
     def _check_dependencies(self) -> None:
-        """Raise a clear ImportError listing any missing RT-Sort deps."""
+        """Raise a clear ImportError listing any missing RT-Sort deps.
+
+        Distinguishes ImportError (package missing) from other
+        exception types (package present but broken — e.g. ABI
+        mismatch, partially-installed wheel, native library missing).
+        Pre-Tier-L the blanket ``except ImportError`` collapsed both
+        into "missing", which sent operators down the wrong
+        troubleshooting path when the real problem was a broken
+        install. Non-ImportError failures now report the underlying
+        exception message.
+        """
         missing = []
+        broken: List[str] = []
         for name, pkg in [
             ("torch", "torch"),
             ("diptest", "diptest"),
@@ -180,11 +191,18 @@ class RTSortBackend(SorterBackend):
                 __import__(name)
             except ImportError:
                 missing.append(pkg)
-        if missing:
+            except Exception as exc:
+                broken.append(f"{pkg} (import raised {type(exc).__name__}: {exc})")
+        if missing or broken:
+            parts = []
+            if missing:
+                parts.append("missing: " + ", ".join(missing))
+            if broken:
+                parts.append("present-but-broken: " + "; ".join(broken))
             raise ImportError(
-                "RT-Sort backend requires the following packages "
-                f"which are not installed: {', '.join(missing)}. "
-                "For PyTorch, install a CUDA-matching wheel from "
+                "RT-Sort backend dependency check failed — "
+                + " | ".join(parts)
+                + ". For PyTorch, install a CUDA-matching wheel from "
                 "https://pytorch.org/get-started/locally/"
             )
 

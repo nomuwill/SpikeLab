@@ -10,6 +10,12 @@ from itertools import groupby as _groupby
 from scipy import ndimage, signal
 from scipy.stats import norm
 
+#: Milliseconds per second. Used by the ISI/firing-rate helpers to
+#: convert ``1.0 / isi_ms`` (Hz-per-ms input) into Hz (per-second
+#: output). The literal ``1000`` appeared at several sites; the
+#: named constant makes the unit-conversion intent explicit.
+_MS_PER_S: float = 1000.0
+
 __all__ = [
     "get_sttc",
     "swap",
@@ -225,7 +231,7 @@ def _resampled_isi(spikes, times, sigma_ms):
         isi = spikes[idx + 1] - spikes[idx]
         if isi <= 0:
             return np.zeros_like(times, dtype=float)
-        return np.array([1.0 / isi * 1000], dtype=float)
+        return np.array([1.0 / isi * _MS_PER_S], dtype=float)
 
     spikes = np.array(spikes)
     times = np.array(times)
@@ -270,7 +276,7 @@ def _resampled_isi(spikes, times, sigma_ms):
 
     # Compute instantaneous firing rates (1/isi, in Hz assuming ms units)
     isi_rate = np.zeros_like(isi, dtype=float)
-    isi_rate[1:] = 1.0 / isi[1:] * 1000
+    isi_rate[1:] = 1.0 / isi[1:] * _MS_PER_S
 
     # Create temporary result array matching times resolution
     t_start, t_end = times[0], times[-1]
@@ -1709,6 +1715,21 @@ def _validate_time_start_to_end(
         time_diff_check.append(time_window[1] - time_window[0])
         valid_time_tuples.append(time_window)
 
+    # Run the uniformity check first. When durations mix zero-with-
+    # non-zero, the ValueError below is the actionable signal — emit
+    # the zero-duration warning ONLY when the uniformity check passes
+    # (i.e. all windows are uniformly zero), so the caller doesn't
+    # see both a warning and an error for the same root cause.
+    uniformity_ok = True
+    if len(time_diff_check) > 1:
+        diffs = np.array(time_diff_check)
+        if not np.allclose(diffs, diffs[0], atol=1e-6, rtol=0):
+            uniformity_ok = False
+
+    if not uniformity_ok:
+        # Mixed durations — error only, no zero-duration warn noise.
+        raise ValueError("All time windows must have the same length")
+
     if zero_duration_offenders:
         n = len(zero_duration_offenders)
         head = zero_duration_offenders[:10]
@@ -1737,10 +1758,6 @@ def _validate_time_start_to_end(
             stacklevel=2,
         )
 
-    if len(time_diff_check) > 1:
-        diffs = np.array(time_diff_check)
-        if not np.allclose(diffs, diffs[0], atol=1e-6, rtol=0):
-            raise ValueError("All time windows must have the same length")
     return valid_time_tuples
 
 

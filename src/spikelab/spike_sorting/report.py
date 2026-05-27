@@ -54,7 +54,13 @@ _logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _TIMESTAMP_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
-_BANNER_LINE_RE = re.compile(r"^=+$")
+# Tier L-D10: derive the banner regex from the shared constants
+# ``BANNER_CHAR`` / ``BANNER_WIDTH`` defined in ``sorting_utils`` so
+# a future change to the banner char doesn't require touching this
+# regex independently. ``re.escape`` ensures the char is regex-safe.
+from .sorting_utils import BANNER_CHAR as _BANNER_CHAR
+
+_BANNER_LINE_RE = re.compile(rf"^{re.escape(_BANNER_CHAR)}+$")
 _TRACEBACK_START_RE = re.compile(r"^Traceback \(most recent call last\):")
 _TRACEBACK_END_RE = re.compile(r"^[A-Z][\w\.]*(?:Error|Exception|Interrupt)\b.*")
 _WARNING_RE = re.compile(r"(?i)warning|warn")

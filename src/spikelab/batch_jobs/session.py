@@ -115,19 +115,12 @@ class RunSession:
         manifest_text = self.render_manifest(
             job_name=job_name, job_spec=job_spec, run_id=run_id
         )
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".yaml",
-            prefix=f"{job_name}-",
-            delete=False,
-            encoding="utf-8",
-        ) as f:
-            f.write(manifest_text)
-            manifest_path = f.name
-        try:
-            self.backend.apply_manifest(manifest_path)
-        finally:
-            os.unlink(manifest_path)
+        # ``apply_manifest`` accepts a raw YAML string (it does
+        # ``Path(arg).exists()`` to disambiguate a path argument from
+        # an inline YAML payload). Pass the rendered text directly
+        # instead of writing it to a tempfile only to read it back —
+        # avoids the round-trip to disk and the unlink cleanup.
+        self.backend.apply_manifest(manifest_text)
 
         # Render a second manifest with sensitive env values redacted
         # for the SubmitResult surface. The redaction policy lives in

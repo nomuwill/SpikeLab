@@ -297,7 +297,7 @@ class PairwiseCompMatrix:
         return self.matrix[lower_tri_idx[0], lower_tri_idx[1]]
 
     @staticmethod
-    def _is_diverging(matrix):
+    def _should_use_diverging_cmap(matrix):
         """Check whether a matrix has both meaningful negative and positive values."""
         finite = matrix[np.isfinite(matrix)]
         if len(finite) == 0:
@@ -339,7 +339,9 @@ class PairwiseCompMatrix:
         from .plot_utils import plot_heatmap
 
         if cmap is None:
-            cmap = "RdBu_r" if self._is_diverging(self.matrix) else "viridis"
+            cmap = (
+                "RdBu_r" if self._should_use_diverging_cmap(self.matrix) else "viridis"
+            )
 
         if tick_labels is None:
             tick_labels = (

@@ -248,7 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kubeconfig")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    deploy = sub.add_parser("deploy-job")
+    deploy = sub.add_parser(
+        "deploy-job",
+        help="Validate, render, and submit a job to Kubernetes; optionally wait for completion.",
+    )
     deploy.add_argument("--job-config", required=True)
     deploy.add_argument("--allow-policy-risk", action="store_true")
     deploy.add_argument("--render-only", action="store_true")
@@ -260,20 +263,32 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--image")
     deploy.set_defaults(func=_cmd_deploy)
 
-    status = sub.add_parser("job-status")
+    status = sub.add_parser(
+        "job-status",
+        help="Query the current Kubernetes status of a previously-submitted job.",
+    )
     status.add_argument("job_name")
     status.set_defaults(func=_cmd_status)
 
-    logs = sub.add_parser("job-logs")
+    logs = sub.add_parser(
+        "job-logs",
+        help="Stream stdout/stderr from a job's pods; optionally follow live.",
+    )
     logs.add_argument("job_name")
     logs.add_argument("--follow", action="store_true")
     logs.set_defaults(func=_cmd_logs)
 
-    delete = sub.add_parser("job-delete")
+    delete = sub.add_parser(
+        "job-delete",
+        help="Delete a Kubernetes job (and its pods). Idempotent: missing jobs no-op.",
+    )
     delete.add_argument("job_name")
     delete.set_defaults(func=_cmd_delete)
 
-    render = sub.add_parser("render-job")
+    render = sub.add_parser(
+        "render-job",
+        help="Render the K8s job manifest YAML without submitting (dry-run).",
+    )
     render.add_argument("--job-config", required=True)
     render.add_argument("--output-manifest")
     render.add_argument("--image-profile", choices=["cpu", "gpu"])

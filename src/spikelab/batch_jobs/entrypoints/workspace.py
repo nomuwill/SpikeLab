@@ -3,10 +3,19 @@
 Invoked as ``python -m spikelab.batch_jobs.entrypoints.workspace``
 inside a Kubernetes job container.
 
-Environment variables:
+Environment variables (required):
     INPUT_URI: S3 URI of the input bundle zip.
     OUTPUT_PREFIX: S3 URI prefix for uploading the updated workspace.
     SCRIPT_NAME: Filename of the analysis script inside the bundle.
+
+Environment variables (optional, consulted by the S3 client):
+    S3_ENDPOINT_URL: Override the AWS S3 endpoint. Used by
+        non-AWS S3-compatible stores (MinIO, Wasabi, etc.). Default:
+        unset → boto3 routes to AWS S3.
+    AWS_DEFAULT_REGION: AWS region name passed to ``boto3.client``.
+        Required by some AWS regions to disambiguate the endpoint.
+        Default: unset → boto3 uses its own region-resolution chain
+        (env, profile, instance metadata).
 """
 
 from __future__ import annotations

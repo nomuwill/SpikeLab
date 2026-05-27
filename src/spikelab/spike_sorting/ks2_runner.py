@@ -115,6 +115,18 @@ class RunKilosort:
 
         # region Make substitutions in txt files to set kilosort parameters
         # region Config text
+        #
+        # Convention (Tier L-D11): the templates below are filled via
+        # Python's ``str.format(**kwargs)`` — so any LITERAL MATLAB
+        # ``{N}`` cell-indexing or struct-field syntax inside these
+        # strings MUST be escaped as ``{{N}}``. The current templates
+        # do not contain any such MATLAB cell syntax; if you add e.g.
+        # ``ops.something{{1}}.field`` later, write it as ``{{1}}`` so
+        # ``.format()`` doesn't try to interpolate ``{1}`` as a
+        # positional argument. The alternative is to migrate to
+        # ``str.Template`` (``$key`` syntax — no `{}` collision); the
+        # ``.format``-with-escape convention is the cheaper choice
+        # given the current template surface.
         kilosort2_master_txt = """try
             % prepare for kilosort execution
             addpath(genpath('{kilosort2_path}'));

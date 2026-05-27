@@ -60,5 +60,8 @@ resources:
   requests_gpu: 1
   limits_gpu: 1
   node_selector: {}
-endpoint_url: null
-region_name: null
+# Tier L-D18: ``endpoint_url`` and ``region_name`` previously set
+# explicitly to ``null`` here while ``defaults.yaml`` omitted them.
+# Removed for consistency — pydantic defaults to ``None`` when the
+# fields are absent. Set them explicitly here only if the NRP cluster
+# requires a non-default S3 endpoint or region.

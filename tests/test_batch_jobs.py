@@ -2727,14 +2727,14 @@ class TestRunSessionWorkspaceJob:
 
         session, backend, storage = self._make_session()
 
-        # Capture the file contents from disk at apply-time so the
-        # tempfile content can be inspected post-call (apply_manifest
-        # unlinks the file on its caller in ``_submit``).
+        # Tier L-D8: ``_submit`` now passes the manifest YAML string
+        # directly to ``apply_manifest`` instead of writing to a
+        # tempfile and passing the path. Capture the string argument
+        # for post-call inspection.
         captured_manifest = {"text": None}
 
-        def capture_apply(path):
-            with open(path, encoding="utf-8") as f:
-                captured_manifest["text"] = f.read()
+        def capture_apply(manifest_text_or_path):
+            captured_manifest["text"] = manifest_text_or_path
             return "test-job-abc"
 
         backend.apply_manifest.side_effect = capture_apply

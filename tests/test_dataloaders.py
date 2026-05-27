@@ -6299,22 +6299,37 @@ class TestTrainsFromFlatIndexLengthMismatch:
                 n_units=2,
             )
 
-    def test_n_units_zero_with_non_empty_end_indices_raises(self):
+    def test_n_units_zero_returns_empty_list(self):
         """
+        Tier L-D5: ``n_units=0`` short-circuits to return ``[]`` early,
+        regardless of what's in ``end_indices``. The previous behaviour
+        (raising ValueError on a length mismatch) was a convoluted code
+        path; the empty-list shortcut makes the intent obvious.
+
         Tests:
             (Test Case 1) ``n_units=0`` with non-empty ``end_indices``
-                raises ValueError via the length-mismatch branch.
+                returns ``[]`` without raising.
+            (Test Case 2) ``n_units=0`` with empty ``end_indices``
+                returns ``[]``.
         """
         from spikelab.data_loaders.data_loaders import _trains_from_flat_index
 
-        with pytest.raises(ValueError, match="does not match"):
-            _trains_from_flat_index(
-                np.array([0.1, 0.2]),
-                np.array([2]),
-                unit="s",
-                fs_Hz=None,
-                n_units=0,
-            )
+        result = _trains_from_flat_index(
+            np.array([0.1, 0.2]),
+            np.array([2]),
+            unit="s",
+            fs_Hz=None,
+            n_units=0,
+        )
+        assert result == []
+        result_empty = _trains_from_flat_index(
+            np.array([]),
+            np.array([]),
+            unit="s",
+            fs_Hz=None,
+            n_units=0,
+        )
+        assert result_empty == []
 
 
 class TestReadRawArraysZeroBoundaries:

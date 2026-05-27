@@ -105,6 +105,20 @@ class JobSpec(BaseModel):
     container: ContainerSpec
     resources: ResourceSpec
     volumes: List[VolumeMountSpec] = Field(default_factory=list)
+    #: Kubernetes ``ttlSecondsAfterFinished``: how long the K8s job
+    #: object and its pod logs persist after the pod terminates,
+    #: before the cluster reaps them. The default 3600 (1 hour)
+    #: optimises for cluster cleanliness, not forensics — useful
+    #: dials when you need pod logs available post-completion for
+    #: debugging:
+    #:
+    #: - ``21600`` (6h): end-of-day check
+    #: - ``86400`` (24h): next-business-day investigation
+    #: - ``172800`` (48h): covers a weekend gap
+    #: - ``604800`` (1 week): covers a vacation
+    #:
+    #: Results stored in S3 are retained regardless — this TTL only
+    #: affects the K8s-side job object and its pod logs.
     ttl_seconds_after_finished: int = Field(default=3600, ge=0)
     backoff_limit: int = Field(default=0, ge=0)
     active_deadline_seconds: Optional[int] = Field(default=None, ge=1)

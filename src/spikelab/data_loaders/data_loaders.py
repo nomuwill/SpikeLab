@@ -158,6 +158,13 @@ def _split_by_index(
             type conversion is applied.
     """
     end_indices = np.asarray(end_indices)
+    # Early return for n_units=0 — an all-empty NWB file or a sorting
+    # with no surviving units. The disambiguation logic below has a
+    # convoluted branch for the n_units=0 + leading-zero ``[0]``
+    # variant; bypassing it makes the intent obvious and avoids the
+    # n_units=0 + len(end_indices)=1 special case entirely.
+    if n_units == 0:
+        return []
     if len(end_indices) > 0:
         # Reject float / non-integer dtype upfront with a friendly error;
         # numpy slicing on float indices raises a confusing TypeError mid-loop.

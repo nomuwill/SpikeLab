@@ -2006,7 +2006,14 @@ def plot_recording(
     raster_T = spk_mat.shape[1]
 
     def _rescaled_range(arr_len):
-        """Convert raster-resolution [start, end) to indices for an array of length arr_len."""
+        """Convert raster-resolution [start, end) to indices for an array of length arr_len.
+
+        The ``int(round(...))`` rescale is exact to ±half a bin in
+        the rendered output. For typical recording-length plots the
+        rounding is sub-pixel; for very short windows the crop can
+        differ from the raster-resolution original by up to one bin
+        on each edge.
+        """
         if arr_len == raster_T:
             return start, end
         scale = arr_len / raster_T

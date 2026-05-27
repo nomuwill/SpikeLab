@@ -583,13 +583,17 @@ def _concatenate_recordings_with_state(
                 )
 
             # Warning: channel IDs differ
+            # stacklevel=3: skip _concatenate_recordings_with_state +
+            # skip its caller (concatenate_recordings or load_recording)
+            # so the warning is attributed to the user's call site, not
+            # the internal helper.
             ids_i = list(rec_i.get_channel_ids())
             if ids_i != ref_ids:
                 warnings.warn(
                     f"{name_i} has different channel IDs than {ref_name}. "
                     "Concatenation will proceed but results may be unreliable "
                     "if the electrode configurations differ.",
-                    stacklevel=2,
+                    stacklevel=3,
                 )
 
             # Warning: channel locations differ

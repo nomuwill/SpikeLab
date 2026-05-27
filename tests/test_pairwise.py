@@ -1614,42 +1614,42 @@ class TestPairwiseCompMatrixStackGetItem:
 
 
 # ---------------------------------------------------------------------------
-# PairwiseCompMatrix._is_diverging
+# PairwiseCompMatrix._should_use_diverging_cmap
 # ---------------------------------------------------------------------------
 
 
 class TestIsDiverging:
-    """Tests for PairwiseCompMatrix._is_diverging."""
+    """Tests for PairwiseCompMatrix._should_use_diverging_cmap."""
 
     def test_positive_only(self):
         """Non-negative matrix is not diverging."""
         mat = np.array([[1.0, 0.5], [0.5, 1.0]])
-        assert PairwiseCompMatrix._is_diverging(mat) is False
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is False
 
     def test_mixed_values(self):
         """Matrix with both negative and positive values is diverging."""
         mat = np.array([[1.0, -0.3], [-0.3, 1.0]])
-        assert PairwiseCompMatrix._is_diverging(mat) is True
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is True
 
     def test_all_negative(self):
         """All-negative matrix is not diverging."""
         mat = np.array([[-0.5, -0.2], [-0.2, -0.8]])
-        assert PairwiseCompMatrix._is_diverging(mat) is False
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is False
 
     def test_all_zero(self):
         """All-zero matrix is not diverging."""
         mat = np.zeros((3, 3))
-        assert PairwiseCompMatrix._is_diverging(mat) is False
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is False
 
     def test_all_nan(self):
         """All-NaN matrix is not diverging."""
         mat = np.full((3, 3), np.nan)
-        assert PairwiseCompMatrix._is_diverging(mat) is False
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is False
 
     def test_nan_with_mixed(self):
         """NaN entries are ignored; remaining values determine divergence."""
         mat = np.array([[np.nan, -0.5], [0.3, np.nan]])
-        assert PairwiseCompMatrix._is_diverging(mat) is True
+        assert PairwiseCompMatrix._should_use_diverging_cmap(mat) is True
 
 
 # ---------------------------------------------------------------------------

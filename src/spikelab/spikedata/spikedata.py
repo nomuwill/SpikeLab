@@ -2366,8 +2366,13 @@ class SpikeData:
 
         Parameters:
             n_shuffles (int): Number of shuffled datasets to generate.
-            seed (int or None): Base random seed. Each shuffle uses
-                ``seed + i`` for reproducibility. None means no seed.
+            seed (int or None): Base random seed. When set, the n
+                child seeds are derived via
+                ``np.random.SeedSequence(seed).spawn(n_shuffles)`` so
+                that each shuffle gets an entropy-mixed independent
+                stream — the same idiomatic pattern
+                ``_rank_order_correlation_from_timing`` uses. None
+                means no seed (shuffles non-reproducible).
             swap_per_spike (int): Forwarded to ``spike_shuffle``
                 (default: 5).
             bin_size (int): Forwarded to ``spike_shuffle`` (default: 1).
@@ -2375,18 +2380,38 @@ class SpikeData:
         Returns:
             stack (SpikeSliceStack): Stack of n_shuffles shuffled SpikeData
                 objects. All slices share the same time bounds.
+
+        Notes:
+            - Reproducibility: ``spike_shuffle_stack(seed=42)`` produces
+              identical output across calls. Different seeds produce
+              different outputs.
+            - Pre-Tier-L the child seeds were ``seed + i``. Switching
+              to ``SeedSequence.spawn`` produces a different (but
+              still deterministic) sequence per seed value — exact
+              shuffle values from analysis snapshots pinned to the
+              old ``seed + i`` mapping will not bit-exact match the
+              new output. Null-distribution properties (the use case)
+              are statistically unaffected.
         """
         if n_shuffles < 1:
             raise ValueError("n_shuffles must be at least 1.")
 
         from .spikeslicestack import SpikeSliceStack
 
+        if seed is None:
+            child_seeds: list = [None] * n_shuffles
+        else:
+            # SeedSequence.spawn produces ``n_shuffles`` independent
+            # child SeedSequence objects. ``np.random.default_rng``
+            # (called inside ``randomize``) accepts SeedSequence
+            # directly — no extra conversion needed.
+            child_seeds = list(np.random.SeedSequence(seed).spawn(n_shuffles))
+
         shuffled = []
-        for i in range(n_shuffles):
-            s = seed + i if seed is not None else None
+        for child in child_seeds:
             shuffled.append(
                 self.spike_shuffle(
-                    swap_per_spike=swap_per_spike, seed=s, bin_size=bin_size
+                    swap_per_spike=swap_per_spike, seed=child, bin_size=bin_size
                 )
             )
 

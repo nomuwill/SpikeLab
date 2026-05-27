@@ -959,7 +959,16 @@ class TestShellScriptDaemonThreadDrain:
         from spikelab.spike_sorting.ks2_runner import ShellScript
 
         # Use the current Python interpreter so the test is hermetic.
-        script = f'"{_sys.executable}" -c "import time; time.sleep(2); print(\'done\')"'
+        # On POSIX the script is written to a ``.sh`` file that the
+        # kernel reads via execve; without a shebang the kernel
+        # returns ENOEXEC ("Exec format error"). On Windows the
+        # script lands in a ``.bat`` file that cmd.exe interprets
+        # directly, so the shebang must be omitted.
+        cmd = f'"{_sys.executable}" -c "import time; time.sleep(2); print(\'done\')"'
+        if _sys.platform.startswith("win"):
+            script = cmd
+        else:
+            script = f"#!/bin/bash\n{cmd}"
         ss = ShellScript(script, log_path=str(tmp_path / "log"))
 
         t0 = time.monotonic()
@@ -989,7 +998,14 @@ class TestShellScriptDaemonThreadDrain:
         log_dir = tmp_path / "log_dir"
         log_dir.mkdir()
         log_base = log_dir / "ss"
-        script = f'"{_sys.executable}" -c "print(\'hello-from-subprocess\')"'
+        # POSIX needs a shebang on the generated ``.sh`` file; cmd.exe
+        # on Windows interprets the ``.bat`` without one (see the
+        # sibling test for the full rationale).
+        cmd = f'"{_sys.executable}" -c "print(\'hello-from-subprocess\')"'
+        if _sys.platform.startswith("win"):
+            script = cmd
+        else:
+            script = f"#!/bin/bash\n{cmd}"
         ss = ShellScript(script, log_path=str(log_base))
         ss.start()
         ss.wait()

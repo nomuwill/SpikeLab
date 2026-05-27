@@ -420,9 +420,7 @@ class TestSpikeSliceStackConstructor:
         sd = SpikeData([[250.0]], length=300.0)
         # No ValueError — spike at 250 fits sd.length=300, even though
         # 250 > 100 (the slice-tuple end).
-        stack = SpikeSliceStack(
-            spike_stack=[sd], times_start_to_end=[(0.0, 100.0)]
-        )
+        stack = SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 100.0)])
         assert len(stack.spike_stack) == 1
         np.testing.assert_array_equal(stack.spike_stack[0].train[0], [250.0])
 
@@ -1112,12 +1110,8 @@ class TestSubset:
             _warnings.simplefilter("always")
             sub = sss.subset(["ctx"], by="region", preserve_order=True)
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
-        assert any(
-            "preserve_order" in m and "by" in m for m in warn_msgs
-        ), warn_msgs
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
         # Two of the three test units have region="ctx".
         assert sub.N == 2
 

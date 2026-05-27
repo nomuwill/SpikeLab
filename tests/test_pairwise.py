@@ -2025,11 +2025,7 @@ class TestPairwiseCompMatrixNormalize:
         with _warnings.catch_warnings(record=True) as w:
             _warnings.simplefilter("always")
             result = _z_score_normalize(uniform)
-        warn_msgs = [
-            str(rec.message)
-            for rec in w
-            if rec.category is RuntimeWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is RuntimeWarning]
         assert any("std is zero" in m for m in warn_msgs), warn_msgs
         np.testing.assert_array_equal(result, np.zeros_like(uniform))
 
@@ -2038,14 +2034,8 @@ class TestPairwiseCompMatrixNormalize:
         with _warnings.catch_warnings(record=True) as w2:
             _warnings.simplefilter("always")
             _z_score_normalize(varied)
-        warn_msgs2 = [
-            str(rec.message)
-            for rec in w2
-            if rec.category is RuntimeWarning
-        ]
-        assert not any(
-            "std is zero" in m for m in warn_msgs2
-        ), warn_msgs2
+        warn_msgs2 = [str(rec.message) for rec in w2 if rec.category is RuntimeWarning]
+        assert not any("std is zero" in m for m in warn_msgs2), warn_msgs2
 
     def test_min_max_basic(self):
         """Global min-max normalization scales values to [0, 1].

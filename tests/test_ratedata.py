@@ -336,12 +336,8 @@ class TestRateDataSubset:
             _warnings.simplefilter("always")
             sub = rd.subset(["MO"], by="region", preserve_order=True)
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
-        assert any(
-            "preserve_order" in m and "by" in m for m in warn_msgs
-        ), warn_msgs
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
         assert sub.N == 2
 
     def test_subset_by_attribute(self):
@@ -935,7 +931,7 @@ class TestRateDataFramesULPBoundaryFrameCount:
         rd = make_ratedata(n_units=3, n_times=100, step=1.0)
         stack = rd.frames(20)
         assert len(stack.times) == 5
-        for (start, end) in stack.times:
+        for start, end in stack.times:
             assert end - start == pytest.approx(20.0)
 
 

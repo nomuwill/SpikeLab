@@ -933,9 +933,7 @@ class TestExtractUnitCount:
         class _NoNCandidate:
             pass
 
-        with caplog.at_level(
-            logging.DEBUG, logger="spikelab.spike_sorting.canary"
-        ):
+        with caplog.at_level(logging.DEBUG, logger="spikelab.spike_sorting.canary"):
             result = _extract_unit_count(_NoNCandidate())
 
         assert result is None

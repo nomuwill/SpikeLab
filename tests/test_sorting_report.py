@@ -401,9 +401,7 @@ class TestExtractUnitQualityStats:
             result = extract_unit_quality_stats(bad_path)
 
         assert result == {}
-        warning_records = [
-            r for r in caplog.records if r.levelno >= logging.WARNING
-        ]
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_records, "expected a WARNING-level log record"
         assert "extract_unit_quality_stats" in warning_records[0].getMessage()
 

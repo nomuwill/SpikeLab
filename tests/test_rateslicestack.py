@@ -795,9 +795,7 @@ class TestConvertToListOfRateData:
         mat = make_event_matrix(2, T, 3)
         times = [(0.0, 20.0), (30.0, 50.0), (60.0, 80.0)]
         step = 2.5
-        rss = RateSliceStack(
-            event_matrix=mat, times_start_to_end=times, step_size=step
-        )
+        rss = RateSliceStack(event_matrix=mat, times_start_to_end=times, step_size=step)
         rd_list = rss.convert_to_list_of_RateData()
         assert len(rd_list) == 3
         for rd, (start, _end) in zip(rd_list, times):
@@ -1176,12 +1174,8 @@ class TestSubset:
             _warnings.simplefilter("always")
             sub = rss.subset(["MO"], by="region", preserve_order=True)
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
-        assert any(
-            "preserve_order" in m and "by" in m for m in warn_msgs
-        ), warn_msgs
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
         # Matching units come back in source order.
         assert sub.event_stack.shape[0] == 2
 
@@ -2805,9 +2799,7 @@ class TestRateSliceStackStepSizeFromMedianDiff:
         """
         # Insert one 4 ms gap (between samples 1 and 2). The rest is
         # uniform 1 ms.
-        times = np.array(
-            [0.0, 1.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
-        )
+        times = np.array([0.0, 1.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
         rates = np.ones((4, len(times)), dtype=float)
         rd = RateData(rates, times)
         rss = RateSliceStack(

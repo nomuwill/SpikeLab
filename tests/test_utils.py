@@ -3305,18 +3305,12 @@ class TestValidateTimeStartToEnd:
 
         with _warnings.catch_warnings(record=True) as w:
             _warnings.simplefilter("always")
-            result = _validate_time_start_to_end(
-                [(100.0, 200.0), (50.0, 150.0)]
-            )
+            result = _validate_time_start_to_end([(100.0, 200.0), (50.0, 150.0)])
 
         assert result == [(50.0, 150.0), (100.0, 200.0)]
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [
-            m
-            for m in warn_msgs
-            if "parallel" in m.lower() and "misalign" in m.lower()
+            m for m in warn_msgs if "parallel" in m.lower() and "misalign" in m.lower()
         ]
         assert relevant, warn_msgs
 
@@ -3335,15 +3329,11 @@ class TestValidateTimeStartToEnd:
 
         with _warnings.catch_warnings(record=True) as w:
             _warnings.simplefilter("always")
-            result = _validate_time_start_to_end(
-                [(50.0, 150.0), (100.0, 200.0)]
-            )
+            result = _validate_time_start_to_end([(50.0, 150.0), (100.0, 200.0)])
 
         assert result == [(50.0, 150.0), (100.0, 200.0)]
         warn_msgs = [str(rec.message) for rec in w]
-        assert not any(
-            "misalign" in m.lower() for m in warn_msgs
-        ), warn_msgs
+        assert not any("misalign" in m.lower() for m in warn_msgs), warn_msgs
 
     def test_all_negative_start_preserved(self):
         """
@@ -4759,7 +4749,6 @@ class TestComputeCrossCorrelationWithLagAllNaN:
         b = np.full(50, np.nan, dtype=float)
         score, _lag = compute_cross_correlation_with_lag(a, b, max_lag=10)
         assert np.isnan(score)
-
 
 
 class TestUtilsResampledIsiEmptyTimes:

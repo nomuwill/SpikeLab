@@ -8026,9 +8026,7 @@ class TestValidateRecordingInputsEdges:
         assert findings[0].level == "fail"
         assert findings[0].code == "recording_input_none"
 
-    def test_none_in_middle_of_list_records_finding_and_continues_loop(
-        self, tmp_path
-    ):
+    def test_none_in_middle_of_list_records_finding_and_continues_loop(self, tmp_path):
         """
         ``_validate_recording_inputs`` accumulates findings across the
         entire input list — a ``None`` in the middle produces one
@@ -9826,9 +9824,7 @@ class TestCheckDockerSorterDockerPyPath:
         assert result is True
         assert captured_kwargs.get("timeout") == 5
 
-    def test_check_image_cached_old_docker_py_without_timeout_kwarg(
-        self, monkeypatch
-    ):
+    def test_check_image_cached_old_docker_py_without_timeout_kwarg(self, monkeypatch):
         """
         Older docker-py versions raise ``TypeError`` when
         ``from_env(timeout=5)`` is called. The function catches the
@@ -9842,9 +9838,7 @@ class TestCheckDockerSorterDockerPyPath:
         from spikelab.spike_sorting.guards._preflight import _check_image_cached
 
         def old_from_env(**kwargs):
-            raise TypeError(
-                "from_env() got an unexpected keyword argument 'timeout'"
-            )
+            raise TypeError("from_env() got an unexpected keyword argument 'timeout'")
 
         fake_docker = SimpleNamespace(from_env=old_from_env)
         monkeypatch.setitem(sys.modules, "docker", fake_docker)

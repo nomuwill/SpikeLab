@@ -358,11 +358,18 @@ async def compute_latencies(
     times: List[float],
     window_ms: float = 100.0,
 ) -> Dict[str, Any]:
-    """Compute spike latencies relative to event times and store NaN-padded array to workspace."""
+    """Compute spike latencies relative to event times and store the (U, T) array to workspace.
+
+    Tier L-F1: ``SpikeData.latencies`` now returns a NaN-padded
+    ``(N_units, len(times))`` ndarray directly. The previous
+    ``_pad_ragged`` call became redundant — the shape comes out of
+    ``latencies`` ready to store. ``arr[u, i]`` is the signed latency
+    from ``times[i]`` to the nearest spike in unit ``u``, or NaN if
+    that spike is more than ``window_ms`` away.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    latencies = sd.latencies(times, window_ms=window_ms)
-    arr = _pad_ragged(latencies)
+    arr = sd.latencies(times, window_ms=window_ms)
     ws.store(namespace, key, arr)
     return {
         "workspace_id": workspace_id,
@@ -370,7 +377,7 @@ async def compute_latencies(
         "key": key,
         "window_ms": window_ms,
         "info": ws.get_info(namespace, key),
-        "note": "NaN-padded (U, max_latency_count) array; rows = units",
+        "note": "NaN-padded (U, len(times)) array; rows = units, columns = query times",
     }
 
 
@@ -381,11 +388,16 @@ async def compute_latencies_to_index(
     neuron_index: int,
     window_ms: float = 100.0,
 ) -> Dict[str, Any]:
-    """Compute spike latencies relative to a reference neuron and store to workspace."""
+    """Compute spike latencies relative to a reference neuron and store to workspace.
+
+    Tier L-F1: ``latencies_to_index`` delegates to
+    ``SpikeData.latencies`` which now returns a NaN-padded
+    ``(N_units, len(train_i))`` ndarray directly. The
+    ``_pad_ragged`` call is no longer needed.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    latencies = sd.latencies_to_index(neuron_index, window_ms=window_ms)
-    arr = _pad_ragged(latencies)
+    arr = sd.latencies_to_index(neuron_index, window_ms=window_ms)
     ws.store(namespace, key, arr)
     return {
         "workspace_id": workspace_id,

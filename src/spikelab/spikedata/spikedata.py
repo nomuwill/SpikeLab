@@ -2010,39 +2010,72 @@ class SpikeData:
         )
 
     def latencies(self, times, window_ms=100.0):
-        """Compute latencies from each time to the nearest spike per unit.
+        """Compute latencies from each query time to the nearest spike per unit.
+
+        Tier L-F1: rewrote from the previous O(N_units * N_times *
+        N_train) inner loop (per-iteration ``np.argmin(np.abs(train -
+        time))`` + redundant ``np.array(train)`` allocation) to a
+        ``np.searchsorted``-based vectorisation that is
+        O(N_units * (N_times + N_train * log N_train)) — orders of
+        magnitude faster on long trains. The return shape also
+        changed: a NaN-padded ``(U, len(times))`` ndarray instead
+        of the previous nested ``list[list[float]]``. The new shape
+        is information-preserving — ``arr[u, i]`` is the signed
+        latency from ``times[i]`` to the nearest spike in unit ``u``,
+        or ``NaN`` if that nearest spike is more than ``window_ms``
+        away. The previous nested-list shape silently dropped the
+        time-index correspondence (collapsing out-of-window entries
+        produced ``[lat_t2, lat_t3]`` with no way to tell which
+        query times those corresponded to).
 
         Parameters:
-            times (list): List of times.
-            window_ms (float): Window in milliseconds (default: 100.0).
+            times (array-like): Query times in milliseconds.
+            window_ms (float): Latency window in milliseconds; entries
+                whose nearest-spike distance exceeds the window are
+                returned as ``NaN`` (default: 100.0).
 
         Returns:
-            latencies (list): 2D list, each row is a list of latencies from
-                a time to the nearest spike in the train.
+            latencies (np.ndarray): Shape ``(N_units, len(times))``
+                ndarray of signed latencies (``spike_time - query_time``)
+                or NaN for out-of-window entries. Empty ``times`` →
+                returns an ``(N_units, 0)`` array.
         """
-        latencies = []
-        if len(times) == 0:
-            return latencies
+        times_arr = np.asarray(times, dtype=float)
+        n_times = times_arr.size
+        out = np.full((self.N, n_times), np.nan, dtype=float)
+        if n_times == 0:
+            return out
 
-        for train in self.train:
-            cur_latencies = []
-            if len(train) == 0:
-                latencies.append(cur_latencies)
-                continue
-            for time in times:
-                # Subtract time from all spikes in the train
-                # and take the absolute value
-                abs_diff_ind = np.argmin(np.abs(train - time))
+        for u, train in enumerate(self.train):
+            train_arr = np.asarray(train, dtype=float)
+            if train_arr.size == 0:
+                continue  # row stays all-NaN
 
-                # Calculate the actual latency
-                latency = np.array(train) - time
-                latency = latency[abs_diff_ind]
+            if train_arr.size == 1:
+                # Single-spike train: no nearest-vs-predecessor choice.
+                latencies = train_arr[0] - times_arr
+            else:
+                # ``searchsorted`` returns the insertion index per
+                # query time. The nearest spike is either the spike
+                # AT that index (just-after) or the one just before.
+                # Clip the index to ``[1, len(train) - 1]`` so both
+                # candidates always exist; the comparison below picks
+                # the closer.
+                idx = np.searchsorted(train_arr, times_arr)
+                idx = np.clip(idx, 1, train_arr.size - 1)
+                left = train_arr[idx - 1] - times_arr
+                right = train_arr[idx] - times_arr
+                # Pick whichever spike is closer in absolute distance
+                # to the query time. Ties go to the predecessor (left)
+                # — matches the previous ``argmin`` behaviour, which
+                # also returned the first equal index.
+                use_right = np.abs(right) < np.abs(left)
+                latencies = np.where(use_right, right, left)
 
-                abs_diff = np.abs(latency)
-                if abs_diff <= window_ms:
-                    cur_latencies.append(latency)
-            latencies.append(cur_latencies)
-        return latencies
+            # NaN out entries outside the window.
+            in_window = np.abs(latencies) <= window_ms
+            out[u, in_window] = latencies[in_window]
+        return out
 
     def get_pairwise_latencies(self, window_ms=None, return_distributions=False):
         """Compute pairwise nearest-spike latency distributions between all unit pairs.

@@ -1194,9 +1194,7 @@ class TestSpikeDataSlicing:
             _warnings.simplefilter("always")
             sd.subset([0], by="unitid")
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "subset" in m]
         assert relevant, warn_msgs
         assert "unitid" in relevant[0]
@@ -1232,12 +1230,8 @@ class TestSpikeDataSlicing:
             _warnings.simplefilter("always")
             sub = sd.subset(units=["MO"], by="region", preserve_order=True)
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
-        relevant = [
-            m for m in warn_msgs if "preserve_order" in m and "by" in m
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "preserve_order" in m and "by" in m]
         assert relevant, warn_msgs
         # Matching units come back in self.train order (0, 2).
         assert sub.N == 2
@@ -2240,15 +2234,18 @@ class TestSpikeDataRates:
         a = SpikeData([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
         b = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) - 0.2
         # Make sure the latencies are correct, this is latencies relative
-        # to the input (b), so should all be .2 after
-        assert a.latencies(b)[0][0] == pytest.approx(0.2)
-        assert a.latencies(b)[0][-1] == pytest.approx(0.2)
+        # to the input (b), so should all be .2 after. Tier L-F1: the
+        # return type is now a NaN-padded (N_units, len(times)) ndarray;
+        # ``arr[u, i]`` is the signed latency from times[i] to the
+        # nearest spike in unit u, or NaN if outside window_ms.
+        assert a.latencies(b)[0, 0] == pytest.approx(0.2)
+        assert a.latencies(b)[0, -1] == pytest.approx(0.2)
 
-        # Small enough window, should be no latencies.
-        assert a.latencies(b, 0.1)[0] == []
+        # Small enough window, all entries fall outside → all NaN.
+        assert np.all(np.isnan(a.latencies(b, 0.1)[0]))
 
         # Can do negative
-        assert a.latencies([0.1])[0][0] == pytest.approx(-0.1)
+        assert a.latencies([0.1])[0, 0] == pytest.approx(-0.1)
 
     # --- resampled_isi return type and shape tests ---
 
@@ -3095,16 +3092,17 @@ class TestSpikeDataCorrelation:
         """
         a = SpikeData([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
         b = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) - 0.2
-        # Make sure the latencies are correct, this is latencies relative
-        # to the input (b), so should all be .2 after
-        assert a.latencies(b)[0][0] == pytest.approx(0.2)
-        assert a.latencies(b)[0][-1] == pytest.approx(0.2)
+        # Tier L-F1: latencies now returns a NaN-padded (U, len(times))
+        # ndarray. ``arr[u, i]`` is the signed latency from times[i] to
+        # the nearest spike in unit u, or NaN if outside window_ms.
+        assert a.latencies(b)[0, 0] == pytest.approx(0.2)
+        assert a.latencies(b)[0, -1] == pytest.approx(0.2)
 
-        # Small enough window, should be no latencies.
-        assert a.latencies(b, 0.1)[0] == []
+        # Small enough window → every entry exceeds it → all NaN.
+        assert np.all(np.isnan(a.latencies(b, 0.1)[0]))
 
         # Can do negative
-        assert a.latencies([0.1])[0][0] == pytest.approx(-0.1)
+        assert a.latencies([0.1])[0, 0] == pytest.approx(-0.1)
 
     def test_latencies_to_index(self):
         """
@@ -3121,9 +3119,12 @@ class TestSpikeDataCorrelation:
         lat_to_idx = sd.latencies_to_index(0, window_ms=10.0)
         lat_direct = sd.latencies(sd.train[0], window_ms=10.0)
 
-        assert len(lat_to_idx) == len(lat_direct)
-        for a, b in zip(lat_to_idx, lat_direct):
-            assert len(a) == len(b)
+        # Tier L-F1: both are now (U, len(train_i)) ndarrays.
+        assert lat_to_idx.shape == lat_direct.shape
+        np.testing.assert_array_equal(np.isnan(lat_to_idx), np.isnan(lat_direct))
+        # Numeric values match where both are non-NaN
+        mask = ~np.isnan(lat_to_idx)
+        np.testing.assert_array_almost_equal(lat_to_idx[mask], lat_direct[mask])
 
     def test_sttc_both_trains_empty(self):
         """
@@ -3178,12 +3179,16 @@ class TestSpikeDataCorrelation:
         """
         latencies with an empty times array.
 
+        Tier L-F1: empty input returns a (N_units, 0) ndarray
+        instead of an empty Python list. The shape is still
+        information-preserving — caller knows N_units up front.
+
         Tests:
-        (Test Case 1) Passing an empty list returns an empty list immediately.
+        (Test Case 1) Passing an empty list returns shape (N_units, 0).
         """
         sd = SpikeData([[1.0, 2.0, 3.0]], length=10.0)
         result = sd.latencies([])
-        assert result == []
+        assert result.shape == (1, 0)
 
     def test_latencies_spike_at_exactly_query_time(self):
         """
@@ -8342,15 +8347,16 @@ class TestSpikeDataLatenciesBoundary:
     def test_latencies_with_nan_time_silently_returns_empty(self):
         """
         latencies with a NaN query time: abs(NaN) <= window_ms is False so
-        no latency is recorded (silent empty list per unit).
+        no latency is recorded (NaN per unit in the (U, T) ndarray).
 
         Tests:
-            (Test Case 1) Query times = [NaN] returns one empty latency
-                list per unit, with no error.
+            (Test Case 1) Query times = [NaN] returns NaN-padded (1, 1)
+                array, with no error.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([float("nan")], window_ms=100.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
     def test_latencies_with_negative_window_returns_empty_per_unit(self):
         """
@@ -8358,11 +8364,12 @@ class TestSpikeDataLatenciesBoundary:
         is False for any non-negative abs_diff against a negative bound).
 
         Tests:
-            (Test Case 1) window_ms=-1 yields one empty latency list per unit.
+            (Test Case 1) window_ms=-1 yields NaN-padded (1, 1) array.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([5.0], window_ms=-1.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
     def test_latencies_with_window_zero_keeps_only_exact_matches(self):
         """
@@ -8371,15 +8378,17 @@ class TestSpikeDataLatenciesBoundary:
 
         Tests:
             (Test Case 1) Query time matches a spike: latency 0.0 is kept.
-            (Test Case 2) Query time off-spike: no latency is kept.
+            (Test Case 2) Query time off-spike: NaN is kept.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         # Exact match at 5.0 → latency 0.0 retained.
         result_exact = sd.latencies([5.0], window_ms=0.0)
-        assert result_exact == [[0.0]]
-        # Off-spike at 5.5 → empty.
+        assert result_exact.shape == (1, 1)
+        assert result_exact[0, 0] == 0.0
+        # Off-spike at 5.5 → NaN.
         result_off = sd.latencies([5.5], window_ms=0.0)
-        assert result_off == [[]]
+        assert result_off.shape == (1, 1)
+        assert np.all(np.isnan(result_off))
 
 
 class TestSpikeDataSubsetEdgeCases:
@@ -8518,7 +8527,7 @@ class TestSpikeDataFramesULPBoundaryFrameCount:
         assert len(stack.times) == 10
         # Every frame's end is at most start + length and never past
         # the recording end.
-        for (start, end) in stack.times:
+        for start, end in stack.times:
             assert end - start == pytest.approx(10.0)
             assert end <= sd.start_time + sd.length + 1e-9
 
@@ -9009,27 +9018,26 @@ class TestCompareSorterNeighborChannelsValidation:
 
 
 class TestSpikeDataLatenciesInfTimes:
-    """``SpikeData.latencies(times=[np.inf])``: the argmin over
-    ``abs(train - inf)`` is well defined (all entries are inf, argmin
-    returns 0), but the candidate latency itself is +/-inf which
-    fails the ``abs_diff <= window_ms`` guard. Pin the silent-empty
-    behavior so a regression that surfaced the NaN/inf later in the
-    pipeline would be caught here."""
+    """``SpikeData.latencies(times=[np.inf])``: the candidate latency
+    is +/-inf which fails the ``abs_latency <= window_ms`` guard, so
+    the corresponding cell in the (U, T) NaN-padded ndarray remains
+    NaN. Pin the silent-NaN behavior so a regression that surfaced
+    the NaN/inf later in the pipeline would be caught here."""
 
     def test_latencies_inf_query_time_returns_empty_per_unit(self):
         """
-        Query time +inf produces argmin=0 (all distances are inf) and
-        a latency of -inf, which is rejected by the window check
-        (``abs_diff <= window_ms`` is False for inf), so each unit
-        gets an empty list.
+        Query time +inf produces a latency of -inf, which is rejected
+        by the window check (``abs(latency) <= window_ms`` is False
+        for inf), so each unit's slot is NaN.
 
         Tests:
-            (Test Case 1) ``times=[np.inf]`` returns ``[[]]`` for a
-                single non-empty train (no error raised).
+            (Test Case 1) ``times=[np.inf]`` returns a (1, 1) NaN
+                ndarray for a single non-empty train (no error raised).
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([np.inf], window_ms=100.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
 
 class TestSpikeDataSpikeTimeTilingsNEquals1:
@@ -10534,9 +10542,7 @@ class TestSpikeDataFromThresholdingDirectionBranches:
                 filter=False,
                 hysteresis=False,
             )
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "zero spikes detected" in m]
         assert relevant, warn_msgs
         assert "5.0" in relevant[0] or "5" in relevant[0]

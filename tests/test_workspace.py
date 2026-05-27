@@ -1938,15 +1938,92 @@ class TestHDF5IO:
         """
         Tests that a numpy array stored in SpikeData metadata survives an HDF5 round-trip.
 
+        Tier L-F3: the metadata JSON encoder now records ndarrays as
+        sentinel dicts so the load path can rebuild them with the
+        original dtype and shape. Previously this round-tripped to a
+        Python list, breaking downstream ``metadata[...] / scalar``
+        arithmetic.
+
         Tests:
             (Test Case 1) Save does not raise despite the numpy array value.
-            (Test Case 2) The metadata value is recovered as a Python list with equal elements.
+            (Test Case 2) The metadata value is recovered as an ndarray
+                with the original values, dtype, and shape — *not* a
+                Python list.
         """
         arr = np.array([1.0, 2.0, 3.0])
         sd = SpikeData([[1.0, 2.0], [3.0]], length=20.0, metadata={"positions": arr})
         out = self._roundtrip(sd)
         assert "positions" in out.metadata
-        assert out.metadata["positions"] == [1.0, 2.0, 3.0]
+        assert isinstance(out.metadata["positions"], np.ndarray)
+        assert out.metadata["positions"].dtype == arr.dtype
+        assert out.metadata["positions"].shape == arr.shape
+        np.testing.assert_array_equal(out.metadata["positions"], arr)
+        # Downstream arithmetic that broke under the old list-typed
+        # round-trip must now succeed.
+        _ = out.metadata["positions"] / 1000.0
+
+    def test_roundtrip_metadata_ndarray_preserves_dtype_and_shape(self):
+        """
+        Tier L-F3: ndarrays in metadata preserve dtype and shape through
+        the HDF5 round-trip, including non-default dtypes (int32, etc.)
+        and 2-D arrays. Also covers nesting inside a dict.
+
+        Tests:
+            (Test Case 1) int32 1-D array round-trips as int32 ndarray.
+            (Test Case 2) float32 2-D array round-trips with correct
+                shape, dtype, and values.
+            (Test Case 3) Ndarray nested inside a sub-dict in metadata
+                is also restored to ndarray.
+        """
+        int_arr = np.array([10, 20, 30], dtype=np.int32)
+        mat = np.array([[1.5, 2.5], [3.5, 4.5], [5.5, 6.5]], dtype=np.float32)
+        nested = {"inner": {"timeseries": np.arange(5, dtype=np.float64)}}
+        sd = SpikeData(
+            [[1.0, 2.0]],
+            length=10.0,
+            metadata={
+                "cluster_ids": int_arr,
+                "waveform_matrix": mat,
+                "trials": nested,
+            },
+        )
+        out = self._roundtrip(sd)
+
+        # Test Case 1: int32 preserved.
+        assert isinstance(out.metadata["cluster_ids"], np.ndarray)
+        assert out.metadata["cluster_ids"].dtype == np.int32
+        np.testing.assert_array_equal(out.metadata["cluster_ids"], int_arr)
+
+        # Test Case 2: float32 2-D preserved.
+        assert isinstance(out.metadata["waveform_matrix"], np.ndarray)
+        assert out.metadata["waveform_matrix"].dtype == np.float32
+        assert out.metadata["waveform_matrix"].shape == (3, 2)
+        np.testing.assert_array_equal(out.metadata["waveform_matrix"], mat)
+
+        # Test Case 3: nested ndarray preserved.
+        inner = out.metadata["trials"]["inner"]["timeseries"]
+        assert isinstance(inner, np.ndarray)
+        assert inner.dtype == np.float64
+        np.testing.assert_array_equal(inner, np.arange(5, dtype=np.float64))
+
+    def test_roundtrip_metadata_empty_ndarray(self):
+        """
+        Tier L-F3: empty ndarrays (shape (0,)) round-trip as empty
+        ndarrays, not empty lists. An empty IBL trial-times array is a
+        valid edge case (recording with zero trials of a particular
+        event type).
+
+        Tests:
+            (Test Case 1) Empty float64 array round-trips with shape
+                (0,) and dtype float64.
+        """
+        empty = np.array([], dtype=np.float64)
+        sd = SpikeData([[1.0]], length=10.0, metadata={"stim_off_times": empty})
+        out = self._roundtrip(sd)
+        recovered = out.metadata["stim_off_times"]
+        assert isinstance(recovered, np.ndarray)
+        assert recovered.shape == (0,)
+        assert recovered.dtype == np.float64
 
     def test_roundtrip_metadata_numpy_scalars(self):
         """
@@ -2807,23 +2884,34 @@ class TestHDF5IO:
         """
         Metadata containing nested dicts with numpy arrays inside.
 
+        Tier L-F3: ndarrays nested inside metadata sub-dicts are
+        restored as ndarrays (with dtype/shape preserved) rather than
+        silently degraded to Python lists.
+
         Tests:
             (Test Case 1) Save does not raise.
-            (Test Case 2) Nested numpy array is recovered as a Python list.
+            (Test Case 2) Nested numpy array is recovered as an
+                ndarray with the original values.
+            (Test Case 3) Nested numpy scalar is recovered as a
+                Python float (scalar encoder unchanged).
+            (Test Case 4) Sibling primitive (string) is preserved.
         """
+        arr = np.array([10.0, 20.0, 30.0])
         sd = SpikeData(
             [[1.0, 2.0]],
             length=10.0,
             metadata={
                 "outer": {
-                    "inner_arr": np.array([10.0, 20.0, 30.0]),
+                    "inner_arr": arr,
                     "inner_scalar": np.float64(99.0),
                 },
                 "top_level": "hello",
             },
         )
         out = self._roundtrip(sd)
-        assert out.metadata["outer"]["inner_arr"] == [10.0, 20.0, 30.0]
+        recovered = out.metadata["outer"]["inner_arr"]
+        assert isinstance(recovered, np.ndarray)
+        np.testing.assert_array_equal(recovered, arr)
         assert out.metadata["outer"]["inner_scalar"] == pytest.approx(99.0)
         assert out.metadata["top_level"] == "hello"
 
@@ -4818,9 +4906,7 @@ class TestLoadWorkspaceFullBytesNameDecode:
 
         with h5py.File(base + ".h5", "a") as f:
             del f.attrs["__workspace_name__"]
-            f.attrs.create(
-                "__workspace_name__", b"hello-bytes", dtype="S100"
-            )
+            f.attrs.create("__workspace_name__", b"hello-bytes", dtype="S100")
 
         loaded = load_workspace_full(base)
         assert loaded.name == "hello-bytes"
@@ -4860,17 +4946,13 @@ class TestWorkspaceManagerLoadWorkspaceDoubleLoadWarning:
         with _warnings.catch_warnings(record=True) as w1:
             _warnings.simplefilter("always")
             manager.load_workspace(base)
-        assert not any(
-            "already registered" in str(rec.message) for rec in w1
-        )
+        assert not any("already registered" in str(rec.message) for rec in w1)
 
         # Second load warns about the overwrite.
         with _warnings.catch_warnings(record=True) as w2:
             _warnings.simplefilter("always")
             manager.load_workspace(base)
-        warn_msgs = [
-            str(rec.message) for rec in w2 if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w2 if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "already registered" in m]
         assert relevant, warn_msgs
         assert ws_id in relevant[0]
@@ -5831,10 +5913,14 @@ class TestNumpyEncoder:
             (Test Case 2) ``np.float32`` becomes a JSON float.
             (Test Case 3) ``np.bool_(True)`` becomes ``true``.
             (Test Case 4) ``np.str_`` becomes a JSON string.
-            (Test Case 5) An ``np.ndarray`` becomes a JSON list.
+            (Test Case 5) Tier L-F3: an ``np.ndarray`` becomes a
+                sentinel dict (``__ndarray__: True`` with dtype, shape,
+                values) so the load path can rebuild it; passing the
+                decoded payload through ``_restore_ndarrays`` recovers
+                the original ndarray.
         """
         import json
-        from spikelab.workspace.hdf5_io import _NumpyEncoder
+        from spikelab.workspace.hdf5_io import _NumpyEncoder, _restore_ndarrays
 
         payload = {
             "i": np.int64(7),
@@ -5849,7 +5935,13 @@ class TestNumpyEncoder:
         assert decoded["f"] == pytest.approx(2.5)
         assert decoded["b"] is True
         assert decoded["s"] == "hello"
-        assert decoded["a"] == [1, 2, 3]
+        # Raw JSON now carries the ndarray sentinel; the load path
+        # restores the original ndarray with its dtype preserved.
+        assert decoded["a"]["__ndarray__"] is True
+        assert decoded["a"]["values"] == [1, 2, 3]
+        restored = _restore_ndarrays(decoded)
+        assert isinstance(restored["a"], np.ndarray)
+        np.testing.assert_array_equal(restored["a"], np.array([1, 2, 3]))
 
     def test_unsupported_type_raises_type_error(self):
         """

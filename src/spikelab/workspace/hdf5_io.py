@@ -35,14 +35,30 @@ import numpy as np
 
 import h5py
 
+_NDARRAY_SENTINEL = "__ndarray__"
+
 
 class _NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that converts numpy arrays and scalar types to Python primitives."""
+    """JSON encoder that converts numpy arrays and scalar types to Python primitives.
+
+    Tier L-F3: ndarrays are wrapped in a sentinel dict (``{"__ndarray__":
+    True, "dtype": ..., "shape": ..., "values": ...}``) so the load path
+    can rebuild the original ndarray with its dtype and shape preserved.
+    The previous behaviour — ``ndarray.tolist()`` — silently degraded
+    every ndarray-valued metadata entry to a Python list, breaking
+    downstream code that did e.g. ``metadata["trial_start_times"] /
+    1000`` because list/scalar is a TypeError.
+    """
 
     def default(self, obj):  # noqa: D102
         """Convert numpy types to JSON-serializable Python primitives."""
         if isinstance(obj, np.ndarray):
-            return obj.tolist()
+            return {
+                _NDARRAY_SENTINEL: True,
+                "dtype": str(obj.dtype),
+                "shape": list(obj.shape),
+                "values": obj.tolist(),
+            }
         if isinstance(obj, np.integer):
             return int(obj)
         if isinstance(obj, np.floating):
@@ -52,6 +68,32 @@ class _NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.str_):
             return str(obj)
         return super().default(obj)
+
+
+def _restore_ndarrays(obj):
+    """Recursively reconstitute ndarrays from ``_NumpyEncoder`` sentinels.
+
+    Walks dicts and lists. A dict carrying ``__ndarray__: True`` is
+    rebuilt via ``np.asarray(values, dtype=dtype).reshape(shape)``;
+    every other value is passed through unchanged. Legacy files
+    (encoded before this change) contain plain lists with no sentinel
+    and therefore round-trip as lists — matching the pre-L-F3
+    behaviour for files on disk that pre-date the upgrade.
+    """
+    if isinstance(obj, dict):
+        if obj.get(_NDARRAY_SENTINEL) is True:
+            values = obj["values"]
+            dtype = obj["dtype"]
+            shape = obj["shape"]
+            arr = np.asarray(values, dtype=dtype)
+            # ``np.asarray`` already gives the right shape for non-empty
+            # nested lists; ``reshape`` is needed for the empty / 0-D
+            # cases where ``values`` is ``[]`` or a bare scalar.
+            return arr.reshape(shape)
+        return {k: _restore_ndarrays(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_restore_ndarrays(v) for v in obj]
+    return obj
 
 
 # ===========================================================================
@@ -123,13 +165,35 @@ def load_workspace_full(path: str):
                 "workspace (missing __workspace_id__ attribute)."
             )
         ws = AnalysisWorkspace.__new__(AnalysisWorkspace)
-        ws.workspace_id = str(f.attrs["__workspace_id__"])
-        name = str(f.attrs["__workspace_name__"])
+        # ``str(bytes_obj)`` returns the literal ``"b'foo'"`` repr —
+        # decode explicitly so a workspace written under h5py's
+        # variable-length-bytes mode does not silently corrupt the
+        # ``workspace_id`` / ``name`` attrs on reload.
+        wid_attr = f.attrs["__workspace_id__"]
+        ws.workspace_id = (
+            wid_attr.decode("utf-8") if isinstance(wid_attr, bytes) else str(wid_attr)
+        )
+        name_attr = f.attrs["__workspace_name__"]
+        name = (
+            name_attr.decode("utf-8")
+            if isinstance(name_attr, bytes)
+            else str(name_attr)
+        )
         ws.name = name if name else None
         ws.created_at = float(f.attrs["__created_at__"])
         ws._items = {}
         ws._index = {}
         for ns in f.keys():
+            # Skip any top-level group whose name starts with ``__``.
+            # This mirrors the ``__workspace_id__`` / ``__workspace_name__``
+            # / ``__created_at__`` attribute convention and reserves
+            # the namespace for future metadata sub-groups (e.g. a
+            # ``/__history__/`` audit log). Without this filter, the
+            # loader would treat such a group as a user namespace and
+            # ``_load_item`` would fail on its first child (missing
+            # ``__type__`` attr).
+            if ns.startswith("__"):
+                continue
             ns_grp = f[ns]
             ws._items[ns] = {}
             ws._index[ns] = {}
@@ -449,7 +513,12 @@ def _dump_dict(grp, d: dict, created_at: float) -> None:
         stored as ``ndarray`` with ``__type__ = "set"`` /
         ``"frozenset"``. Round-trips as ``set`` / ``frozenset`` (type
         preserved, order not). Elements must be orderable and
-        homogeneous.
+        homogeneous. **Lossy for mixed-numeric content**: a set such
+        as ``{1, 2.5}`` widens to a float ndarray (``[1.0, 2.5]``)
+        and reloads as a set of floats (``{1.0, 2.5}``) — the
+        original ``int`` element is lost. Pure-int and pure-float
+        sets round-trip with dtype preserved; only the
+        int/float-mixed case widens.
       - ``dict``: recursively serialised via this function.
       - ``ndarray``, ``SpikeData``, ``RateData``, slice stacks,
         pairwise matrices, and pairwise stacks: routed through
@@ -948,10 +1017,14 @@ def _load_metadata_json(grp) -> dict:
         grp: Open h5py Group to read from.
 
     Returns:
-        metadata (dict): Reconstructed metadata, or empty dict if not present.
+        metadata (dict): Reconstructed metadata, or empty dict if not
+            present. Ndarray-valued entries written by the Tier L-F3
+            sentinel-encoded path are restored with their original
+            dtype and shape; legacy entries written before that change
+            still load as plain Python lists.
     """
     raw = grp.attrs.get("__metadata__", "{}")
-    return json.loads(raw)
+    return _restore_ndarrays(json.loads(raw))
 
 
 # ===========================================================================

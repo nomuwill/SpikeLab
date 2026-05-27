@@ -279,8 +279,8 @@ class WaveformExtractor:
         # (zeros on read) so the worker-side semantics are
         # unchanged: positions never written by any worker still
         # return zero, just as with the explicit ``np.zeros`` fill.
-        print("Preparing memory maps for waveforms")
-        wfs_memmap = {}
+        _logger.info("Preparing memory maps for waveforms")
+        wfs_memmap_files = {}
         for unit_id in self.sorting.unit_ids:
             file_path = self.root_folder / "waveforms" / f"waveforms_{unit_id}.npy"
             n_spikes = int(np.sum([e.size for e in selected_spike_times[unit_id]]))
@@ -293,10 +293,10 @@ class WaveformExtractor:
             )
             # Release the parent's mmap immediately so we don't hold
             # 200+ open file handles concurrently while still
-            # populating ``wfs_memmap``. Workers reopen the file via
+            # populating ``wfs_memmap_files``. Workers reopen the file via
             # ``np.load(..., mmap_mode="r+")`` when they need it.
             del mm
-            wfs_memmap[unit_id] = file_path
+            wfs_memmap_files[unit_id] = file_path
 
         # Run extract waveforms
         func = WaveformExtractor._waveform_extractor_chunk
@@ -306,7 +306,7 @@ class WaveformExtractor:
             self.recording,
             self.sorting,
             self,
-            wfs_memmap,
+            wfs_memmap_files,
             selected_spikes,
             selected_spike_times,
             self.nbefore,
@@ -404,7 +404,7 @@ class WaveformExtractor:
             if self.max_waveforms_per_unit is not None
             else 0
         )
-        print(
+        _logger.info(
             f"[streaming] Extracting waveforms + templates for {len(unit_ids)} "
             f"units (peak RAM per unit ~"
             f"{max_wf * self.nsamples * num_chans * 4 / 1024 / 1024:.0f} MB)"
@@ -513,12 +513,12 @@ class WaveformExtractor:
         Dictionary of {unit_id, [selected_spike_times]}
         """
 
-        print("Sampling spikes for each unit")
+        _logger.info("Sampling spikes for each unit")
         selected_spikes = self.select_random_spikes_uniformly()
 
         # Store in 2 columns (spike_index, segment_index) in a .npy file
         # NOT NECESSARY BUT COULD BE USEFUL FOR DEBUGGING
-        print("Saving sampled spikes in .npy format")
+        _logger.info("Saving sampled spikes in .npy format")
         for unit_id in self.sorting.unit_ids:
             n = np.sum([e.size for e in selected_spikes[unit_id]])
             sampled_index = np.zeros(
@@ -724,7 +724,7 @@ class WaveformExtractor:
         recording,
         sorting,
         waveform_extractor,
-        wfs_memmap,
+        wfs_memmap_files,
         selected_spikes,
         selected_spike_times,
         nbefore,
@@ -737,7 +737,7 @@ class WaveformExtractor:
         worker_ctx["sorting"] = sorting
         worker_ctx["waveform_extractor"] = waveform_extractor
 
-        worker_ctx["wfs_memmap_files"] = wfs_memmap
+        worker_ctx["wfs_memmap_files"] = wfs_memmap_files
         worker_ctx["selected_spikes"] = selected_spikes
         worker_ctx["selected_spike_times"] = selected_spike_times
         worker_ctx["nbefore"] = nbefore
@@ -902,7 +902,7 @@ class WaveformExtractor:
             which speeds up I/O-bound waveform loading from disk.
         """
         print_stage("COMPUTING TEMPLATES")
-        print("Template modes: " + ", ".join(modes))
+        _logger.info("Template modes: " + ", ".join(modes))
         stopwatch = Stopwatch()
 
         if unit_ids is None:
@@ -937,7 +937,7 @@ class WaveformExtractor:
 
         n_units = len(unit_ids)
         n_workers = min(n_jobs, n_units) if n_jobs > 1 else 1
-        print(f"Computing templates for {n_units} units (n_jobs={n_workers})")
+        _logger.info(f"Computing templates for {n_units} units (n_jobs={n_workers})")
 
         if n_workers > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -953,7 +953,7 @@ class WaveformExtractor:
                 _compute_unit_template(unit_id)
 
         create_folder(folder)
-        print("Saving templates to .npy")
+        _logger.info("Saving templates to .npy")
         for mode in modes:
             templates = self.template_cache[mode]
             template_file = folder / f"templates_{mode}.npy"
@@ -1000,7 +1000,7 @@ class WaveformExtractor:
         """
         print_stage("SAVING CURATED UNITS")
         stopwatch = Stopwatch()
-        print(f"Saving {len(unit_ids)} curated units to new folder")
+        _logger.info(f"Saving {len(unit_ids)} curated units to new folder")
         create_folder(curated_folder)
 
         # Save data about unit ids
@@ -1120,13 +1120,8 @@ class ChunkRecordingExecutor:
         self.job_name = job_name
 
         if verbose:
-            print(
-                self.job_name,
-                "with",
-                "n_jobs",
-                self.n_jobs,
-                " chunk_size",
-                self.chunk_size,
+            _logger.info(
+                f"{self.job_name} with n_jobs {self.n_jobs}  chunk_size {self.chunk_size}"
             )
 
     def run(self):
@@ -1334,12 +1329,6 @@ class Utils:
         elif n_jobs == 0:
             n_jobs = 1
         elif n_jobs is None:
-            n_jobs = 1
-
-        version = sys.version_info
-
-        if (n_jobs != 1) and not (version.major >= 3 and version.minor >= 7):
-            print(f"Python {sys.version} does not support parallel processing")
             n_jobs = 1
 
         return n_jobs

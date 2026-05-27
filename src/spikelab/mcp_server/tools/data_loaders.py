@@ -719,6 +719,7 @@ async def load_from_ibl(
     length_ms: Optional[float] = None,
     workspace_id: str = "",
     namespace: str = "",
+    collection: str = "",
 ) -> Dict[str, Any]:
     """
     Load spike data for a single IBL probe into the workspace.
@@ -734,6 +735,10 @@ async def load_from_ibl(
         length_ms: Optional recording duration in ms; inferred from max spike time if absent.
         workspace_id: Workspace to store the SpikeData in; creates a new one if empty.
         namespace: Recording namespace; derived from the eid if empty.
+        collection: Explicit ALF collection (e.g. ``"alf/probe00/pykilosort"``).
+            When provided, skips the heuristic collection search and avoids
+            3-4 extra network round-trips per call. Empty string (default)
+            falls back to the PID-suffix heuristic + fallback chain.
 
     Returns:
         Dictionary with workspace_id, namespace, workspace_key, and info.
@@ -745,7 +750,12 @@ async def load_from_ibl(
             f"argument or supply a full eid."
         )
 
-    spikedata = load_spikedata_from_ibl(eid, pid, length_ms=length_ms)
+    spikedata = load_spikedata_from_ibl(
+        eid,
+        pid,
+        length_ms=length_ms,
+        collection=collection or None,
+    )
 
     ns_derived = namespace or eid[:8]
     ws, resolved_wid = _resolve_workspace(workspace_id, name=ns_derived)

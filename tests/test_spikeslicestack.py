@@ -376,17 +376,53 @@ class TestSpikeSliceStackConstructor:
         with pytest.raises(ValueError, match="less than end"):
             SpikeSliceStack(sd, times_start_to_end=[(50.0, 50.0)])
 
-    def test_spike_stack_absolute_times_raises(self):
+    def test_spike_stack_spikes_outside_sd_length_raise(self):
         """
-        Constructing via spike_stack with absolute (non-0-based) spike times
-        raises ValueError when spike times exceed the slice duration.
+        Constructing via spike_stack with spike times that exceed the
+        SpikeData's intrinsic ``sd.start_time + sd.length`` window raises
+        ValueError.
+
+        Tier H1 changed the validator to use ``sd.length`` (the
+        SpikeData's own claimed length) rather than ``(end - start)``
+        (the slice-tuple label). Spike times that fit the SpikeData
+        but exceed the slice-tuple duration are now accepted; only
+        spikes that exceed sd.length are rejected. To trigger the
+        validator we mutate the train after construction so the
+        SpikeData constructor's own bounds check does not catch it.
 
         Tests:
-            (Test Case 1) ValueError mentioning '0-based' is raised.
+            (Test Case 1) ValueError mentioning 'fall outside' is raised
+                when ``sd.train`` is mutated to contain a spike past
+                ``sd.start_time + sd.length``.
         """
-        sd = SpikeData([[150.0, 250.0]], length=300.0)
-        with pytest.raises(ValueError, match="0-based"):
-            SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(100.0, 200.0)])
+        sd = SpikeData([[10.0]], length=100.0)
+        # Mutate the train past the constructor check to simulate a
+        # malformed hand-built SpikeData.
+        sd.train[0] = np.array([10.0, 150.0])
+        with pytest.raises(ValueError, match="fall outside"):
+            SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 100.0)])
+
+    def test_spike_stack_spike_within_sd_length_but_outside_slice_tuple_accepted(
+        self,
+    ):
+        """
+        Tier H1: the per-slice validator bounds against ``sd.length``
+        (the SpikeData's own claimed window), not the slice-tuple
+        duration. A spike that fits the SpikeData but exceeds the
+        narrower tuple range must be ACCEPTED — the tuple is a
+        bookkeeping label, not a re-validation surface.
+
+        Tests:
+            (Test Case 1) ``sd.length=300``, tuple ``(0, 100)``, spike
+                at 250 ms — no exception (the spike is well inside
+                ``[sd.start_time, sd.start_time + sd.length]``).
+        """
+        sd = SpikeData([[250.0]], length=300.0)
+        # No ValueError — spike at 250 fits sd.length=300, even though
+        # 250 > 100 (the slice-tuple end).
+        stack = SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 100.0)])
+        assert len(stack.spike_stack) == 1
+        np.testing.assert_array_equal(stack.spike_stack[0].train[0], [250.0])
 
     def test_spike_stack_zero_based_no_warning(self):
         """
@@ -936,6 +972,68 @@ class TestSubslice:
                 result.spike_stack[0].train[u], sss.spike_stack[1].train[u]
             )
 
+    def test_subslice_duplicate_indices_deduplicated(self):
+        """
+        ``subslice([1, 1, 3])`` deduplicates repeated indices to 2 entries
+        (first occurrence wins) — mirrors the RateSliceStack
+        ``test_duplicate_indices`` contract.
+
+        Tests:
+            (Test Case 1) Result has 2 slices, not 3.
+            (Test Case 2) The retained slices' times correspond to the
+                original indices 1 and 3.
+            (Test Case 3) Spike trains in the kept slices match the
+                original at indices 1 and 3.
+        """
+        sss = self._make_stack()
+        original_times = list(sss.times)
+        sub = sss.subslice([1, 1, 3])
+
+        assert len(sub.spike_stack) == 2
+        # Original indices 1 and 3 — both already in ascending order, so
+        # the constructor's sort doesn't reorder them.
+        assert sub.times[0] == original_times[1]
+        assert sub.times[1] == original_times[3]
+        for u in range(sss.N):
+            np.testing.assert_array_equal(
+                sub.spike_stack[0].train[u], sss.spike_stack[1].train[u]
+            )
+            np.testing.assert_array_equal(
+                sub.spike_stack[1].train[u], sss.spike_stack[3].train[u]
+            )
+
+    def test_subslice_float_index_rejected(self):
+        """
+        ``subslice([2.5])`` raises TypeError naming "integers" — mirrors
+        the RateSliceStack contract that slice indices must be integer-
+        typed.
+
+        Tests:
+            (Test Case 1) A float index raises TypeError.
+            (Test Case 2) The error message mentions "integers".
+        """
+        sss = self._make_stack()
+        with pytest.raises(TypeError, match="integer"):
+            sss.subslice([2.5])
+
+    def test_subslice_mixed_positive_negative_indices(self):
+        """
+        ``subslice([2, -1])`` on a 4-slice stack returns slices at
+        indices 2 and 3 (the resolved -1). Both already ascending, so
+        the contract holds even with the constructor's re-sort.
+
+        Tests:
+            (Test Case 1) Result has 2 slices.
+            (Test Case 2) Times match original indices 2 and 3.
+        """
+        sss = self._make_stack()
+        original_times = list(sss.times)
+        sub = sss.subslice([2, -1])
+
+        assert len(sub.spike_stack) == 2
+        assert sub.times[0] == original_times[2]
+        assert sub.times[1] == original_times[3]
+
 
 class TestSubset:
     """Tests for SpikeSliceStack.subset()."""
@@ -992,6 +1090,30 @@ class TestSubset:
 
         dedup = sss.subset([2, 0, 0, 2, 1], preserve_order=True)
         assert [a["id"] for a in dedup.neuron_attributes] == ["C", "A", "B"]
+
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        because ``preserve_order`` has no effect under the
+        ``by``-attribute path.
+
+        Tests:
+            (Test Case 1) A UserWarning naming ``preserve_order`` and
+                ``by`` is emitted.
+            (Test Case 2) The subset succeeds and returns matches in
+                source order.
+        """
+        import warnings as _warnings
+
+        sss = self._make_stack()
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = sss.subset(["ctx"], by="region", preserve_order=True)
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
+        # Two of the three test units have region="ctx".
+        assert sub.N == 2
 
     def test_subset_by_index_list(self):
         """
@@ -4452,11 +4574,15 @@ class TestSpikeSliceStackBoundarySpike:
         from spikelab.spikedata import SpikeData
         from spikelab.spikedata.spikeslicestack import SpikeSliceStack
 
-        # SpikeData itself rejects spike past start_time + length, so
-        # use a longer length to construct the SpikeData, then pass a
-        # tighter slice window to SpikeSliceStack to trigger its
-        # per-slice validator.
-        sd = SpikeData([np.array([10.0001])], length=20.0)
+        # Tier H1: the SpikeSliceStack validator now bounds against
+        # ``sd.length`` (the SpikeData's own claimed window) instead
+        # of the slice-tuple's ``(end - start)``. A spike at 10.0001
+        # in an sd with length=20.0 is therefore in-range. To trigger
+        # the validator we need a spike that exceeds sd.length —
+        # construct sd with the shorter length and mutate the train
+        # after the constructor's own bounds check.
+        sd = SpikeData([np.array([5.0])], length=10.0)
+        sd.train[0] = np.array([10.0001])
         with pytest.raises(ValueError, match="fall outside"):
             SpikeSliceStack(spike_stack=[sd], times_start_to_end=[(0.0, 10.0)])
 

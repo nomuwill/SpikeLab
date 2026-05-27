@@ -10,6 +10,12 @@ from itertools import groupby as _groupby
 from scipy import ndimage, signal
 from scipy.stats import norm
 
+#: Milliseconds per second. Used by the ISI/firing-rate helpers to
+#: convert ``1.0 / isi_ms`` (Hz-per-ms input) into Hz (per-second
+#: output). The literal ``1000`` appeared at several sites; the
+#: named constant makes the unit-conversion intent explicit.
+_MS_PER_S: float = 1000.0
+
 __all__ = [
     "get_sttc",
     "swap",
@@ -194,6 +200,14 @@ def _resampled_isi(spikes, times, sigma_ms):
         Assumed to have been sampled halfway between any two given spikes,
         interpolated, and then smoothed by a Gaussian kernel with the given
         width.
+
+        Bin assignment uses ``int(round(...))`` rather than ``floor``,
+        which means a spike landing at exactly ``0.5 * dt_ms`` past a
+        bin boundary can fall into either the lower or upper bin (a
+        known sub-ms precision limitation). For typical ``dt_ms`` of
+        1ms+ this introduces at most a one-bin shift; for sub-ms
+        ``dt_ms`` the caller should be aware that pinning the exact
+        bin of a boundary-spike requires a separate convention.
     """
 
     # Empty times → empty rates. Matches the empty-friendly behaviour
@@ -217,7 +231,7 @@ def _resampled_isi(spikes, times, sigma_ms):
         isi = spikes[idx + 1] - spikes[idx]
         if isi <= 0:
             return np.zeros_like(times, dtype=float)
-        return np.array([1.0 / isi * 1000], dtype=float)
+        return np.array([1.0 / isi * _MS_PER_S], dtype=float)
 
     spikes = np.array(spikes)
     times = np.array(times)
@@ -262,7 +276,7 @@ def _resampled_isi(spikes, times, sigma_ms):
 
     # Compute instantaneous firing rates (1/isi, in Hz assuming ms units)
     isi_rate = np.zeros_like(isi, dtype=float)
-    isi_rate[1:] = 1.0 / isi[1:] * 1000
+    isi_rate[1:] = 1.0 / isi[1:] * _MS_PER_S
 
     # Create temporary result array matching times resolution
     t_start, t_end = times[0], times[-1]
@@ -519,6 +533,60 @@ def swap(ar, idxs, rng):
     return True
 
 
+def _frame_window_starts(
+    t0: float, effective_end: float, length: float, overlap: float = 0
+) -> List[tuple]:
+    """Compute the (start, end) tuples for fixed-length framing windows.
+
+    Shared helper for ``SpikeData.frames`` and ``RateData.frames``
+    (Tier L-E5). Both methods consume a uniform recording timeline
+    and partition it into ``length``-wide windows with the given
+    ``overlap``. Windows that would extend past ``effective_end``
+    are excluded; the frame count is derived as ``floor(slot_span /
+    step) + 1`` from the slot span ``effective_end - length - t0``,
+    deterministic in float arithmetic (no ULP-padding magic).
+
+    Parameters:
+        t0 (float): Start of the recording timeline (ms).
+        effective_end (float): One past the last sample of the
+            timeline. For ``SpikeData`` this is
+            ``start_time + length``; for ``RateData`` this is
+            ``times[-1] + step_size`` (one bin past the last
+            sample).
+        length (float): Window length (ms).
+        overlap (float): Overlap between consecutive windows (ms).
+            Must satisfy ``0 <= overlap < length``.
+
+    Returns:
+        windows (list[tuple[float, float]]): Sorted list of
+            ``(start, start + length)`` tuples ready to pass to
+            ``SpikeSliceStack`` / ``RateSliceStack``.
+
+    Raises:
+        ValueError: If ``overlap`` is negative, ``length - overlap``
+            is non-positive, or the timeline is shorter than one
+            window.
+    """
+    if overlap < 0:
+        raise ValueError(
+            f"overlap must be non-negative, got {overlap}. The parameter "
+            "represents an overlap, not a stride; use a smaller `length` "
+            "and post-filter slices for gapped windows."
+        )
+    step = length - overlap
+    if step <= 0:
+        raise ValueError("overlap must be less than length")
+    slot_span = effective_end - length - t0
+    if slot_span < 0:
+        raise ValueError(
+            f"Recording length ({effective_end - t0:.1f} ms) is shorter "
+            f"than frame length ({length} ms)"
+        )
+    n_frames = int(np.floor(slot_span / step)) + 1
+    starts = t0 + np.arange(n_frames) * step
+    return [(float(s), float(s) + length) for s in starts]
+
+
 def randomize(ar, swap_per_spike=5, seed=None):
     """Randomize a binary spike raster using degree-preserving double-edge swaps.
 
@@ -634,28 +702,40 @@ def compute_cross_correlation_with_lag(ref_rate, comp_rate, max_lag=0):
     if max_lag == 0:
         max_corr = np.sum(ref_rate * comp_rate) / np.sqrt(norm_product)
         return max_corr, 0
-    # General path: use scipy.signal.correlate and normalise by the
-    # L2-norm product — the same denominator as the max_lag==0 fast
-    # path, so the two paths agree numerically regardless of max_lag.
-    # The previous denominator went through
-    # ``correlate(ref, ref, 'same')[len(ref)//2]``, which equals
-    # ref_norm in theory but can pick up a half-sample offset for
-    # even-length signals under 'same' mode — making max_lag=0 and
-    # max_lag>0 disagree by a few ULPs on the same inputs.
-    # norm_product is guaranteed > 0 after the ref_norm/comp_norm
-    # zero-checks above.
-    r = signal.correlate(ref_rate, comp_rate, mode="same") / np.sqrt(norm_product)
+    # General path: ``mode='full'`` cross-correlation, then symmetric
+    # slice around the lag-0 centre. ``mode='same'`` was the previous
+    # default but it returns an asymmetric lag window for even-length
+    # inputs (``len(r) = N``, range ``[-N/2, +N/2 - 1]``). Three
+    # downstream sites mirror via ``lag_matrix[n2, n1] = -lag``
+    # (``SpikeData.get_pairwise_ccg``,
+    # ``RateData.get_pairwise_fr_corr``,
+    # ``SpikeSliceStack.get_slice_to_slice_unit_comparison``) and rely
+    # on ``argmax(correlate(a, b))`` being exactly
+    # ``-argmax(correlate(b, a))``. That identity only holds when the
+    # lag axis is symmetric — which is guaranteed by ``mode='full'``
+    # (length ``2N-1``, always odd for equal-length inputs), and
+    # then by the symmetric ``[-max_lag, +max_lag]`` slice below.
+    # As a side benefit, the work is bounded by ``2*max_lag + 1``
+    # samples (typically ≪ N) instead of the full N-length ``same``
+    # output.
+    # Normalises by sqrt(sum(ref^2) * sum(comp^2)) — the L2-norm
+    # product, identical to the max_lag==0 fast path so both branches
+    # agree numerically regardless of max_lag.
+    full = signal.correlate(ref_rate, comp_rate, mode="full") / np.sqrt(norm_product)
 
-    center = len(r) // 2
-
-    # Search within max_lag window
-    search_start = max(0, center - max_lag)
-    search_end = min(len(r), center + max_lag + 1)
-    search_window = r[search_start:search_end]
+    # In ``mode='full'`` for equal-length inputs of length N, lag 0
+    # sits at index ``N - 1``. Slice symmetrically around that centre
+    # to the requested lag window. ``np.clip`` guards the case where
+    # ``max_lag >= N`` so the slice does not over-run the ends.
+    n = len(ref_rate)
+    centre = n - 1
+    lo = max(0, centre - max_lag)
+    hi = min(len(full), centre + max_lag + 1)
+    search_window = full[lo:hi]
 
     # NaN-safe peak detection. RateData allows NaN entries (caller-built
     # rate matrices, e.g. from external sources), so the correlation
-    # output ``r`` can contain NaN. Plain ``np.max``/``argmax`` would
+    # output can contain NaN. Plain ``np.max``/``argmax`` would
     # silently propagate NaN into the pairwise matrices; the cosine
     # sibling ``compute_cosine_similarity_with_lag`` already uses the
     # nan-safe variants. Match that behaviour, with a sentinel return
@@ -663,7 +743,7 @@ def compute_cross_correlation_with_lag(ref_rate, comp_rate, max_lag=0):
     if np.all(np.isnan(search_window)):
         return np.nan, 0
     max_corr = np.nanmax(search_window)
-    max_lag_idx = int(np.nanargmax(search_window)) + search_start - center
+    max_lag_idx = int(np.nanargmax(search_window)) + lo - centre
 
     return max_corr, max_lag_idx
 
@@ -1609,8 +1689,19 @@ def _validate_time_start_to_end(
             ``ValueError``. If None (default), no range check is performed.
 
     Returns:
-        valid_time_tuples (list): Sorted list of valid ``(start, end)``
-            tuples. Negative-start windows are preserved.
+        valid_time_tuples (list): The input tuples in ascending-by-start
+            order. Negative-start windows are preserved.
+
+    Notes:
+        - The returned list is **always sorted by start time**, even
+          if the input was not. Callers that pair this list with an
+          externally-supplied parallel array (e.g.
+          ``SpikeSliceStack(spike_stack=..., times_start_to_end=...)``)
+          must therefore re-sort the parallel array using the same
+          key, or pass ``times_start_to_end`` already-sorted. A
+          ``UserWarning`` is emitted at the call site when the sort
+          actually changed the order, so this re-ordering is not
+          silent.
     """
     if not isinstance(times_start_to_end, list):
         raise TypeError("times must be a list of tuples")
@@ -1626,7 +1717,24 @@ def _validate_time_start_to_end(
     valid_time_tuples = []
     zero_duration_offenders = []
     negative_start_offenders = []
-    times_start_to_end = sorted(times_start_to_end)
+    sorted_times = sorted(times_start_to_end)
+    if len(times_start_to_end) > 1 and list(times_start_to_end) != sorted_times:
+        # The sort decouples the returned slice order from the
+        # caller's input order. That's fine if no parallel array is
+        # bound to the input positions, but it silently breaks
+        # callers like ``SpikeSliceStack(spike_stack=..., times_start_to_end=...)``
+        # who relied on positional alignment. Warn so the rewrite is
+        # visible.
+        warnings.warn(
+            "times_start_to_end was not sorted ascending by start time "
+            "and has been reordered. Any parallel array indexed by the "
+            "same positions (e.g. ``spike_stack`` in SpikeSliceStack) "
+            "will now be misaligned. Pre-sort the input to silence "
+            "this warning.",
+            UserWarning,
+            stacklevel=3,
+        )
+    times_start_to_end = sorted_times
     for i, time_window in enumerate(times_start_to_end):
         if not isinstance(time_window, tuple):
             raise TypeError(f"Element {i} of times is not a tuple: {time_window}")
@@ -1661,6 +1769,21 @@ def _validate_time_start_to_end(
         time_diff_check.append(time_window[1] - time_window[0])
         valid_time_tuples.append(time_window)
 
+    # Run the uniformity check first. When durations mix zero-with-
+    # non-zero, the ValueError below is the actionable signal — emit
+    # the zero-duration warning ONLY when the uniformity check passes
+    # (i.e. all windows are uniformly zero), so the caller doesn't
+    # see both a warning and an error for the same root cause.
+    uniformity_ok = True
+    if len(time_diff_check) > 1:
+        diffs = np.array(time_diff_check)
+        if not np.allclose(diffs, diffs[0], atol=1e-6, rtol=0):
+            uniformity_ok = False
+
+    if not uniformity_ok:
+        # Mixed durations — error only, no zero-duration warn noise.
+        raise ValueError("All time windows must have the same length")
+
     if zero_duration_offenders:
         n = len(zero_duration_offenders)
         head = zero_duration_offenders[:10]
@@ -1689,10 +1812,6 @@ def _validate_time_start_to_end(
             stacklevel=2,
         )
 
-    if len(time_diff_check) > 1:
-        diffs = np.array(time_diff_check)
-        if not np.allclose(diffs, diffs[0], atol=1e-6, rtol=0):
-            raise ValueError("All time windows must have the same length")
     return valid_time_tuples
 
 
@@ -2055,6 +2174,15 @@ def _compute_agreement_score(train1, train2, delta):
             ``n_matches / (n1 + n2 - n_matches)``.
         frac_1 (float): Fraction of train1 spikes that were matched.
         frac_2 (float): Fraction of train2 spikes that were matched.
+
+    Notes:
+        Empty inputs are treated as "no overlap possible" and return
+        ``(0.0, 0.0, 0.0)``. This differs from
+        ``_compute_footprint_similarity``, which returns ``NaN`` for
+        degenerate inputs because cosine similarity has no natural
+        zero. Callers comparing both helpers should be aware of the
+        asymmetric "undefined" sentinel: ``0.0`` here vs ``NaN`` for
+        footprint similarity.
     """
     n1 = len(train1)
     n2 = len(train2)
@@ -2167,7 +2295,14 @@ def _compute_footprint_similarity(fp1, fp2, max_lag=5):
         )
 
     n_samples = fp1.shape[1]
-    best = -np.inf
+    # Track "any finite sim seen" with an explicit flag rather than
+    # comparing the running best against ``-np.inf``. If
+    # ``_cosine_sim`` ever returns ``-inf`` (e.g. via a future refactor
+    # that propagates a degenerate denominator) the sentinel
+    # comparison would silently return ``-inf`` as a real similarity;
+    # the flag makes the "no finite value seen" contract unambiguous.
+    best = 0.0
+    seen_finite = False
     for lag in range(-max_lag, max_lag + 1):
         if lag == 0:
             vec1 = fp1.ravel()
@@ -2181,7 +2316,10 @@ def _compute_footprint_similarity(fp1, fp2, max_lag=5):
             vec1 = fp1[:, : n_samples + lag].ravel()
             vec2 = fp2[:, -lag:].ravel()
         sim = _cosine_sim(vec1, vec2)
-        if not np.isnan(sim) and sim > best:
+        if np.isnan(sim):
+            continue
+        if not seen_finite or sim > best:
             best = sim
+            seen_finite = True
 
-    return float(best) if best > -np.inf else np.nan
+    return float(best) if seen_finite else np.nan

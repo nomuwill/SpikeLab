@@ -7,10 +7,13 @@ removal in ``iat/TO_IMPLEMENT.md``), so this backend simply holds the
 config and threads it through to every call site.
 """
 
+import logging
 from typing import Any
 
 from ..config import SortingPipelineConfig
 from .base import SorterBackend
+
+_logger = logging.getLogger(__name__)
 
 DEFAULT_KILOSORT2_PARAMS = {
     "detect_threshold": 6,
@@ -127,14 +130,14 @@ class Kilosort2Backend(SorterBackend):
         # KS2 mex requires NT to be a multiple of 32; round down.
         new_nt = (new_nt // 32) * 32
         if new_nt < 1024:
-            print(
+            _logger.info(
                 f"[oom retry] kilosort2: NT would drop to {new_nt} "
                 "after scaling — refusing to scale further."
             )
             return False
         params["NT"] = new_nt
         self.config.sorter.sorter_params = params
-        print(
+        _logger.info(
             f"[oom retry] kilosort2: scaled NT {nt} -> {new_nt} " f"(factor={factor})."
         )
         return True

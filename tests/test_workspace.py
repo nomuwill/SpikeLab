@@ -964,6 +964,23 @@ class TestMakeSummary:
         assert s["N"] == 5
         assert s["length_ms"] == pytest.approx(300.0)
 
+    def test_summary_spikedata_event_centered_start_time_present(self):
+        """
+        ``_make_summary`` records ``start_time`` for SpikeData so
+        event-centered slices are visible in ``describe()`` output —
+        the previous summary collapsed all SpikeData to the same
+        ``length_ms``-only shape and the event-centered window was
+        invisible.
+
+        Tests:
+            (Test Case 1) SpikeData with ``start_time=-200.0`` has
+                ``s["start_time"] == -200.0`` in the summary.
+        """
+        sd = SpikeData([[5.0]], length=500.0, start_time=-200.0)
+        s = _make_summary(sd)
+        assert s["type"] == "SpikeData"
+        assert s["start_time"] == pytest.approx(-200.0)
+
     def test_summary_ratedata(self):
         """
         Tests _make_summary() for a RateData object.
@@ -1006,6 +1023,43 @@ class TestMakeSummary:
         assert s["N_slices"] == 4
         assert s["N_units"] == 3
         assert s["length_ms"] == pytest.approx(50.0)
+
+    def test_summary_spikeslicestack_heterogeneous_durations_returns_range(
+        self,
+    ):
+        """
+        ``_make_summary`` reports the per-slice length range when a
+        ``SpikeSliceStack`` has heterogeneous-duration slice tuples.
+        Pin the defensive summary path that future heterogeneous-
+        durations support (e.g. ``time_peaks + time_bounds`` with
+        per-event bounds) would surface — for now we mutate
+        ``stack.times`` post-construction to bypass the equal-length
+        validator and exercise the same code path.
+
+        Tests:
+            (Test Case 1) Times ``[(0, 100), (100, 250)]`` → durations
+                ``[100.0, 150.0]`` → ``length_ms`` is a tuple
+                ``(100.0, 150.0)``.
+            (Test Case 2) Uniform-duration stacks still return a
+                single float (covered by the existing
+                ``test_summary_spikeslicestack``).
+        """
+        from spikelab.spikedata.spikeslicestack import SpikeSliceStack
+
+        # Construct a uniform stack first (the validator only fires at
+        # __init__), then mutate ``stack.times`` to a heterogeneous
+        # layout to exercise the summary code path.
+        sd1 = SpikeData([[10.0]], length=100.0)
+        sd2 = SpikeData([[50.0]], length=100.0)
+        sss = SpikeSliceStack(
+            spike_stack=[sd1, sd2],
+            times_start_to_end=[(0.0, 100.0), (100.0, 200.0)],
+        )
+        sss.times = [(0.0, 100.0), (100.0, 250.0)]
+
+        s = _make_summary(sss)
+        assert s["type"] == "SpikeSliceStack"
+        assert s["length_ms"] == (100.0, 150.0)
 
     def test_summary_pairwise_comp_matrix(self):
         """
@@ -1884,15 +1938,92 @@ class TestHDF5IO:
         """
         Tests that a numpy array stored in SpikeData metadata survives an HDF5 round-trip.
 
+        Tier L-F3: the metadata JSON encoder now records ndarrays as
+        sentinel dicts so the load path can rebuild them with the
+        original dtype and shape. Previously this round-tripped to a
+        Python list, breaking downstream ``metadata[...] / scalar``
+        arithmetic.
+
         Tests:
             (Test Case 1) Save does not raise despite the numpy array value.
-            (Test Case 2) The metadata value is recovered as a Python list with equal elements.
+            (Test Case 2) The metadata value is recovered as an ndarray
+                with the original values, dtype, and shape — *not* a
+                Python list.
         """
         arr = np.array([1.0, 2.0, 3.0])
         sd = SpikeData([[1.0, 2.0], [3.0]], length=20.0, metadata={"positions": arr})
         out = self._roundtrip(sd)
         assert "positions" in out.metadata
-        assert out.metadata["positions"] == [1.0, 2.0, 3.0]
+        assert isinstance(out.metadata["positions"], np.ndarray)
+        assert out.metadata["positions"].dtype == arr.dtype
+        assert out.metadata["positions"].shape == arr.shape
+        np.testing.assert_array_equal(out.metadata["positions"], arr)
+        # Downstream arithmetic that broke under the old list-typed
+        # round-trip must now succeed.
+        _ = out.metadata["positions"] / 1000.0
+
+    def test_roundtrip_metadata_ndarray_preserves_dtype_and_shape(self):
+        """
+        Tier L-F3: ndarrays in metadata preserve dtype and shape through
+        the HDF5 round-trip, including non-default dtypes (int32, etc.)
+        and 2-D arrays. Also covers nesting inside a dict.
+
+        Tests:
+            (Test Case 1) int32 1-D array round-trips as int32 ndarray.
+            (Test Case 2) float32 2-D array round-trips with correct
+                shape, dtype, and values.
+            (Test Case 3) Ndarray nested inside a sub-dict in metadata
+                is also restored to ndarray.
+        """
+        int_arr = np.array([10, 20, 30], dtype=np.int32)
+        mat = np.array([[1.5, 2.5], [3.5, 4.5], [5.5, 6.5]], dtype=np.float32)
+        nested = {"inner": {"timeseries": np.arange(5, dtype=np.float64)}}
+        sd = SpikeData(
+            [[1.0, 2.0]],
+            length=10.0,
+            metadata={
+                "cluster_ids": int_arr,
+                "waveform_matrix": mat,
+                "trials": nested,
+            },
+        )
+        out = self._roundtrip(sd)
+
+        # Test Case 1: int32 preserved.
+        assert isinstance(out.metadata["cluster_ids"], np.ndarray)
+        assert out.metadata["cluster_ids"].dtype == np.int32
+        np.testing.assert_array_equal(out.metadata["cluster_ids"], int_arr)
+
+        # Test Case 2: float32 2-D preserved.
+        assert isinstance(out.metadata["waveform_matrix"], np.ndarray)
+        assert out.metadata["waveform_matrix"].dtype == np.float32
+        assert out.metadata["waveform_matrix"].shape == (3, 2)
+        np.testing.assert_array_equal(out.metadata["waveform_matrix"], mat)
+
+        # Test Case 3: nested ndarray preserved.
+        inner = out.metadata["trials"]["inner"]["timeseries"]
+        assert isinstance(inner, np.ndarray)
+        assert inner.dtype == np.float64
+        np.testing.assert_array_equal(inner, np.arange(5, dtype=np.float64))
+
+    def test_roundtrip_metadata_empty_ndarray(self):
+        """
+        Tier L-F3: empty ndarrays (shape (0,)) round-trip as empty
+        ndarrays, not empty lists. An empty IBL trial-times array is a
+        valid edge case (recording with zero trials of a particular
+        event type).
+
+        Tests:
+            (Test Case 1) Empty float64 array round-trips with shape
+                (0,) and dtype float64.
+        """
+        empty = np.array([], dtype=np.float64)
+        sd = SpikeData([[1.0]], length=10.0, metadata={"stim_off_times": empty})
+        out = self._roundtrip(sd)
+        recovered = out.metadata["stim_off_times"]
+        assert isinstance(recovered, np.ndarray)
+        assert recovered.shape == (0,)
+        assert recovered.dtype == np.float64
 
     def test_roundtrip_metadata_numpy_scalars(self):
         """
@@ -2753,23 +2884,34 @@ class TestHDF5IO:
         """
         Metadata containing nested dicts with numpy arrays inside.
 
+        Tier L-F3: ndarrays nested inside metadata sub-dicts are
+        restored as ndarrays (with dtype/shape preserved) rather than
+        silently degraded to Python lists.
+
         Tests:
             (Test Case 1) Save does not raise.
-            (Test Case 2) Nested numpy array is recovered as a Python list.
+            (Test Case 2) Nested numpy array is recovered as an
+                ndarray with the original values.
+            (Test Case 3) Nested numpy scalar is recovered as a
+                Python float (scalar encoder unchanged).
+            (Test Case 4) Sibling primitive (string) is preserved.
         """
+        arr = np.array([10.0, 20.0, 30.0])
         sd = SpikeData(
             [[1.0, 2.0]],
             length=10.0,
             metadata={
                 "outer": {
-                    "inner_arr": np.array([10.0, 20.0, 30.0]),
+                    "inner_arr": arr,
                     "inner_scalar": np.float64(99.0),
                 },
                 "top_level": "hello",
             },
         )
         out = self._roundtrip(sd)
-        assert out.metadata["outer"]["inner_arr"] == [10.0, 20.0, 30.0]
+        recovered = out.metadata["outer"]["inner_arr"]
+        assert isinstance(recovered, np.ndarray)
+        np.testing.assert_array_equal(recovered, arr)
         assert out.metadata["outer"]["inner_scalar"] == pytest.approx(99.0)
         assert out.metadata["top_level"] == "hello"
 
@@ -3330,15 +3472,44 @@ class TestLazyAnalysisWorkspace:
         with pytest.raises(OSError):
             ws.get("ns", "arr")
 
-    def test_items_property_raises(self):
+    def test_items_property_raises_with_helpful_message(self):
         """
-        Accessing _items on a LazyAnalysisWorkspace raises NotImplementedError.
+        Accessing ``_items`` on a LazyAnalysisWorkspace raises
+        ``NotImplementedError`` whose message points the caller at the
+        proper public API (``list_namespaces`` / ``list_keys`` /
+        ``get``) since lazy workspaces don't materialise items in
+        memory.
 
         Tests:
-            (Test Case 1) Reading _items raises NotImplementedError.
+            (Test Case 1) Reading ``_items`` raises NotImplementedError.
+            (Test Case 2) The error message names ``list_namespaces``,
+                ``list_keys``, and ``get`` as the recovery API.
         """
         ws = LazyAnalysisWorkspace(name="test_items")
-        with pytest.raises(NotImplementedError, match="does not use _items"):
+        with pytest.raises(NotImplementedError) as excinfo:
+            _ = ws._items
+        msg = str(excinfo.value)
+        assert "list_namespaces" in msg
+        assert "list_keys" in msg
+        assert "get" in msg
+
+    def test_items_setter_is_noop_for_parent_init_compatibility(self):
+        """
+        ``LazyAnalysisWorkspace._items = {}`` (the assignment the parent
+        ``AnalysisWorkspace.__init__`` does) must NOT raise — the
+        setter is a no-op so the lazy subclass can reuse the parent
+        constructor without sub-classing around its init order.
+
+        Tests:
+            (Test Case 1) ``ws._items = {}`` does not raise.
+            (Test Case 2) Reading ``_items`` afterwards still raises
+                NotImplementedError (the setter discards the value).
+        """
+        ws = LazyAnalysisWorkspace(name="test_items_setter")
+        # Setter must not raise.
+        ws._items = {}
+        # Getter behaviour is unchanged after the no-op setter.
+        with pytest.raises(NotImplementedError):
             _ = ws._items
 
     def test_get_after_delete(self):
@@ -4631,6 +4802,162 @@ class TestRemaining:
 
 
 @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+class TestLoadWorkspaceFullSkipsDoubleUnderscoreGroups:
+    """``load_workspace_full`` skips any top-level HDF5 group whose
+    name starts with ``__``. This reserves the prefix for workspace
+    metadata sub-groups (e.g. ``/__history__/``) so a future audit-log
+    addition doesn't make the loader treat the metadata group as a
+    user namespace and fail on its first child's missing ``__type__``.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_double_underscore_group_skipped_from_items(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A workspace .h5 containing a normal namespace
+                ``ns_a/...`` plus a sibling ``__history__/...`` loads
+                without raising.
+            (Test Case 2) ``ws._items`` contains only ``ns_a``; the
+                ``__history__`` group is absent.
+        """
+        from spikelab.workspace.hdf5_io import load_workspace_full
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        # Build a valid workspace .h5 via the real save path first so
+        # the file has all the required attrs and a real ns_a entry.
+        ws = AnalysisWorkspace(name="skip-double-underscore")
+        ws.store("ns_a", "key", np.array([1, 2, 3]))
+        base = str(tmp_path / "ws")
+        ws.save(base)
+
+        # Add a sibling ``__history__`` group to the saved file.
+        with h5py.File(base + ".h5", "a") as f:
+            hist = f.create_group("__history__")
+            hist.create_dataset("dummy", data=np.array([42]))
+
+        loaded = load_workspace_full(base)
+        assert "ns_a" in loaded._items
+        assert "__history__" not in loaded._items
+        assert "__history__" not in loaded._index
+
+
+class TestLazyAnalysisWorkspaceDelLogsCleanupFailure:
+    """``LazyAnalysisWorkspace.__del__`` is a best-effort fallback for
+    temp-file cleanup. When ``close()`` raises (read-only mount,
+    open handle on Windows), the failure is logged to ``sys.__stderr__``
+    rather than swallowed so the audit log retains a trace.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_del_close_failure_writes_marker_to_stderr(self, monkeypatch, capfd):
+        """
+        Tests:
+            (Test Case 1) Monkeypatching ``close()`` to raise
+                ``OSError("read-only")`` and triggering ``__del__``
+                writes a ``cleanup failed`` marker to ``sys.__stderr__``.
+
+        Notes:
+            - Uses ``capfd`` (file-descriptor capture) instead of
+              ``capsys`` because the source prints to ``sys.__stderr__``
+              (the original stderr fd), which bypasses Python-level
+              redirection.
+        """
+        from spikelab.workspace.workspace import LazyAnalysisWorkspace
+
+        ws = LazyAnalysisWorkspace(name="del-cleanup-test")
+
+        def failing_close(self):
+            raise OSError("read-only")
+
+        import types as _types
+
+        ws.close = _types.MethodType(failing_close, ws)
+        ws.__del__()
+
+        captured = capfd.readouterr()
+        assert "cleanup failed" in captured.err
+        assert "read-only" in captured.err
+
+
+class TestLoadWorkspaceFullBytesNameDecode:
+    """``load_workspace_full`` decodes ``__workspace_name__`` from
+    bytes when h5py returns the attribute that way (varies by h5py /
+    Python build). Without the explicit decode the reload would
+    surface the literal ``"b'...'"`` repr.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_bytes_workspace_name_attr_decodes_to_str(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A workspace .h5 with ``__workspace_name__``
+                written as bytes loads with ``ws.name`` equal to the
+                decoded UTF-8 string (not the bytes repr).
+        """
+        from spikelab.workspace.hdf5_io import load_workspace_full
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        # Build a valid workspace .h5 via the real save path, then
+        # overwrite the name attribute with bytes form.
+        ws = AnalysisWorkspace(name="placeholder")
+        ws.store("ns", "key", np.array([1, 2, 3]))
+        base = str(tmp_path / "ws")
+        ws.save(base)
+
+        with h5py.File(base + ".h5", "a") as f:
+            del f.attrs["__workspace_name__"]
+            f.attrs.create("__workspace_name__", b"hello-bytes", dtype="S100")
+
+        loaded = load_workspace_full(base)
+        assert loaded.name == "hello-bytes"
+
+
+class TestWorkspaceManagerLoadWorkspaceDoubleLoadWarning:
+    """``WorkspaceManager.load_workspace`` warns when the same
+    workspace_id is reloaded twice — the second load overwrites the
+    in-memory instance and the warning surfaces any pending mutations
+    that would be lost.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_double_load_warns_with_workspace_id(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Calling ``load_workspace`` twice for the same
+                saved path emits a UserWarning on the second call.
+            (Test Case 2) The warning message contains the workspace
+                id.
+        """
+        import warnings as _warnings
+
+        from spikelab.workspace.workspace import (
+            AnalysisWorkspace,
+            WorkspaceManager,
+        )
+
+        manager = WorkspaceManager()
+        ws = AnalysisWorkspace(name="double-load")
+        ws.store("ns", "k", np.array([1.0]))
+        base = str(tmp_path / "ws")
+        ws.save(base)
+        ws_id = ws.workspace_id
+
+        # First load registers the workspace silently.
+        with _warnings.catch_warnings(record=True) as w1:
+            _warnings.simplefilter("always")
+            manager.load_workspace(base)
+        assert not any("already registered" in str(rec.message) for rec in w1)
+
+        # Second load warns about the overwrite.
+        with _warnings.catch_warnings(record=True) as w2:
+            _warnings.simplefilter("always")
+            manager.load_workspace(base)
+        warn_msgs = [str(rec.message) for rec in w2 if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "already registered" in m]
+        assert relevant, warn_msgs
+        assert ws_id in relevant[0]
+
+
 class TestLoadWorkspaceFullValidation:
     """Tests for load_workspace_full input validation."""
 
@@ -5368,6 +5695,154 @@ class TestDumpDictKeyValidation:
         assert loaded["with_underscore"] == 2
 
 
+class TestLazyAnalysisWorkspaceCloseDeleteCleanup:
+    """``LazyAnalysisWorkspace.close()`` deterministically unlinks the
+    backing temp HDF5 file and ``WorkspaceManager.delete_workspace``
+    invokes ``close()`` to avoid leaking temp files past
+    ``__del__`` (which is unreliable on Windows and during interpreter
+    shutdown). Second close is a no-op.
+    """
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_delete_workspace_unlinks_temp_h5(self):
+        """
+        Tests:
+            (Test Case 1) After ``WorkspaceManager.delete_workspace``,
+                the LazyAnalysisWorkspace's backing temp file is gone.
+            (Test Case 2) The workspace is removed from the manager
+                (subsequent ``get_workspace`` raises KeyError).
+        """
+        from spikelab.workspace.workspace import (
+            LazyAnalysisWorkspace,
+            WorkspaceManager,
+        )
+
+        manager = WorkspaceManager()
+        ws = LazyAnalysisWorkspace(name="cleanup-test")
+        h5_path = ws._h5_path
+        assert os.path.exists(h5_path)
+
+        manager._workspaces[ws.workspace_id] = ws
+        manager.delete_workspace(ws.workspace_id)
+
+        assert not os.path.exists(h5_path)
+        # ``get_workspace`` returns None for unknown IDs (the public
+        # contract); a second ``delete_workspace`` raises KeyError.
+        assert manager.get_workspace(ws.workspace_id) is None
+        with pytest.raises(KeyError):
+            manager.delete_workspace(ws.workspace_id)
+
+    @pytest.mark.skipif(not H5PY_AVAILABLE, reason="h5py not installed")
+    def test_double_close_is_noop(self):
+        """
+        Tests:
+            (Test Case 1) Calling ``close()`` a second time after the
+                file has already been unlinked does not raise.
+        """
+        from spikelab.workspace.workspace import LazyAnalysisWorkspace
+
+        ws = LazyAnalysisWorkspace(name="double-close")
+        ws.close()
+        # Second close on an already-closed workspace must be safe.
+        ws.close()  # should not raise
+        assert ws._h5_path is None
+
+
+class TestDumpWorkspaceAtomicH5Cleanup:
+    """``dump_workspace`` writes the HDF5 to ``{path}.h5.tmp`` and
+    ``os.replace``-s into position on success. A mid-write failure
+    leaves no stale ``.h5.tmp`` and the pre-existing ``{path}.h5``
+    is preserved.
+    """
+
+    def test_h5_write_failure_cleans_tmp_and_preserves_original_h5(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) When ``_dump_item`` raises mid-write, the
+                ``.h5.tmp`` sidecar does NOT survive on disk.
+            (Test Case 2) A pre-existing ``foo.h5`` is left unchanged.
+            (Test Case 3) The original exception propagates to the caller.
+        """
+        try:
+            import h5py  # noqa: F401
+        except ImportError:
+            pytest.skip("h5py not installed")
+        from spikelab.workspace.workspace import AnalysisWorkspace
+        from spikelab.workspace import hdf5_io as io_mod
+
+        # Pre-existing successful save to establish baseline ``foo.h5``.
+        ws = AnalysisWorkspace(name="atomic-h5-save")
+        ws.store("ns", "key", np.array([1, 2, 3]))
+        base = str(tmp_path / "foo")
+        ws.save(base)
+        original_h5_bytes = (tmp_path / "foo.h5").read_bytes()
+
+        # Patch _dump_item so the second save fails mid-write.
+        def fake_dump_item(*args, **kwargs):
+            raise RuntimeError("simulated h5 write failure")
+
+        monkeypatch.setattr(io_mod, "_dump_item", fake_dump_item)
+
+        with pytest.raises(RuntimeError, match="simulated h5 write failure"):
+            ws.save(base)
+
+        assert not (tmp_path / "foo.h5.tmp").exists()
+        assert (tmp_path / "foo.h5").read_bytes() == original_h5_bytes
+
+
+class TestAnalysisWorkspaceSaveAtomicJsonCleanup:
+    """``AnalysisWorkspace.save`` writes the JSON index via tmp-file +
+    ``os.replace``, so a mid-write failure must leave no stale
+    ``.json.tmp`` on disk and the pre-existing ``.json`` (if any) must
+    be preserved unchanged.
+    """
+
+    def test_json_write_failure_cleans_tmp_and_preserves_original_json(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) When ``json.dump`` raises mid-write, the
+                ``.json.tmp`` sidecar does NOT survive on disk.
+            (Test Case 2) A pre-existing ``foo.json`` is left unchanged
+                (the failed save did not overwrite it).
+            (Test Case 3) The original exception propagates to the caller.
+        """
+        try:
+            import h5py  # noqa: F401
+        except ImportError:
+            pytest.skip("h5py not installed")
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        # Pre-existing successful save establishes baseline ``foo.h5``
+        # and ``foo.json``.
+        ws = AnalysisWorkspace(name="atomic-json-save")
+        base = str(tmp_path / "foo")
+        ws.save(base)
+        original_json_bytes = (tmp_path / "foo.json").read_bytes()
+
+        # Now make ``json.dump`` raise mid-write. The workspace.save
+        # body catches the exception only to unlink the tmp file before
+        # re-raising — patch on the workspace module's reference so the
+        # global json module stays usable.
+        import spikelab.workspace.workspace as ws_mod
+
+        def fake_dump(*args, **kwargs):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(ws_mod.json, "dump", fake_dump)
+
+        with pytest.raises(OSError, match="simulated disk full"):
+            ws.save(base)
+
+        # Test Case 1: no stale .json.tmp.
+        assert not (tmp_path / "foo.json.tmp").exists()
+        # Test Case 2: original .json unchanged.
+        assert (tmp_path / "foo.json").read_bytes() == original_json_bytes
+
+
 class TestAnalysisWorkspaceSaveStripsH5Suffix:
     """``AnalysisWorkspace.save`` strips a trailing ``.h5`` from the path."""
 
@@ -5438,10 +5913,14 @@ class TestNumpyEncoder:
             (Test Case 2) ``np.float32`` becomes a JSON float.
             (Test Case 3) ``np.bool_(True)`` becomes ``true``.
             (Test Case 4) ``np.str_`` becomes a JSON string.
-            (Test Case 5) An ``np.ndarray`` becomes a JSON list.
+            (Test Case 5) Tier L-F3: an ``np.ndarray`` becomes a
+                sentinel dict (``__ndarray__: True`` with dtype, shape,
+                values) so the load path can rebuild it; passing the
+                decoded payload through ``_restore_ndarrays`` recovers
+                the original ndarray.
         """
         import json
-        from spikelab.workspace.hdf5_io import _NumpyEncoder
+        from spikelab.workspace.hdf5_io import _NumpyEncoder, _restore_ndarrays
 
         payload = {
             "i": np.int64(7),
@@ -5456,7 +5935,13 @@ class TestNumpyEncoder:
         assert decoded["f"] == pytest.approx(2.5)
         assert decoded["b"] is True
         assert decoded["s"] == "hello"
-        assert decoded["a"] == [1, 2, 3]
+        # Raw JSON now carries the ndarray sentinel; the load path
+        # restores the original ndarray with its dtype preserved.
+        assert decoded["a"]["__ndarray__"] is True
+        assert decoded["a"]["values"] == [1, 2, 3]
+        restored = _restore_ndarrays(decoded)
+        assert isinstance(restored["a"], np.ndarray)
+        np.testing.assert_array_equal(restored["a"], np.array([1, 2, 3]))
 
     def test_unsupported_type_raises_type_error(self):
         """

@@ -81,10 +81,23 @@ class PolicyConfig(BaseModel):
     max_runtime_seconds: int = Field(default=1_209_600, ge=1)  # 14 days
     block_sleep_infinity: bool = True
     warn_request_limit_mismatch: bool = True
+    sleep_duration_threshold_s: int = Field(
+        default=86_400, ge=1
+    )  # 24 hours — bare ``sleep <n>`` durations >= this are flagged
+    # as idle-placeholders. Separate from ``max_runtime_seconds``
+    # because the check targets compute-masquerading sleeps, not
+    # the job's overall wall-clock budget.
 
 
 class JobSpec(BaseModel):
-    """High-level description of a Kubernetes batch job."""
+    """High-level description of a Kubernetes batch job.
+
+    Single-container assumption: ``container`` is a single
+    :class:`ContainerSpec`, not a list. The rendered ``job.yaml.j2``
+    template targets one container per pod (named ``analysis``).
+    Multi-container patterns (sidecars for log shipping, init
+    containers for fetch) are not supported by the current template.
+    """
 
     name_prefix: str = "analysis-job"
     namespace: str = "default"
@@ -92,6 +105,20 @@ class JobSpec(BaseModel):
     container: ContainerSpec
     resources: ResourceSpec
     volumes: List[VolumeMountSpec] = Field(default_factory=list)
+    #: Kubernetes ``ttlSecondsAfterFinished``: how long the K8s job
+    #: object and its pod logs persist after the pod terminates,
+    #: before the cluster reaps them. The default 3600 (1 hour)
+    #: optimises for cluster cleanliness, not forensics — useful
+    #: dials when you need pod logs available post-completion for
+    #: debugging:
+    #:
+    #: - ``21600`` (6h): end-of-day check
+    #: - ``86400`` (24h): next-business-day investigation
+    #: - ``172800`` (48h): covers a weekend gap
+    #: - ``604800`` (1 week): covers a vacation
+    #:
+    #: Results stored in S3 are retained regardless — this TTL only
+    #: affects the K8s-side job object and its pod logs.
     ttl_seconds_after_finished: int = Field(default=3600, ge=0)
     backoff_limit: int = Field(default=0, ge=0)
     active_deadline_seconds: Optional[int] = Field(default=None, ge=1)
@@ -158,6 +185,15 @@ class ClusterProfile(BaseModel):
     resources: ResourceSpec = Field(default_factory=ResourceSpec)
     endpoint_url: Optional[str] = None
     region_name: Optional[str] = None
+    #: Tier L-F7: Kubernetes ``imagePullSecrets`` to attach to the pod
+    #: spec. Each entry is the name of a ``kubernetes.io/dockerconfigjson``
+    #: secret that already exists in the target namespace. Empty (the
+    #: default) means no pull secrets are rendered — appropriate for
+    #: public registries and clusters whose default ServiceAccount
+    #: already carries the necessary secrets. Cluster-level rather
+    #: than per-job because the same registry is typically reused
+    #: across every job submitted to the cluster.
+    image_pull_secrets: List[str] = Field(default_factory=list)
 
 
 class SubmitResult(BaseModel):
@@ -170,17 +206,3 @@ class SubmitResult(BaseModel):
     output_prefix: str
     logs_prefix: str
     job_type: Literal["workspace", "sorting", "prepared"]
-
-
-class RunConfig(BaseModel):
-    """User-facing run config consumed by CLI/session."""
-
-    profile_name: str = "defaults"
-    input_path: str
-    output_prefix: Optional[str] = None
-    workspace_id: Optional[str] = None
-    namespace: Optional[str] = None
-    allow_policy_risk: bool = False
-    max_wait_seconds: int = Field(default=3600, ge=1)
-    wait_for_completion: bool = False
-    follow_logs: bool = False

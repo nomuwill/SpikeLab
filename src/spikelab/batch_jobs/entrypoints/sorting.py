@@ -3,10 +3,19 @@
 Invoked as ``python -m spikelab.batch_jobs.entrypoints.sorting``
 inside a Kubernetes job container.
 
-Environment variables:
+Environment variables (required):
     INPUT_URI: S3 URI of the input bundle zip containing recordings +
         sorting_config.json.
     OUTPUT_PREFIX: S3 URI prefix for uploading sorted results.
+
+Environment variables (optional, consulted by the S3 client):
+    S3_ENDPOINT_URL: Override the AWS S3 endpoint. Used by
+        non-AWS S3-compatible stores (MinIO, Wasabi, etc.). Default:
+        unset → boto3 routes to AWS S3.
+    AWS_DEFAULT_REGION: AWS region name passed to ``boto3.client``.
+        Required by some AWS regions to disambiguate the endpoint.
+        Default: unset → boto3 uses its own region-resolution chain
+        (env, profile, instance metadata).
 """
 
 from __future__ import annotations
@@ -67,13 +76,37 @@ def _reconstruct_config(config_dict: dict):
 
     import typing
 
+    # Resolve top-level field annotations explicitly. Under
+    # ``from __future__ import annotations`` (which spike_sorting.config
+    # does NOT use today, but which a future cleanup pass might add),
+    # ``f.type`` would be the string ``"RecordingConfig"`` and the
+    # naive ``f.type(**sub_dict)`` would crash with
+    # ``TypeError: 'str' object is not callable``. Resolve via
+    # ``get_type_hints`` so both annotation modes work.
+    try:
+        top_hints = typing.get_type_hints(SortingPipelineConfig)
+    except Exception:
+        top_hints = {}
+
     sub_configs = {}
     for f in fields(SortingPipelineConfig):
         sub_dict = config_dict.get(f.name, {})
-        sub_instance = f.type(**sub_dict)
+        sub_cls = top_hints.get(f.name, f.type)
+        try:
+            sub_instance = sub_cls(**sub_dict)
+        except TypeError as exc:
+            # Wrap with the offending sub-config name so the operator
+            # sees ``Failed to reconstruct execution: unexpected
+            # keyword 'foo'`` instead of the bare ``__init__() got an
+            # unexpected keyword argument 'foo'`` that doesn't say
+            # which sub-config was being built.
+            raise TypeError(
+                f"Failed to reconstruct {f.name!r} from bundled "
+                f"sorting_config.json: {exc}"
+            ) from exc
         # Restore Path fields on the just-constructed sub-config.
         try:
-            sub_hints = typing.get_type_hints(f.type)
+            sub_hints = typing.get_type_hints(sub_cls)
         except Exception:
             sub_hints = {}
         for sub_field_name, sub_annotation in sub_hints.items():
@@ -110,9 +143,11 @@ def main() -> None:
         work = Path(work_dir)
 
         # --- Download and extract input bundle ---
+        print(f"[entrypoint] download: {input_uri}", flush=True)
         bundle_zip = str(work / "input.zip")
         storage.download_file(s3_uri=input_uri, local_path=bundle_zip)
 
+        print("[entrypoint] extract: validating zip members + unpacking", flush=True)
         extract_dir = work / "input"
         # Validate zip members against the target directory before
         # extracting. Without this, a malicious bundle (compromised S3,
@@ -125,6 +160,7 @@ def main() -> None:
             _safe_extractall(zf, extract_dir)
 
         # --- Load sorting config ---
+        print("[entrypoint] config: loading sorting_config.json", flush=True)
         config_files = list(extract_dir.rglob("sorting_config.json"))
         if not config_files:
             raise FileNotFoundError("sorting_config.json not found in input bundle")
@@ -133,18 +169,59 @@ def main() -> None:
         config = _reconstruct_config(config_dict)
 
         # --- Identify recording files ---
-        # Everything in the bundle that is not sorting_config.json or
-        # manifest.json is a recording file.
+        # Tier L-C2: read the declared recording whitelist from
+        # ``manifest.json["recording_files"]`` (set by
+        # ``package_analysis_bundle`` at submission time). The host
+        # already knows which input paths are recordings vs companion
+        # files (probe sidecars, metadata.csv, etc.); the manifest
+        # carries that knowledge into the pod so the entrypoint does
+        # not have to guess via a name blacklist. Companion files
+        # remain in the bundle (extracted under ``extract_dir``) and
+        # are simply not passed to ``sort_recording``.
+        manifest_path = extract_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                "manifest.json not found at the bundle root. The sorting "
+                "entrypoint requires a manifest produced by "
+                "``package_analysis_bundle(output_format='sorting', "
+                "recording_files=...)``."
+            )
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        declared_names = manifest.get("recording_files")
+        if not declared_names:
+            raise ValueError(
+                "manifest.json has no ``recording_files`` field (or it is "
+                "empty). The host's ``package_analysis_bundle`` must declare "
+                "the recording basenames when ``output_format='sorting'``."
+            )
+        # Map each declared basename back to its extracted path. The
+        # bundle layout is flat under ``extract_dir`` (the bundle
+        # writer ``shutil.copy2``s every input into one folder), so
+        # ``extract_dir / name`` is the canonical location. ``rglob``
+        # would only be needed if a future bundler restored nested
+        # paths; for now treat a missing extracted file as a bundle
+        # corruption error.
         recording_files = []
-        for path in sorted(extract_dir.rglob("*")):
-            if path.is_dir():
-                continue
-            if path.name in {"sorting_config.json", "manifest.json"}:
-                continue
-            recording_files.append(str(path))
-
-        if not recording_files:
-            raise FileNotFoundError("No recording files found in input bundle")
+        missing = []
+        for name in declared_names:
+            candidate = extract_dir / name
+            if not candidate.exists():
+                # Try a recursive search as a fallback in case the
+                # bundle layout changed.
+                candidates = list(extract_dir.rglob(name))
+                if not candidates:
+                    missing.append(name)
+                    continue
+                candidate = candidates[0]
+            recording_files.append(str(candidate))
+        if missing:
+            raise FileNotFoundError(
+                f"manifest declared recordings missing from the extracted "
+                f"bundle: {missing}. The bundle is corrupt or the "
+                "``recording_files`` list does not match the bundled "
+                "filenames."
+            )
 
         # Reject stem-level collisions across recording_files. Two
         # recordings with the same stem (e.g. ``rec.bin`` and
@@ -182,6 +259,11 @@ def main() -> None:
         # even when some recordings had degraded or partial results.
         from spikelab.spike_sorting.pipeline import SortRunReport
 
+        print(
+            f"[entrypoint] sort: {len(recording_files)} recording(s) "
+            f"with {config.sorter.sorter_name}",
+            flush=True,
+        )
         sort_report = SortRunReport()
         spikedata_results = sort_recording(
             recording_files=recording_files,
@@ -205,6 +287,11 @@ def main() -> None:
                 f"SpikeData but bundle contains {len(recording_files)} "
                 "recordings; cannot map results to recording names."
             )
+        print(
+            f"[entrypoint] upload: {len(spikedata_results)} curated SpikeData pickle(s) "
+            f"-> {output_prefix}",
+            flush=True,
+        )
         for sd, rec_path in zip(spikedata_results, recording_files):
             rec_name = Path(rec_path).stem
             pkl_name = f"{rec_name}_curated.pkl"

@@ -185,6 +185,37 @@ class TestParseSortingLog:
         assert any("SPIKE SORTING" in n for n in names)
         assert any("PER-UNIT FIGURES" in n for n in names)
 
+    def test_repeated_banner_pairs_with_closest_preceding(self):
+        """
+        ``parse_sorting_log`` pairs each ISO timestamp with the closest
+        preceding banner using the enumerate index, not the first
+        occurrence (``lines.index(...)``). If a banner name repeats
+        in the log, each subsequent timestamp must pair with the
+        *most recent* preceding instance.
+
+        Tests:
+            (Test Case 1) A log with two identical "INNER STAGE"
+                banners — each followed by its own timestamp — yields
+                two ``stage_timings`` entries with the matching
+                timestamps in order, not two entries both pointing at
+                the first timestamp.
+        """
+        log = (
+            "    INNER STAGE\n"
+            "\n"
+            "[2026-05-25 10:00:00]\n"
+            "    INNER STAGE\n"
+            "\n"
+            "[2026-05-25 10:05:00]\n"
+        )
+        info = parse_sorting_log(log)
+        stages = info["stage_timings"]
+        inner = [s for s in stages if "INNER STAGE" in s["name"]]
+        assert len(inner) == 2
+        # Each timestamp paired with its own preceding banner.
+        assert inner[0]["timestamp"] == "2026-05-25 10:00:00"
+        assert inner[1]["timestamp"] == "2026-05-25 10:05:00"
+
     def test_curation_line_extracted(self):
         """
         The "Curation: N -> M units" line is captured verbatim.
@@ -349,6 +380,30 @@ class TestExtractUnitQualityStats:
         """
         result = extract_unit_quality_stats(tmp_path / "does_not_exist.pkl")
         assert result == {}
+
+    def test_non_pickle_file_warns_and_returns_empty(self, tmp_path, caplog):
+        """
+        A file that exists but is not a valid pickle returns ``{}`` and
+        emits a WARNING-level log message from the module's logger.
+        Operators inspecting log streams can see why the curated stats
+        block came out empty.
+
+        Tests:
+            (Test Case 1) Garbage bytes produce ``{}`` return.
+            (Test Case 2) The module's logger records a WARNING.
+        """
+        import logging
+
+        bad_path = tmp_path / "garbage.pkl"
+        bad_path.write_bytes(b"not-a-pickle")
+
+        with caplog.at_level(logging.WARNING, logger="spikelab.spike_sorting.report"):
+            result = extract_unit_quality_stats(bad_path)
+
+        assert result == {}
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records, "expected a WARNING-level log record"
+        assert "extract_unit_quality_stats" in warning_records[0].getMessage()
 
     def test_extracts_snr_and_std_norm_and_amplitude(self, tmp_path):
         """
@@ -727,14 +782,34 @@ class TestWalkDiff:
         _walk_diff("", default, actual, out)
         assert out == [("section", {"x": 1}, 5)]
 
-    def test_lists_compared_as_leaves_not_recursed(self):
+    def test_identical_dicts_short_circuit_with_no_diffs(self):
         """
-        Lists are compared with ``!=``, not walked element-wise.
+        ``_walk_diff`` short-circuits identical subtrees: when
+        ``default == actual`` the function returns immediately and
+        records no diff entries. This avoids re-recursing into
+        hundreds of identical leaves per call when ``diff_against_default``
+        passes whole sub-config dicts whose contents match.
 
         Tests:
-            (Test Case 1) Two unequal lists produce a single
-                top-level diff entry containing the entire lists,
-                not per-element entries.
+            (Test Case 1) Two identical nested dicts (3 levels) produce
+                an empty ``out`` list.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        identical = {"a": 1, "b": {"c": 2, "d": {"e": 3, "f": [1, 2, 3]}}}
+        out: list = []
+        _walk_diff("", identical, dict(identical), out)
+        assert out == []
+
+    def test_equal_length_lists_recursed_element_wise(self):
+        """
+        Lists of equal length are walked element-wise: each differing
+        index appears as its own ``"channels[i]"``-style diff entry,
+        not as one bulk list-vs-list entry.
+
+        Tests:
+            (Test Case 1) Two equal-length lists differing at index 2
+                produce a single entry ``("channels[2]", 3, 4)``.
         """
         from spikelab.spike_sorting.report import _walk_diff
 
@@ -742,7 +817,26 @@ class TestWalkDiff:
         actual = {"channels": [1, 2, 4]}
         out: list = []
         _walk_diff("", default, actual, out)
-        assert out == [("channels", [1, 2, 3], [1, 2, 4])]
+        assert out == [("channels[2]", 3, 4)]
+
+    def test_unequal_length_lists_compared_as_leaves(self):
+        """
+        Lists of *different* lengths fall through to the leaf
+        ``!=`` comparison and produce a single bulk diff entry —
+        element-wise recursion is only safe when zip alignment is
+        unambiguous.
+
+        Tests:
+            (Test Case 1) Lists of lengths 2 vs 3 produce one top-
+                level diff entry containing the entire lists.
+        """
+        from spikelab.spike_sorting.report import _walk_diff
+
+        default = {"channels": [1, 2]}
+        actual = {"channels": [1, 2, 3]}
+        out: list = []
+        _walk_diff("", default, actual, out)
+        assert out == [("channels", [1, 2], [1, 2, 3])]
 
     def test_multiple_diffs_collected(self):
         """
@@ -808,3 +902,75 @@ class TestWalkDiff:
         assert out[0] is sentinel
         assert out[-1] == ("a", 1, 2)
         assert len(out) == 2
+
+
+class TestMdFilesSectionBehaviour:
+    """``_md_files_section`` uses ``os.scandir`` with cached stat() to
+    enumerate the results folder. The perf optimisation must not
+    change the rendered table content.
+    """
+
+    def test_files_section_lists_files_with_megabyte_sizes(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) Files of known sizes render with their
+                relative paths and MB-formatted sizes.
+            (Test Case 2) Rows are sorted by size descending.
+        """
+        from spikelab.spike_sorting.report import _md_files_section
+
+        # Create three files of distinct sizes.
+        (tmp_path / "small.bin").write_bytes(b"x" * 1024)  # 1 KiB
+        (tmp_path / "medium.bin").write_bytes(b"x" * (5 * 1024 * 1024))  # 5 MiB
+        (tmp_path / "big.bin").write_bytes(b"x" * (8 * 1024 * 1024))  # 8 MiB
+
+        out = _md_files_section(tmp_path)
+        assert "| File | Size (MB) |" in out
+        # Sorted descending by size — big.bin appears before medium.bin
+        # which appears before small.bin.
+        big_idx = out.index("big.bin")
+        medium_idx = out.index("medium.bin")
+        small_idx = out.index("small.bin")
+        assert big_idx < medium_idx < small_idx
+        # The 8 MB file's size column shows ~8.00.
+        assert "8.00" in out
+
+
+class TestCachedGpuBannerInfoCaches:
+    """``_cached_gpu_banner_info`` runs ``nvidia-smi`` at most once
+    per process: the cache makes the second call (and beyond) return
+    the stored string without re-invoking the subprocess.
+    """
+
+    def test_subprocess_called_at_most_once_across_calls(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Two back-to-back calls invoke
+                ``subprocess.check_output`` exactly once total.
+            (Test Case 2) Resetting ``_GPU_BANNER_CACHE = None``
+                re-enables the subprocess invocation on the next call.
+        """
+        import subprocess
+
+        from spikelab.spike_sorting import pipeline as pipeline_mod
+
+        # Clear the cache so this test is hermetic.
+        monkeypatch.setattr(pipeline_mod, "_GPU_BANNER_CACHE", None)
+
+        call_count = {"n": 0}
+
+        def fake_check_output(*args, **kwargs):
+            call_count["n"] += 1
+            return "FakeGPU, 555.55, 16384 MiB\n"
+
+        monkeypatch.setattr(subprocess, "check_output", fake_check_output)
+
+        first = pipeline_mod._cached_gpu_banner_info()
+        second = pipeline_mod._cached_gpu_banner_info()
+        assert first == second
+        assert call_count["n"] == 1
+
+        # After resetting the cache the subprocess is invoked again.
+        monkeypatch.setattr(pipeline_mod, "_GPU_BANNER_CACHE", None)
+        pipeline_mod._cached_gpu_banner_info()
+        assert call_count["n"] == 2

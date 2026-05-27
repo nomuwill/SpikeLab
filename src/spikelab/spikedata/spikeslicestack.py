@@ -183,13 +183,24 @@ class SpikeSliceStack:
                         "would silently mis-align downstream raster outputs."
                     )
 
-            # Validate that spike times are consistent with the slice
-            # duration. Spike times must be relative to the slice (0-based
-            # or event-centered), not absolute recording times.
+            # Validate that spike times are consistent with the slice's
+            # *intrinsic* length. Spike times must be relative to the
+            # slice (0-based or event-centered), not absolute recording
+            # times.
+            #
+            # Use ``sd.length`` (the SpikeData's own length) rather than
+            # ``end - start`` (the user-supplied tuple duration). The
+            # spike-time validity contract is determined by the SpikeData
+            # object itself; the absolute ``(start, end)`` tuple is a
+            # bookkeeping label that may legitimately differ from
+            # ``sd.length`` for hand-built stacks (e.g. a 1-second slice
+            # tagged with absolute timestamps `(120000, 121000)`).
+            # Driving the bounds check off the tuple duration silently
+            # misclassified in-range spikes as out-of-range whenever
+            # the two diverged.
             for i, (sd, (start, end)) in enumerate(zip(self.spike_stack, self.times)):
-                duration = end - start
                 expected_start = sd.start_time
-                expected_end = sd.start_time + duration
+                expected_end = sd.start_time + sd.length
                 for u, train in enumerate(sd.train):
                     if len(train) == 0:
                         continue
@@ -198,7 +209,8 @@ class SpikeSliceStack:
                             f"Slice {i}, unit {u}: spike times "
                             f"[{train[0]:.1f}, {train[-1]:.1f}] ms fall outside "
                             f"expected range [{expected_start:.1f}, "
-                            f"{expected_end:.1f}] ms. "
+                            f"{expected_end:.1f}] ms "
+                            f"(sd.start_time={sd.start_time}, sd.length={sd.length}). "
                             "Spike times must be relative to the slice (0-based "
                             "or event-centered), not absolute recording times."
                         )
@@ -235,25 +247,46 @@ class SpikeSliceStack:
 
         Parameters:
             slices (int or list): Slice index or list of slice indices to
-                extract.
+                extract. Indices are kept in **caller order**;
+                duplicates are deduplicated (first occurrence wins).
+                Negative indices are accepted and resolved against
+                the current ``S`` dimension.
 
         Returns:
-            result (SpikeSliceStack): New SpikeSliceStack containing only the
-                specified slices. Shape changes from S to S_trimmed. All
-                units and neuron_attributes are carried over.
+            result (SpikeSliceStack): New SpikeSliceStack containing only
+                the specified slices in caller-supplied order. Shape
+                changes from S to S_trimmed. All units and
+                neuron_attributes are carried over.
+
+        Notes:
+            - Previously the input was silently sorted ascending, so
+              ``subslice([2, 0, 1])`` returned ``[0, 1, 2]`` and any
+              caller that intended a reordering for plotting or
+              concatenation got the wrong layout. The caller-order +
+              dedupe behaviour is consistent with the ``subset(...,
+              preserve_order=True)`` design family.
         """
         S = len(self.spike_stack)
         if isinstance(slices, int):
             slices = [slices]
         for s in slices:
+            if not isinstance(s, (int, np.integer)):
+                raise TypeError(
+                    f"Slice indices must be integers, got {type(s).__name__}: {s!r}"
+                )
             if s >= S or s < -S:
                 raise ValueError(f"One or more slice indices out of range for S={S}")
-        slices = sorted(slices)
-        new_spike_stack = []
-        new_times = []
+        # Preserve caller order and deduplicate (first occurrence wins).
+        seen: set = set()
+        ordered: list = []
         for s in slices:
-            new_spike_stack.append(self.spike_stack[s])
-            new_times.append(self.times[s])
+            si = int(s) % S if S else int(s)
+            if si not in seen:
+                seen.add(si)
+                ordered.append(si)
+        slices = ordered
+        new_spike_stack = [self.spike_stack[s] for s in slices]
+        new_times = [self.times[s] for s in slices]
         return SpikeSliceStack(
             spike_stack=new_spike_stack,
             times_start_to_end=new_times,
@@ -295,6 +328,15 @@ class SpikeSliceStack:
             # positional correspondence to unit indices.
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in index order. "
+                    "Drop preserve_order=True or use index-based subset() "
+                    "to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
             unit_set = set(units)
             kept_indices = []

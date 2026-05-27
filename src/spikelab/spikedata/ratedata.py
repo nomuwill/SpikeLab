@@ -115,7 +115,10 @@ class RateData:
     def __repr__(self) -> str:
         t0 = float(self.times[0]) if len(self.times) > 0 else 0.0
         t1 = float(self.times[-1]) if len(self.times) > 0 else 0.0
-        return f"RateData(shape={self.inst_Frate_data.shape}, time_range=[{t0:.1f}, {t1:.1f}])"
+        return (
+            f"RateData(shape={self.inst_Frate_data.shape}, "
+            f"time_range=[{t0:.1f}, {t1:.1f}], rate_unit={self.rate_unit!r})"
+        )
 
     def subset(self, units, by=None, preserve_order=False):
         """Extract a subset of units/neurons from the rate data.
@@ -152,6 +155,15 @@ class RateData:
             # positional correspondence to unit indices.
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in self.train "
+                    "order. Drop preserve_order=True or use index-based "
+                    "subset() to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
             wanted = set(units)
             selected = [
@@ -272,6 +284,15 @@ class RateData:
             - To slice by time values instead of array indices, use
               ``subtime(start, end)``.
         """
+        # Empty-times guard. ``subtime`` raises a clear "cannot apply
+        # subtime to RateData with empty times array" — match that
+        # contract here so callers from MCP (``ratedata_subtime``) see
+        # the same diagnostic regardless of which path they hit.
+        if len(self.times) == 0:
+            raise ValueError(
+                "cannot apply subtime_by_index to RateData with empty "
+                "times array (no time points to slice)."
+            )
         if start_idx < 0:
             start_idx += len(self.times)
         if end_idx < 0:
@@ -312,16 +333,7 @@ class RateData:
               stride.
         """
         from .rateslicestack import RateSliceStack
-
-        if overlap < 0:
-            raise ValueError(
-                f"overlap must be non-negative, got {overlap}. The parameter "
-                "represents an overlap, not a stride; use a smaller `length` "
-                "and post-filter slices for gapped windows."
-            )
-        step = length - overlap
-        if step <= 0:
-            raise ValueError("overlap must be less than length")
+        from .utils import _frame_window_starts
 
         if len(self.times) < 2:
             raise ValueError(
@@ -330,18 +342,16 @@ class RateData:
                 "required to infer the bin step_size."
             )
 
-        t0 = float(self.times[0])
-        t_end = float(self.times[-1])
-
-        # frames() places windows on the uniform grid implied by
-        # ``np.median(np.diff(times))``. Using the median (rather than
-        # ``times[1] - times[0]``) is robust to a single anomalous
-        # gap or duplicate-time pair at the start that
-        # ``RateData.__init__`` allows under its monotonically-
-        # non-decreasing contract — without this, the first-pair
-        # step could poison the uniformity check below for an
-        # otherwise-uniform grid.
+        # Tier L-E5: window-generation logic factored out to
+        # ``_frame_window_starts`` and shared with ``SpikeData.frames``.
+        # Uniform-grid validation stays here because it's
+        # RateData-specific — the helper consumes pre-validated
+        # ``effective_end`` (one bin past the last sample).
         diffs = np.diff(np.asarray(self.times, dtype=float))
+        # ``np.median`` (not ``times[1] - times[0]``) is robust to a
+        # single anomalous gap or duplicate-time pair at the start
+        # that ``RateData.__init__`` allows under its monotonically-
+        # non-decreasing contract.
         step_size = float(np.median(diffs))
         if not np.allclose(diffs, step_size, rtol=1e-6, atol=1e-9):
             raise ValueError(
@@ -351,16 +361,12 @@ class RateData:
                 "uniform grid before framing."
             )
 
-        upper = t_end - length + step_size + 1e-9
-        times = [
-            (float(start), float(start) + length)
-            for start in np.arange(t0, upper, step)
-        ]
-        if not times:
-            raise ValueError(
-                f"Recording length ({t_end - t0 + step_size:.1f} ms) is shorter "
-                f"than frame length ({length} ms)"
-            )
+        times = _frame_window_starts(
+            t0=float(self.times[0]),
+            effective_end=float(self.times[-1]) + step_size,
+            length=length,
+            overlap=overlap,
+        )
         return RateSliceStack(self, times_start_to_end=times)
 
     def get_pairwise_fr_corr(
@@ -414,6 +420,12 @@ class RateData:
             corr_matrix_this_event[n1, n2] = max_corr
             lag_matrix_this_event[n1, n2] = max_lag_idx
             corr_matrix_this_event[n2, n1] = max_corr
+            # Diagonal note: when n1 == n2 (self-correlation), the
+            # symmetric overwrite assigns ``-max_lag_idx`` over the
+            # same diagonal cell. This is benign because a unit's
+            # auto-correlation peaks at lag 0 (``-0 == 0``); the cell
+            # is therefore self-consistent regardless of which copy
+            # writes last.
             lag_matrix_this_event[n2, n1] = -max_lag_idx
 
         # Output is UxU, wrapped in PairwiseCompMatrix for API consistency

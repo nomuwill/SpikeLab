@@ -10,22 +10,87 @@ import yaml
 
 from .models import ClusterProfile, JobSpec
 
+# Characters that can break out of a double-quoted YAML scalar. Each
+# entry is documented for posterity:
+#   ``\n`` / ``\r``  — start a new YAML node; terminate the scalar early.
+#   ``\t``           — YAML rejects tabs in indentation, and many parsers
+#                       reject them inside flow scalars too.
+#   ``"``            — closes the surrounding double-quoted scalar.
+#   ``\\``           — would start a YAML escape sequence.
+# Characters that are safe inside double-quoted scalars and therefore
+# intentionally NOT in this set: ``:``, ``#``, ``{`` / ``}``, ``[`` /
+# ``]``, ``&``, ``*``, ``!``, ``|``, ``>``, ``'``, ``%``, ``@``,
+# `` ` ``. None of these can terminate a double-quoted scalar.
 _YAML_UNSAFE_CHARS = set('\n\r\t"\\')
 
 
-def _sanitize_yaml_value(value: str) -> str:
-    """Strip characters that could break out of a quoted YAML value."""
-    return "".join(ch for ch in value if ch not in _YAML_UNSAFE_CHARS)
+def _sanitize_yaml_value(value: str, *, field: Optional[str] = None) -> str:
+    """Validate that *value* is safe to embed inside a quoted YAML scalar.
+
+    Previously this function silently stripped any character in
+    ``_YAML_UNSAFE_CHARS`` from *value* and returned the truncated
+    string. That mangled commands and label values without notice —
+    e.g. a ``command=['python', '-c "print(\\"x\\")"']`` lost both
+    double-quotes and ran ``python -c print(x)`` inside the container,
+    silently. Tier L-C1 replaces the silent strip with a fail-fast
+    ``ValueError`` naming the offending character(s) and (if known)
+    the field that contained them. Callers that legitimately need
+    multi-line or quote-containing content should pre-process: base64-
+    encode the payload, or write the literal value to a sidecar file
+    referenced by path. Returns *value* unchanged on success.
+
+    Parameters:
+        value (str): The string to validate.
+        field (str | None): Optional dotted-path field name used in
+            the error message (e.g. ``"container.env.FOO"``). Helps
+            operators locate the offending entry in the job spec.
+
+    Raises:
+        ValueError: If *value* contains any character in
+            ``_YAML_UNSAFE_CHARS``.
+    """
+    bad = sorted({ch for ch in value if ch in _YAML_UNSAFE_CHARS})
+    if bad:
+        bad_repr = ", ".join(repr(c) for c in bad)
+        field_str = f" in field {field!r}" if field else ""
+        raise ValueError(
+            f"YAML-unsafe character(s){field_str}: {bad_repr} in "
+            f"value={value!r}. These characters can break out of a "
+            "double-quoted YAML scalar and would corrupt the rendered "
+            "manifest. Pre-process the value (e.g. base64-encode "
+            "multi-line content, or write to a sidecar file referenced "
+            "by path) before passing it to the job spec."
+        )
+    return value
 
 
-def _sanitize_map(mapping: Dict[str, str]) -> Dict[str, str]:
-    """Sanitize all values in a string->string mapping for YAML embedding."""
-    return {k: _sanitize_yaml_value(str(v)) for k, v in mapping.items()}
+def _sanitize_map(
+    mapping: Dict[str, str], *, field: Optional[str] = None
+) -> Dict[str, str]:
+    """Validate all values in a string->string mapping for YAML embedding.
+
+    Per-entry failures include the dotted-path field name (e.g.
+    ``"container.env.FOO"``) when *field* is provided, so the
+    ValueError pinpoints the offending entry.
+    """
+    out: Dict[str, str] = {}
+    for k, v in mapping.items():
+        sub_field = f"{field}.{k}" if field else k
+        out[k] = _sanitize_yaml_value(str(v), field=sub_field)
+    return out
 
 
-def _sanitize_list(items: List[str]) -> List[str]:
-    """Sanitize a list of strings for YAML embedding."""
-    return [_sanitize_yaml_value(str(item)) for item in items]
+def _sanitize_list(items: List[str], *, field: Optional[str] = None) -> List[str]:
+    """Validate a list of strings for YAML embedding.
+
+    Per-entry failures include the indexed field name (e.g.
+    ``"container.command[2]"``) when *field* is provided.
+    """
+    out: List[str] = []
+    for i, item in enumerate(items):
+        sub_field = f"{field}[{i}]" if field else f"[{i}]"
+        out.append(_sanitize_yaml_value(str(item), field=sub_field))
+    return out
 
 
 def _template_env() -> Environment:
@@ -36,6 +101,35 @@ def _template_env() -> Environment:
         trim_blocks=True,
         lstrip_blocks=True,
     )
+
+
+_VOLUME_STRING_FIELDS = (
+    "name",
+    "mount_path",
+    "sub_path",
+    "secret_name",
+    "pvc_name",
+)
+
+
+def _sanitize_volume_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate string fields on a single volume-mount dict for YAML embedding.
+
+    Mirrors the ``container.env`` / ``container.command`` validation
+    pass in ``build_template_context`` but applied to the volume-mount
+    payload. A volume name containing ``\\n`` or ``"`` could break
+    the rendered YAML structure; this raises ``ValueError`` per-field
+    if any unsafe character is present (Tier L-C1).
+    """
+    cleaned = dict(entry)
+    vol_name = cleaned.get("name", "<unnamed>")
+    for field in _VOLUME_STRING_FIELDS:
+        value = cleaned.get(field)
+        if isinstance(value, str):
+            cleaned[field] = _sanitize_yaml_value(
+                value, field=f"volume[{vol_name}].{field}"
+            )
+    return cleaned
 
 
 def _volume_entry_key(entry: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -69,7 +163,7 @@ def _apply_namespace_hooks(
 
     # Always-on default volumes from profile
     for vol in profile.default_volumes:
-        entry = vol.model_dump()
+        entry = _sanitize_volume_entry(vol.model_dump())
         key = _volume_entry_key(entry)
         if key not in seen:
             merged_mounts.append(entry)
@@ -89,12 +183,22 @@ def _apply_namespace_hooks(
     # Merge hook env_defaults (hook values do not override user-specified keys)
     if hook.env_defaults:
         existing_env = updated_container.get("env", {})
-        merged_env = dict(hook.env_defaults)
+        # Validate hook env_defaults BEFORE the merge — the user's
+        # ``container.env`` was already validated at the call site in
+        # ``build_template_context``, but hook values bypass that pass.
+        # Tier L-C1: ``_sanitize_map`` now raises rather than silently
+        # stripping, so an unsafe character in a hook's env_defaults
+        # surfaces immediately with the field name
+        # ``hooks.<namespace>.env_defaults.<KEY>``.
+        merged_env = _sanitize_map(
+            dict(hook.env_defaults),
+            field=f"hooks.{namespace}.env_defaults",
+        )
         merged_env.update(existing_env)  # user keys take precedence
         updated_container["env"] = merged_env
 
     for vol in hook.required_volumes:
-        entry = vol.model_dump()
+        entry = _sanitize_volume_entry(vol.model_dump())
         key = _volume_entry_key(entry)
         if key not in seen:
             merged_mounts.append(entry)
@@ -165,13 +269,19 @@ def build_template_context(
     labels.update(job_spec.labels)
     if extra_labels:
         labels.update(extra_labels)
-    labels = _sanitize_map(labels)
+    labels = _sanitize_map(labels, field="labels")
     namespace = job_spec.namespace or profile.namespace
-    mounts = [volume.model_dump() for volume in job_spec.volumes]
+    mounts = [
+        _sanitize_volume_entry(volume.model_dump()) for volume in job_spec.volumes
+    ]
     container = job_spec.container.model_dump()
-    container["env"] = _sanitize_map(container.get("env", {}))
-    container["command"] = _sanitize_list(container.get("command", []))
-    container["args"] = _sanitize_list(container.get("args", []))
+    container["env"] = _sanitize_map(container.get("env", {}), field="container.env")
+    container["command"] = _sanitize_list(
+        container.get("command", []), field="container.command"
+    )
+    container["args"] = _sanitize_list(
+        container.get("args", []), field="container.args"
+    )
     affinity = profile.affinity
     container, mounts = _apply_namespace_hooks(
         namespace=namespace,
@@ -181,8 +291,8 @@ def build_template_context(
     )
     pod_volumes = _build_pod_volumes(mounts)
     return {
-        "job_name": _sanitize_yaml_value(job_name),
-        "namespace": _sanitize_yaml_value(namespace),
+        "job_name": _sanitize_yaml_value(job_name, field="job_name"),
+        "namespace": _sanitize_yaml_value(namespace, field="namespace"),
         "labels": labels,
         "container": container,
         "resources": job_spec.resources.model_dump(),
@@ -201,6 +311,10 @@ def build_template_context(
         "ttl_seconds_after_finished": job_spec.ttl_seconds_after_finished,
         "backoff_limit": job_spec.backoff_limit,
         "active_deadline_seconds": job_spec.active_deadline_seconds,
+        "image_pull_secrets": [
+            _sanitize_yaml_value(s, field="image_pull_secrets")
+            for s in profile.image_pull_secrets
+        ],
     }
 
 

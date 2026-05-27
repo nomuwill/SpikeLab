@@ -2888,6 +2888,90 @@ class TestLoaderMCPToolsCoverage:
         assert result["info"]["num_neurons"] == 2
         assert "workspace_id" in result
         mock_load.assert_called_once()
+        # Default (no explicit collection) should forward ``collection=None``
+        # so the underlying loader runs its heuristic search.
+        assert mock_load.call_args.kwargs.get("collection") is None
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    @patch("spikelab.mcp_server.tools.data_loaders.load_spikedata_from_ibl")
+    async def test_load_from_ibl_forwards_explicit_collection(self, mock_load):
+        """
+        Tier L-F2: the ``collection`` MCP parameter must reach the
+        underlying ``load_spikedata_from_ibl`` call so the heuristic
+        search can be short-circuited from agent-facing callers too.
+
+        Tests:
+            (Test Case 1) Passing ``collection="alf/probe00/pykilosort"``
+                forwards that value as the ``collection`` keyword.
+            (Test Case 2) Passing ``collection=""`` (the MCP empty-string
+                default) maps to ``collection=None`` on the underlying
+                call, preserving heuristic behavior.
+        """
+        train = [[10.0, 20.0], [15.0]]
+        sd = SpikeData(train, length=30.0)
+        mock_load.return_value = sd
+
+        # Test Case 1: explicit collection forwarded.
+        await data_loaders.load_from_ibl(
+            eid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            pid="11111111-2222-3333-4444-555555555555",
+            collection="alf/probe00/pykilosort",
+        )
+        assert mock_load.call_args.kwargs.get("collection") == "alf/probe00/pykilosort"
+
+        # Test Case 2: empty string → None (heuristic mode preserved).
+        await data_loaders.load_from_ibl(
+            eid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            pid="11111111-2222-3333-4444-555555555555",
+            collection="",
+        )
+        assert mock_load.call_args.kwargs.get("collection") is None
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    @patch("spikelab.mcp_server.tools.data_loaders.load_spikedata_from_ibl")
+    async def test_load_from_ibl_surfaces_array_metadata_as_summary(self, mock_load):
+        """
+        Array-valued IBL metadata (e.g. ``trial_start_times``) appears
+        in the response under ``info.metadata`` as a JSON-friendly
+        ``__array_summary__`` dict (shape / dtype / size) rather than
+        being dropped or inlined as a huge nested list.
+
+        Tests:
+            (Test Case 1) An ndarray metadata entry appears as a dict
+                with ``__array_summary__: True``.
+            (Test Case 2) The summary's ``shape``, ``dtype``, and
+                ``size`` match the source array.
+            (Test Case 3) Plain scalar metadata is passed through
+                verbatim.
+        """
+        train = [[10.0, 20.0], [15.0]]
+        trial_start_times = np.array([0.0, 1.0, 2.5, 3.0], dtype=float)
+        sd = SpikeData(
+            train,
+            length=30.0,
+            metadata={
+                "trial_start_times": trial_start_times,
+                "subject": "mouse_42",  # scalar passthrough
+            },
+        )
+        mock_load.return_value = sd
+
+        result = await data_loaders.load_from_ibl(
+            eid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            pid="11111111-2222-3333-4444-555555555555",
+        )
+        metadata = result["info"]["metadata"]
+        # Array summary surfaced under the metadata key.
+        summary = metadata["trial_start_times"]
+        assert isinstance(summary, dict)
+        assert summary["__array_summary__"] is True
+        assert summary["shape"] == [4]
+        assert summary["dtype"] == str(trial_start_times.dtype)
+        assert summary["size"] == 4
+        # Scalar metadata passthrough.
+        assert metadata["subject"] == "mouse_42"
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -3434,20 +3518,88 @@ class TestComputeResampledISI:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_single_time_point(self, loaded_ws):
+    async def test_non_1d_times_rejected(self, loaded_ws):
         """
-        Single time point succeeds and returns a valid RateData.
+        ``compute_resampled_isi`` rejects non-1D times at the MCP
+        boundary with a clear "1-D array" message — the underlying
+        ``resampled_isi`` would otherwise surface a deep-stack shape
+        error.
 
         Tests:
-            (Test Case 1) compute_resampled_isi with times=[25.0] stores a
-                result with 1 time point.
+            (Test Case 1) A 2-D times array raises ValueError mentioning
+                "1-D array".
         """
         ws_id, ns = loaded_ws
-        result = await analysis.compute_resampled_isi(
-            ws_id, ns, "rates_single", times=[25.0]
-        )
-        assert result["n_timepoints"] == 1
-        assert result["key"] == "rates_single"
+        with pytest.raises(ValueError, match="1-D array"):
+            await analysis.compute_resampled_isi(
+                ws_id, ns, "rates_2d", times=[[1.0, 2.0], [3.0, 4.0]]
+            )
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_non_monotonic_times_rejected(self, loaded_ws):
+        """
+        ``compute_resampled_isi`` rejects non-strictly-increasing times
+        at the MCP boundary with a clear "strictly increasing" message.
+
+        Tests:
+            (Test Case 1) Out-of-order times raise ValueError mentioning
+                "strictly increasing".
+        """
+        ws_id, ns = loaded_ws
+        with pytest.raises(ValueError, match="strictly increasing"):
+            await analysis.compute_resampled_isi(
+                ws_id, ns, "rates_unsorted", times=[1.0, 3.0, 2.0, 4.0]
+            )
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_non_uniform_times_rejected(self, loaded_ws):
+        """
+        ``compute_resampled_isi`` rejects non-uniformly-spaced times at
+        the MCP boundary with a "uniformly spaced" message and surfaces
+        the min/max/median step so the operator can act.
+
+        Tests:
+            (Test Case 1) Non-uniform times raise ValueError mentioning
+                "uniformly spaced".
+            (Test Case 2) The error message names min, max, and median
+                step values.
+        """
+        ws_id, ns = loaded_ws
+        # Uniform 1 ms diffs except one 4 ms gap.
+        with pytest.raises(ValueError) as excinfo:
+            await analysis.compute_resampled_isi(
+                ws_id,
+                ns,
+                "rates_nonuniform",
+                times=[0.0, 1.0, 2.0, 6.0, 7.0, 8.0],
+            )
+        msg = str(excinfo.value)
+        assert "uniformly spaced" in msg
+        assert "median step" in msg
+        assert "min step" in msg
+        assert "max step" in msg
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    async def test_single_time_point_rejected(self, loaded_ws):
+        """
+        Single time point is rejected up-front (Tier F).
+
+        Tests:
+            (Test Case 1) ``compute_resampled_isi`` with times=[25.0]
+                raises ValueError at the MCP layer — the new pre-check
+                requires at least 2 entries to infer the uniform step.
+                Previously this fell through to the core layer where it
+                also raised, but with a less actionable deep-stack
+                message.
+        """
+        ws_id, ns = loaded_ws
+        with pytest.raises(ValueError, match="at least 2 entries"):
+            await analysis.compute_resampled_isi(
+                ws_id, ns, "rates_single", times=[25.0]
+            )
 
     @pytestmark_server
     @pytest.mark.asyncio
@@ -4582,6 +4734,42 @@ class TestUniqueNamespace:
         result = _unique_namespace(ws, "rec_1")
         assert result == "rec_1_1"
 
+    def test_collision_emits_userwarning_naming_both_namespaces(self):
+        """
+        On collision ``_unique_namespace`` emits a UserWarning whose
+        message names both the requested namespace and the assigned
+        (bumped) one — so the agent can see that its requested key
+        was bumped without parsing the returned string.
+
+        Tests:
+            (Test Case 1) A UserWarning is emitted.
+            (Test Case 2) The warning message contains the requested
+                namespace.
+            (Test Case 3) The warning message contains the assigned
+                namespace.
+        """
+        if not MCP_SERVER_AVAILABLE:
+            pytest.skip("MCP server not available")
+        import warnings as _warnings
+
+        from spikelab.mcp_server.tools.data_loaders import _unique_namespace
+
+        wm = get_workspace_manager()
+        ws_id = wm.create_workspace(name="ns_collide_warn_ws")
+        ws = wm.get_workspace(ws_id)
+        ws.store("rec", "item", np.zeros(3))
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            assigned = _unique_namespace(ws, "rec")
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "rec" in m]
+        assert relevant, warn_msgs
+        assert "rec" in relevant[0]
+        # The assigned name (rec_1 here) is also surfaced.
+        assert assigned in relevant[0]
+
 
 class TestLoadFromHDF5:
     """Edge case tests for load_from_hdf5 MCP tool."""
@@ -5112,25 +5300,25 @@ class TestAppendSessionMCP2:
 
     @pytestmark_server
     @pytest.mark.asyncio
-    async def test_negative_offset(self, loaded_ws):
+    async def test_negative_offset_rejected(self, loaded_ws):
         """
-        append_session with negative offset.
+        append_session rejects negative offset (Tier F).
 
         Tests:
-            (Test Case 1) Negative offset is accepted; the second session
-                overlaps with the first.
+            (Test Case 1) Negative offset propagates as ValueError from
+                the core ``SpikeData.append`` boundary check — the
+                previous overlay-by-shift behaviour silently
+                interleaved spikes from the two sessions.
         """
         ws_id, ns = loaded_ws
-        result = await analysis.append_session(
-            ws_id,
-            namespace_a=ns,
-            namespace_b=ns,
-            out_namespace="neg_off_ns",
-            offset=-10.0,
-        )
-        sd = get_workspace_manager().get_workspace(ws_id).get("neg_off_ns", "spikedata")
-        # With offset=-10, length = 50 + 50 - 10 = 90
-        assert sd.length == pytest.approx(90.0)
+        with pytest.raises(ValueError, match="offset must be non-negative"):
+            await analysis.append_session(
+                ws_id,
+                namespace_a=ns,
+                namespace_b=ns,
+                out_namespace="neg_off_ns",
+                offset=-10.0,
+            )
 
 
 class TestConcatenateUnitsMCP:

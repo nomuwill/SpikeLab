@@ -1294,6 +1294,22 @@ from spikelab.spikedata.utils import (
 class TestResampledIsi:
     """Edge-case tests for _resampled_isi."""
 
+    def test_docstring_pins_int_round_bin_assignment(self):
+        """
+        ``_resampled_isi`` documents that bin assignment uses
+        ``int(round(...))`` rather than ``floor``. The docstring is
+        the only place this contract is spelled out for users
+        building parallel grids by hand. Pin the substring so a
+        future API/comment rewrite that drops the rounding language
+        surfaces as a test failure.
+
+        Tests:
+            (Test Case 1) ``_resampled_isi.__doc__`` contains the
+                substring ``"int(round"``.
+        """
+        assert _resampled_isi.__doc__ is not None
+        assert "int(round" in _resampled_isi.__doc__
+
     def test_resampled_isi_identical_spike_times(self):
         """
         Identical spike times are deduplicated with a RuntimeWarning.
@@ -3270,6 +3286,55 @@ from spikelab.spikedata.utils import _validate_time_start_to_end
 class TestValidateTimeStartToEnd:
     """Edge case tests for _validate_time_start_to_end."""
 
+    def test_unsorted_input_returns_sorted_and_warns(self):
+        """
+        ``_validate_time_start_to_end`` always returns windows sorted
+        by start time. When the input was NOT already sorted, the
+        function emits a UserWarning naming the parallel-array
+        misalignment risk so callers that pair the times with an
+        external positional array (e.g. ``spike_stack``) see the
+        reorder rather than discovering a silent index shuffle.
+
+        Tests:
+            (Test Case 1) Input ``[(100, 200), (50, 150)]`` returns
+                ``[(50, 150), (100, 200)]`` (sorted).
+            (Test Case 2) A UserWarning is emitted whose message
+                mentions parallel arrays / misalignment.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            result = _validate_time_start_to_end([(100.0, 200.0), (50.0, 150.0)])
+
+        assert result == [(50.0, 150.0), (100.0, 200.0)]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [
+            m for m in warn_msgs if "parallel" in m.lower() and "misalign" in m.lower()
+        ]
+        assert relevant, warn_msgs
+
+    def test_already_sorted_input_does_not_warn(self):
+        """
+        When the caller passes already-sorted windows, no reorder
+        warning fires (the function only warns when the sort changed
+        the order).
+
+        Tests:
+            (Test Case 1) Sorted input returns unchanged.
+            (Test Case 2) No UserWarning mentioning "misalignment" is
+                emitted.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            result = _validate_time_start_to_end([(50.0, 150.0), (100.0, 200.0)])
+
+        assert result == [(50.0, 150.0), (100.0, 200.0)]
+        warn_msgs = [str(rec.message) for rec in w]
+        assert not any("misalign" in m.lower() for m in warn_msgs), warn_msgs
+
     def test_all_negative_start_preserved(self):
         """
         Windows with negative start times are preserved (not filtered).
@@ -3840,6 +3905,39 @@ class TestComputeFootprint:
         # Channel 1 has the neighbor template (0.5x)
         assert fp[1, 2] == pytest.approx(-1.5)
 
+    def test_positive_going_template_locates_peak_via_abs(self):
+        """
+        Positive-going templates (inverted-polarity sorter output) must
+        place the alignment point at ``argmax(abs(template))`` so the
+        peak sample lands at ``f_rel_to_trough[0]`` of the footprint.
+
+        Tests:
+            (Test Case 1) A template with a positive peak at index 2 is
+                centered at the footprint's anchor column (column 2 for
+                ``f_rel_to_trough=(2, 2)``), not at the least-positive
+                sample.
+        """
+        from spikelab.spikedata.utils import _compute_footprint
+
+        # Positive-going template — peak at index 2, value +3.0.
+        # ``np.argmin`` would return index 0 or 4 (the least-positive
+        # samples), producing a wrong alignment.
+        template = np.array([0.0, 1.0, 3.0, 1.0, 0.0], dtype=float)
+        attrs = {
+            "template": template,
+            "neighbor_templates": np.zeros((1, 5)),
+            "channel": 1,
+            "neighbor_channels": np.array([1]),
+        }
+        fp = _compute_footprint(attrs, f_rel_to_trough=(2, 2), n_channels=3)
+
+        # Anchor column = f_rel_to_trough[0] = 2; the +3.0 peak lives
+        # at column 2 of the main-channel row.
+        assert fp[1, 2] == 3.0
+        # Pre/post samples are also placed correctly.
+        assert fp[1, 1] == 1.0
+        assert fp[1, 3] == 1.0
+
 
 # ---------------------------------------------------------------------------
 # _compute_footprint_similarity
@@ -3907,6 +4005,56 @@ class TestComputeFootprintSimilarity:
         fp2 = np.ones((3, 5))
         with pytest.raises(ValueError, match="same shape"):
             _compute_footprint_similarity(fp1, fp2)
+
+
+class TestComputeFootprintSimilaritySeenFiniteFlag:
+    """``_compute_footprint_similarity`` tracks "any finite sim seen"
+    with an explicit ``seen_finite`` flag rather than the previous
+    ``-np.inf`` sentinel. If every per-lag ``_cosine_sim`` is NaN the
+    function returns NaN; otherwise it returns the max of the finite
+    values.
+    """
+
+    def test_all_nan_per_lag_returns_nan(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Under a mock ``_cosine_sim`` that always
+                returns NaN, the function returns NaN (not -inf).
+        """
+        import spikelab.spikedata.utils as utils_mod
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        monkeypatch.setattr(utils_mod, "_cosine_sim", lambda a, b: np.nan)
+
+        fp1 = np.ones((2, 5))
+        fp2 = np.ones((2, 5))
+        result = _compute_footprint_similarity(fp1, fp2, max_lag=2)
+        assert np.isnan(result)
+
+    def test_max_across_finite_lags_is_returned(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Under a mock ``_cosine_sim`` that returns a
+                cycle of finite values [0.1, 0.5, 0.3] across lags,
+                the function returns 0.5 (the max).
+        """
+        import spikelab.spikedata.utils as utils_mod
+        from spikelab.spikedata.utils import _compute_footprint_similarity
+
+        values = iter([0.1, 0.5, 0.3])
+
+        def fake_cosine_sim(a, b):
+            try:
+                return next(values)
+            except StopIteration:
+                return 0.0
+
+        monkeypatch.setattr(utils_mod, "_cosine_sim", fake_cosine_sim)
+        fp1 = np.ones((2, 5))
+        fp2 = np.ones((2, 5))
+        # max_lag=1 → 3 lag candidates (-1, 0, 1).
+        result = _compute_footprint_similarity(fp1, fp2, max_lag=1)
+        assert result == pytest.approx(0.5)
 
 
 class TestComputeFootprintSimilarityAllZero:
@@ -4529,6 +4677,60 @@ class TestComputeCrossCorrelationWithLagAllNaN:
         score, lag = compute_cross_correlation_with_lag(a, b, max_lag=0)
         assert np.isnan(score)
         assert lag == 0
+
+    @pytest.mark.parametrize("N", [4, 5, 6, 8, 9, 16, 17])
+    def test_anti_symmetric_lag_under_swap_for_any_N(self, N):
+        """
+        ``compute_cross_correlation_with_lag(a, b)`` returns a lag
+        that is exactly the negation of the lag returned by
+        ``compute_cross_correlation_with_lag(b, a)``. The new
+        ``mode='full'`` + symmetric-slice implementation makes this
+        identity hold for both even and odd ``N``; the previous
+        ``mode='same'`` path failed it for even ``N`` at the
+        boundary because the lag window was ``[-N/2, +N/2 - 1]``.
+
+        Tests:
+            (Test Case 1) For ``N`` in {4, 5, 6, 8, 9, 16, 17}, random
+                ``a, b`` of length ``N`` produce ``lag(a,b) + lag(b,a)
+                == 0``.
+        """
+        from spikelab.spikedata.utils import (
+            compute_cross_correlation_with_lag,
+        )
+
+        rng = np.random.default_rng(N)
+        a = rng.standard_normal(N)
+        b = rng.standard_normal(N)
+        _, lag_ab = compute_cross_correlation_with_lag(a, b, max_lag=N // 2)
+        _, lag_ba = compute_cross_correlation_with_lag(b, a, max_lag=N // 2)
+        assert lag_ab + lag_ba == 0
+
+    def test_extreme_lag_boundary_even_N_now_reachable(self):
+        """
+        With ``N=6``, a delta at sample 0 (``a``) vs a delta at
+        sample 5 (``b``) has a true peak at lag ``-5`` for
+        ``corr(a, b)``. The new ``mode='full'`` path reaches lag
+        ``+N/2`` symmetrically — pre-Tier-L this lag value was
+        unreachable for even N because ``mode='same'`` exposed lags
+        only up to ``+N/2 - 1``.
+
+        Tests:
+            (Test Case 1) ``lag(a, b) == -5``.
+            (Test Case 2) ``lag(b, a) == +5`` (the new symmetric
+                positive boundary).
+        """
+        from spikelab.spikedata.utils import (
+            compute_cross_correlation_with_lag,
+        )
+
+        a = np.zeros(6)
+        a[0] = 1.0
+        b = np.zeros(6)
+        b[5] = 1.0
+        _, lag_ab = compute_cross_correlation_with_lag(a, b, max_lag=5)
+        _, lag_ba = compute_cross_correlation_with_lag(b, a, max_lag=5)
+        assert lag_ab == -5
+        assert lag_ba == 5
 
     def test_both_signals_all_nan_returns_nan_with_lag(self):
         """

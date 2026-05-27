@@ -471,6 +471,16 @@ class RateSliceStack:
             # --- Vectorized fast path (no lag search) -------------------------
             # For each unit, compute the full S x S normalised dot-product
             # matrix in one matrix multiply instead of an O(S^2) Python loop.
+            # The build-then-mask pattern (compute corr_matrix over ALL
+            # slices, then assign only into valid-vs-valid pairs of
+            # ``unit_corr``) is mathematically equivalent to slicing by
+            # ``valid_idx`` before the matmul — the invalid columns
+            # contribute to ``corr_matrix`` but are never read.
+            # Mask-after-matmul is preferred because (a) BLAS matmul on
+            # a contiguous (T, S) array beats two non-contiguous
+            # ``rates[:, valid_idx]`` slices, and (b) the S<2 short-
+            # circuit above already guarantees that the matmul has
+            # work to do.
             for unit in range(num_units):
                 rates = event_stack[unit, :, :]  # (T, S)
                 slice_means = np.mean(rates, axis=0)  # (S,)
@@ -655,14 +665,18 @@ class RateSliceStack:
         """
         output = []
         # U x T x S
+        # Pre-compute the relative-time vector ONCE outside the loop;
+        # ``np.arange(T) * self.step_size`` is identical for every slice
+        # (only the per-slice ``start`` offset changes), so the in-loop
+        # allocation was redundant work proportional to S.
+        rel_times = np.arange(self.event_stack.shape[1]) * self.step_size
         for s_idx in range(self.event_stack.shape[2]):
             matrix = self.event_stack[:, :, s_idx]
             start, end = self.times[s_idx]
-            time = start + np.arange(matrix.shape[1]) * self.step_size
+            time = start + rel_times
             if time[-1] > end:
                 # Extremely rare edge case with floating point calculation. Should never happen but just in case
                 time = np.clip(time, start, end - np.finfo(float).eps)
-            # time = np.arange(start, end, self.step_size)
             rate_obj = RateData(matrix, time, neuron_attributes=self.neuron_attributes)
             output.append(rate_obj)
         return output
@@ -822,6 +836,15 @@ class RateSliceStack:
             # to unit indices.
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in index order. "
+                    "Drop preserve_order=True or use index-based subset() "
+                    "to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
             wanted = set(units)
             selected = [
@@ -915,29 +938,50 @@ class RateSliceStack:
 
         Parameters:
             slices (int or list): Slice index or list of slice indices to
-                extract.
+                extract. Indices are kept in **caller order**;
+                duplicates are deduplicated (first occurrence wins).
+                Negative indices are accepted and resolved against
+                the current ``S`` dimension.
 
         Returns:
             result (RateSliceStack): New RateSliceStack containing only the
-                specified slices. Shape changes from (U, T, S) to
-                (U, T, S_trimmed).
+                specified slices in caller-supplied order. Shape changes
+                from (U, T, S) to (U, T, S_trimmed).
 
         Notes:
             - All units, neuron_attributes, and step_size are carried over
               from the original.
+            - Previously the input was silently sorted ascending, so
+              ``subslice([2, 0, 1])`` returned ``[0, 1, 2]`` and any
+              caller that intended a reordering for plotting or
+              concatenation got the wrong layout. The caller-order +
+              dedupe behaviour is consistent with the ``subset(...,
+              preserve_order=True)`` design family.
         """
         length = self.event_stack.shape[2]
         if isinstance(slices, int):
             slices = [slices]
         for s in slices:
+            if not isinstance(s, (int, np.integer)):
+                raise TypeError(
+                    f"Slice indices must be integers, got {type(s).__name__}: {s!r}"
+                )
             if s >= length or s < -length:
                 raise ValueError(
                     f"One or more slice indices out of range for S={length}"
                 )
-        slices = sorted(slices)
-        new_times = []
+        # Preserve caller order and deduplicate (first occurrence wins).
+        # Negative indices are normalised against the current S so that
+        # ``[2, -1]`` against S=3 collapses to ``[2]``.
+        seen: set = set()
+        ordered: list = []
         for s in slices:
-            new_times.append(self.times[s])
+            si = int(s) % length if length else int(s)
+            if si not in seen:
+                seen.add(si)
+                ordered.append(si)
+        slices = ordered
+        new_times = [self.times[s] for s in slices]
         new_stack = self.event_stack[:, :, slices]
         return RateSliceStack(
             event_matrix=new_stack,

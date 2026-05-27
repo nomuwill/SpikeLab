@@ -777,6 +777,31 @@ class TestConvertToListOfRateData:
         assert rd_list[0].times[0] == pytest.approx(0.0)
         assert rd_list[0].times[1] == pytest.approx(2.0)
 
+    def test_times_start_and_span_match_slice_boundaries(self):
+        """
+        ``convert_to_list_of_RateData`` precomputes ``rel_times = np.arange(T) *
+        step_size`` once outside the loop (Tier K perf opt). Verify each
+        returned ``RateData``'s ``times[0]`` is the slice's start and
+        ``times[-1] - times[0]`` equals ``(T-1) * step_size`` — the perf
+        change must preserve value equivalence.
+
+        Tests:
+            (Test Case 1) Each of S=3 slices has ``times[0]`` equal to
+                its declared start.
+            (Test Case 2) Each slice's total time span equals
+                ``(T-1) * step_size``.
+        """
+        T = 8
+        mat = make_event_matrix(2, T, 3)
+        times = [(0.0, 20.0), (30.0, 50.0), (60.0, 80.0)]
+        step = 2.5
+        rss = RateSliceStack(event_matrix=mat, times_start_to_end=times, step_size=step)
+        rd_list = rss.convert_to_list_of_RateData()
+        assert len(rd_list) == 3
+        for rd, (start, _end) in zip(rd_list, times):
+            assert rd.times[0] == pytest.approx(start)
+            assert rd.times[-1] - rd.times[0] == pytest.approx((T - 1) * step)
+
     def test_convert_to_list_single_time_bin(self):
         """
         Tests convert_to_list_of_RateData with T=1 per slice.
@@ -859,6 +884,45 @@ class TestSliceCorrelations:
         for u in range(2):
             unit_mat = pcm_stack.stack[:, :, u]
             np.testing.assert_array_almost_equal(unit_mat, unit_mat.T)
+
+    def test_slice_to_slice_unit_corr_matmul_mask_invalidates_low_rate_unit(self):
+        """
+        The matmul-mask path (``max_lag=0``) masks per-unit slice
+        correlations to NaN when the unit's mean rate is below
+        ``MIN_RATE_THRESHOLD`` in more than ``MIN_FRAC`` of the slices.
+        Pin that the masking actually fires when the build-then-mask
+        pattern runs.
+
+        Tests:
+            (Test Case 1) A unit whose mean rate is below threshold in
+                MORE than ``MIN_FRAC`` of the slices ends up with an
+                all-NaN row in its slice-correlation matrix.
+        """
+        # 2 units, 10 time bins, 4 slices.
+        # Unit 0: well above threshold in every slice (clean signal).
+        # Unit 1: well above threshold in 1 slice, well below in 3.
+        # With MIN_FRAC=0.3 (default), unit 1 has 3/4 = 75% invalid >
+        # 30% → masked.
+        mat = np.zeros((2, 10, 4), dtype=float)
+        # Unit 0 — all slices well above the 0.1 threshold.
+        mat[0, :, :] = 1.0
+        # Unit 1 — only slice 0 is above the threshold; slices 1..3
+        # are well below.
+        mat[1, :, 0] = 1.0
+        mat[1, :, 1:] = 0.0  # mean = 0 < 0.1
+
+        rss = RateSliceStack(event_matrix=mat)
+        pcm_stack, _ = rss.get_slice_to_slice_unit_corr_from_stack(
+            max_lag=0,
+            MIN_RATE_THRESHOLD=0.1,
+            MIN_FRAC=0.3,
+        )
+        # Unit 1's slice-correlation matrix is all-NaN.
+        unit1_mat = pcm_stack.stack[:, :, 1]
+        assert np.all(np.isnan(unit1_mat))
+        # Unit 0 retains finite values (sanity).
+        unit0_mat = pcm_stack.stack[:, :, 0]
+        assert np.any(np.isfinite(unit0_mat))
 
     def test_slice_to_slice_time_corr_shape(self):
         """
@@ -1081,6 +1145,39 @@ class TestSubset:
         np.testing.assert_array_equal(dedup.event_stack[0], mat[2])
         np.testing.assert_array_equal(dedup.event_stack[1], mat[0])
         np.testing.assert_array_equal(dedup.event_stack[2], mat[1])
+
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        explaining that ``preserve_order`` has no effect under the
+        ``by``-attribute path.
+
+        Tests:
+            (Test Case 1) A UserWarning naming ``preserve_order`` and
+                ``by`` is emitted.
+            (Test Case 2) The resulting subset still succeeds.
+        """
+        import warnings as _warnings
+
+        mat = make_event_matrix(3, 10, 2)
+        rss = RateSliceStack(
+            event_matrix=mat,
+            times_start_to_end=[(0.0, 10.0), (10.0, 20.0)],
+            step_size=1.0,
+        )
+        rss.neuron_attributes = [
+            {"region": "MO"},
+            {"region": "VIS"},
+            {"region": "MO"},
+        ]
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = rss.subset(["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
+        # Matching units come back in source order.
+        assert sub.event_stack.shape[0] == 2
 
     def test_subset_by_attribute(self):
         """
@@ -1397,9 +1494,16 @@ class TestSubslice:
 
         Tests:
             (Test Case 1) Output S dimension equals the number of input indices
-                (including duplicates).
-            (Test Case 2) Duplicate slices contain identical data.
-            (Test Case 3) times list has repeated entries for duplicated slices.
+                (with duplicates removed; first occurrence wins).
+            (Test Case 2) The retained slice contains the expected data.
+            (Test Case 3) times list has no repeated entries.
+
+        Notes:
+            - Tier G changed ``subslice`` to preserve caller order and
+              deduplicate. The previous behaviour (sort + keep
+              duplicates) silently produced different output than the
+              caller passed in. The new contract is symmetric with
+              ``subset(..., preserve_order=True)``.
         """
         mat = np.random.default_rng(0).random((3, 10, 5))
         times = [(i * 10.0, (i + 1) * 10.0) for i in range(5)]
@@ -1407,17 +1511,12 @@ class TestSubslice:
 
         sub = rss.subslice([1, 1, 3])
 
-        # 3 entries because duplicates are not removed
-        assert sub.event_stack.shape == (3, 10, 3)
-        # First two slices should be identical (both are slice 1)
-        np.testing.assert_array_equal(
-            sub.event_stack[:, :, 0], sub.event_stack[:, :, 1]
-        )
+        # 2 entries — duplicates deduplicated (first-occurrence wins).
+        assert sub.event_stack.shape == (3, 10, 2)
         np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, 1])
-        np.testing.assert_array_equal(sub.event_stack[:, :, 2], mat[:, :, 3])
-        # times has the duplicate entry
-        assert sub.times[0] == sub.times[1] == times[1]
-        assert sub.times[2] == times[3]
+        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, 3])
+        assert sub.times[0] == times[1]
+        assert sub.times[1] == times[3]
 
 
 class TestOrderUnitsNanSentinel:
@@ -2420,22 +2519,28 @@ class TestRateSliceStackCoreReview:
 
     def test_subslice_mixed_positive_negative_indices(self):
         """
-        Mixed positive/negative indices: sorted() sorts unresolved indices,
-        so -1 sorts before 2, resulting in order [-1, 2] = [4, 2].
+        Mixed positive/negative indices preserve caller order and resolve
+        negatives against the current S dimension.
+
+        Tier G changed ``subslice`` to preserve caller order (and
+        deduplicate), so ``[2, -1]`` against ``S=5`` keeps the input
+        sequence: first slice is index 2, second is index 4 (the
+        normalised form of -1). The previous ``sorted([-1, 2])``
+        ordering put -1 first.
 
         Tests:
             (Test Case 1) subslice([2, -1]) selects 2 slices.
-            (Test Case 2) sorted([-1, 2]) = [-1, 2], so first slice is index -1
-                (last) and second is index 2.
+            (Test Case 2) Slice 0 is the caller's first index (2);
+                slice 1 is the resolved -1 (index 4).
         """
         mat = np.random.default_rng(0).random((2, 10, 5))
         times = [(i * 10.0, (i + 1) * 10.0) for i in range(5)]
         rss = RateSliceStack(event_matrix=mat, times_start_to_end=times)
         sub = rss.subslice([2, -1])
         assert sub.event_stack.shape == (2, 10, 2)
-        # sorted([-1, 2]) = [-1, 2]; -1 maps to slice 4
-        np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, -1])
-        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, 2])
+        # Caller order preserved: [2, -1] → [slice 2, slice 4].
+        np.testing.assert_array_equal(sub.event_stack[:, :, 0], mat[:, :, 2])
+        np.testing.assert_array_equal(sub.event_stack[:, :, 1], mat[:, :, -1])
 
     def test_get_unit_timing_identical_peak_times(self):
         """
@@ -2648,6 +2753,61 @@ class TestRateSliceStackSubsliceEmpty:
         )
         with pytest.raises(ValueError, match="zero slices"):
             rss.subslice([])
+
+
+class TestRateSliceStackStepSizeFromMedianDiff:
+    """``RateSliceStack.__init__`` infers ``step_size`` from
+    ``np.median(np.diff(times))`` rather than ``times[1] - times[0]``,
+    so a single anomalous gap or duplicate-time pair at the start of
+    an otherwise-uniform grid does not poison the inferred resolution.
+    """
+
+    def test_duplicate_start_time_doesnt_poison_step_size(self):
+        """
+        Tests:
+            (Test Case 1) Times ``[0, 0, 1, 2, ..., 14]`` (a duplicate
+                at the start of an otherwise-uniform 1.0 ms grid)
+                yields ``step_size == 1.0``, not 0.0.
+
+        Notes:
+            - Uses a single slice that begins past the duplicate so
+              the stack-of-slices construction succeeds; the step_size
+              inference path runs over the full ``times`` array
+              regardless of which slices are extracted.
+        """
+        # 4 rates × 16 time samples, uniform 1.0 ms grid except the
+        # first two entries are both 0.0 (duplicate-start anomaly).
+        # RateData accepts monotonically non-decreasing times.
+        times = np.concatenate(([0.0], np.arange(15.0)))
+        rates = np.ones((4, len(times)), dtype=float)
+        rd = RateData(rates, times)
+        rss = RateSliceStack(
+            data_obj=rd,
+            times_start_to_end=[(5.0, 10.0)],
+        )
+        # diffs = [0, 1, 1, ..., 1]; median is the uniform 1.0.
+        # Without the median-diff defence, step_size would have been
+        # ``times[1] - times[0] == 0.0``, poisoning the stack.
+        assert rss.step_size == pytest.approx(1.0)
+
+    def test_single_anomalous_gap_doesnt_poison_step_size(self):
+        """
+        Tests:
+            (Test Case 1) A single 4 ms gap among otherwise-uniform
+                1 ms diffs yields ``step_size == 1.0`` because
+                ``median`` is robust to the single outlier.
+        """
+        # Insert one 4 ms gap (between samples 1 and 2). The rest is
+        # uniform 1 ms.
+        times = np.array([0.0, 1.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+        rates = np.ones((4, len(times)), dtype=float)
+        rd = RateData(rates, times)
+        rss = RateSliceStack(
+            data_obj=rd,
+            times_start_to_end=[(6.0, 11.0)],
+        )
+        # diffs = [1, 4, 1, 1, 1, 1, 1, 1, 1]; median = 1.0.
+        assert rss.step_size == pytest.approx(1.0)
 
 
 class TestRateSliceStackInitSigmaZero:

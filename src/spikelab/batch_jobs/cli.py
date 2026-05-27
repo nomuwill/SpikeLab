@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import yaml
+from pydantic import ValidationError
 
 from .backend_k8s import KubernetesBatchJobBackend
 from .credentials import resolve_credentials
@@ -17,6 +18,8 @@ from .profiles import load_cluster_profile, load_profile_from_name
 from .session import RunSession
 from .storage_s3 import S3StorageClient
 from .validation import summarize_validation_error, validate_job_spec
+
+DEFAULT_IMAGE_PROFILE = "cpu"
 
 
 def _load_payload(path: str) -> Dict[str, Any]:
@@ -57,7 +60,7 @@ def _apply_image_selection(
         container["image"] = image_override
         return payload
 
-    selected_profile = (image_profile or "cpu").strip().lower()
+    selected_profile = (image_profile or DEFAULT_IMAGE_PROFILE).strip().lower()
     default_image = profile.default_images.get(selected_profile)
     if default_image and not container.get("image"):
         container["image"] = default_image
@@ -116,9 +119,17 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     )
     try:
         job_spec = validate_job_spec(payload)
+    except ValidationError as exc:
+        # Nominal match (``isinstance``) rather than structural
+        # (``hasattr(exc, "errors")``) — the previous form would also
+        # match unrelated exceptions that happen to expose an
+        # ``errors`` attribute and route them through the pydantic
+        # summariser, which then produced a noisy traceback.
+        raise SystemExit(
+            f"Invalid job config: {summarize_validation_error(exc)}"
+        ) from exc
     except Exception as exc:
-        msg = summarize_validation_error(exc) if hasattr(exc, "errors") else str(exc)
-        raise SystemExit(f"Invalid job config: {msg}") from exc
+        raise SystemExit(f"Invalid job config: {exc}") from exc
 
     if args.render_only:
         manifest = session.render_manifest(
@@ -127,7 +138,14 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             run_id="dry-run",
         )
         if args.output_manifest:
-            Path(args.output_manifest).write_text(manifest, encoding="utf-8")
+            # Ensure the parent directory exists before writing.
+            # ``write_text`` raises ``FileNotFoundError`` if the parent
+            # is missing — easy to hit when the user passes a path
+            # like ``./out/dry-run/job.yaml`` and ``./out/dry-run``
+            # doesn't exist yet.
+            output_path = Path(args.output_manifest)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(manifest, encoding="utf-8")
             print(f"MANIFEST_PATH={args.output_manifest}")
         else:
             print(manifest)
@@ -170,14 +188,28 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
-    overrides = {
+    # ``_cmd_deploy`` reads several attributes that the ``render``
+    # subparser doesn't define (``wait``, ``follow_logs``,
+    # ``max_wait_seconds``, ``allow_policy_risk``, ``output_manifest``,
+    # ``render_only``). Without explicit defaults the
+    # ``args.render_only`` branch later in ``_cmd_deploy`` would
+    # ``AttributeError`` on a Namespace that didn't get those flags
+    # from argparse. Build a complete Namespace with safe defaults
+    # and let ``vars(args)`` provide any values the user did pass.
+    defaults = {
         "render_only": True,
         "wait": False,
         "follow_logs": False,
         "max_wait_seconds": 1,
         "allow_policy_risk": False,
+        "output_manifest": None,
     }
-    render_args = argparse.Namespace(**{**vars(args), **overrides})
+    render_args = argparse.Namespace(**{**defaults, **vars(args)})
+    # Force the render-specific values even if the caller passed
+    # something else (defensive against future arg additions).
+    render_args.render_only = True
+    render_args.wait = False
+    render_args.follow_logs = False
     return _cmd_deploy(render_args)
 
 
@@ -216,7 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kubeconfig")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    deploy = sub.add_parser("deploy-job")
+    deploy = sub.add_parser(
+        "deploy-job",
+        help="Validate, render, and submit a job to Kubernetes; optionally wait for completion.",
+    )
     deploy.add_argument("--job-config", required=True)
     deploy.add_argument("--allow-policy-risk", action="store_true")
     deploy.add_argument("--render-only", action="store_true")
@@ -228,20 +263,32 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--image")
     deploy.set_defaults(func=_cmd_deploy)
 
-    status = sub.add_parser("job-status")
+    status = sub.add_parser(
+        "job-status",
+        help="Query the current Kubernetes status of a previously-submitted job.",
+    )
     status.add_argument("job_name")
     status.set_defaults(func=_cmd_status)
 
-    logs = sub.add_parser("job-logs")
+    logs = sub.add_parser(
+        "job-logs",
+        help="Stream stdout/stderr from a job's pods; optionally follow live.",
+    )
     logs.add_argument("job_name")
     logs.add_argument("--follow", action="store_true")
     logs.set_defaults(func=_cmd_logs)
 
-    delete = sub.add_parser("job-delete")
+    delete = sub.add_parser(
+        "job-delete",
+        help="Delete a Kubernetes job (and its pods). Idempotent: missing jobs no-op.",
+    )
     delete.add_argument("job_name")
     delete.set_defaults(func=_cmd_delete)
 
-    render = sub.add_parser("render-job")
+    render = sub.add_parser(
+        "render-job",
+        help="Render the K8s job manifest YAML without submitting (dry-run).",
+    )
     render.add_argument("--job-config", required=True)
     render.add_argument("--output-manifest")
     render.add_argument("--image-profile", choices=["cpu", "gpu"])

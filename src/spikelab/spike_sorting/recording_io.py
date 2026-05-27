@@ -7,12 +7,15 @@ extracting waveforms via the WaveformExtractor.
 For the full sorting pipeline (sort → build SpikeData → curate → compile),
 use ``pipeline.py`` and ``sort_recording()``."""
 
+import logging
 import os
 import warnings
 from pathlib import Path
 from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 try:
     import h5py
@@ -146,7 +149,7 @@ def _patch_neo_maxwell_hdf5_plugin_path_handling() -> None:
             local_lib = hdf5_plugin_path / "compression.dll"
 
         if not force_download and local_lib.is_file():
-            print(
+            _logger.info(
                 f"The h5 compression library for Maxwell is already located in {local_lib}!"
             )
             return
@@ -197,10 +200,16 @@ def _time_chunks_to_frames(
     chunks: List[Tuple[int, int]] = []
 
     if start_time_s is not None or end_time_s is not None:
+        if total_duration_s <= 0:
+            raise ValueError(
+                f"Recording duration is non-positive (total_duration_s="
+                f"{total_duration_s}); refusing to slice. The recording is "
+                "likely corrupt or empty."
+            )
         start_s = start_time_s if start_time_s is not None else 0.0
         end_s = end_time_s if end_time_s is not None else total_duration_s
         if end_s > total_duration_s:
-            print(
+            _logger.info(
                 f"'end_time_s' ({end_s}) exceeds recording duration "
                 f"({total_duration_s:.2f}s); clipping to the end."
             )
@@ -219,7 +228,7 @@ def _time_chunks_to_frames(
                 f"Must satisfy 0 <= start < end."
             )
         if end_s > total_duration_s:
-            print(
+            _logger.info(
                 f"'rec_chunks_s' entry ({start_s}, {end_s}) exceeds "
                 f"recording duration ({total_duration_s:.2f}s); clipping."
             )
@@ -274,7 +283,7 @@ def _load_recording_with_state(
     rec_cfg = config.recording
 
     print_stage("LOADING RECORDING")
-    print(f"Recording path: {rec_path}")
+    _logger.info(f"Recording path: {rec_path}")
     stopwatch = Stopwatch()
 
     auto_rec_chunks: List[Tuple[int, int]] = []
@@ -291,7 +300,7 @@ def _load_recording_with_state(
         else:
             rec = load_single_recording(rec_path, config=config)
 
-    print(f"Recording has {rec.get_num_channels()} channels")
+    _logger.info(f"Recording has {rec.get_num_channels()} channels")
 
     # Convert time-based slicing parameters (seconds) to frame tuples.
     time_chunks = _time_chunks_to_frames(
@@ -327,33 +336,35 @@ def _load_recording_with_state(
     if rec_cfg.first_n_mins is not None:
         end_frame = rec_cfg.first_n_mins * 60 * rec.get_sampling_frequency()
         if end_frame > rec.get_num_samples():
-            print(
+            _logger.info(
                 f"'first_n_mins' is set to {rec_cfg.first_n_mins}, but recording is only {rec.get_total_duration() / 60:.2f} min long"
             )
-            print(
+            _logger.info(
                 f"Using entire duration of recording: {rec.get_total_duration() / 60:.2f}min"
             )
         else:
-            print(f"Only analyzing the first {rec_cfg.first_n_mins} min of recording")
+            _logger.info(
+                f"Only analyzing the first {rec_cfg.first_n_mins} min of recording"
+            )
             rec = rec.frame_slice(start_frame=0, end_frame=end_frame)
     else:
-        print(
+        _logger.info(
             f"Using entire duration of recording: {rec.get_total_duration() / 60:.2f}min"
         )
 
     if effective_rec_chunks:
-        print(f"Using {len(effective_rec_chunks)} chunks of the recording")
+        _logger.info(f"Using {len(effective_rec_chunks)} chunks of the recording")
         rec_chunk_slices = []
         for c, (start_frame, end_frame) in enumerate(effective_rec_chunks):
-            print(f"Chunk {c}: {start_frame} to {end_frame} frame")
+            _logger.info(f"Chunk {c}: {start_frame} to {end_frame} frame")
             chunk = rec.frame_slice(start_frame=start_frame, end_frame=end_frame)
             rec_chunk_slices.append(chunk)
         rec = si_segmentutils.concatenate_recordings(rec_chunk_slices)
     else:
-        print(f"Using entire recording")
+        _logger.info(f"Using entire recording")
 
     if rec_cfg.mea_y_max is not None:
-        print(
+        _logger.info(
             f"Flipping y-coordinates of channel locations. MEA height: {rec_cfg.mea_y_max}"
         )
         probes_all = []
@@ -435,7 +446,7 @@ def load_single_recording(
     elif rec.get_channel_gains() is not None:
         gain = rec.get_channel_gains()
     else:
-        print("Recording does not have channel gains to uV")
+        _logger.info("Recording does not have channel gains to uV")
         gain = 1.0
 
     if rec_cfg.offset_to_uv is not None:
@@ -443,13 +454,13 @@ def load_single_recording(
     elif rec.get_channel_offsets() is not None:
         offset = rec.get_channel_offsets()
     else:
-        print("Recording does not have channel offsets to uV")
+        _logger.info("Recording does not have channel offsets to uV")
         offset = 0.0
 
-    print(
+    _logger.info(
         f"Scaling recording to uV with gain {np.median(np.array(gain))} and offset {np.median(np.array(offset))}"
     )
-    print(f"Converting recording dtype from {rec.get_dtype()} to float32")
+    _logger.info(f"Converting recording dtype from {rec.get_dtype()} to float32")
 
     rec = ScaleRecording(rec, gain=gain, offset=offset, dtype="float32")
 
@@ -511,24 +522,37 @@ def _concatenate_recordings_with_state(
     if config is None:
         config = SortingPipelineConfig()
 
-    print("Concatenating recordings")
+    _logger.info("Concatenating recordings")
     recordings = []
 
     new_rec_chunks: List[Tuple[int, int]] = []
     start_frame = 0
 
-    recording_names = natsorted(
-        [
-            p.name
-            for p in rec_path.iterdir()
-            if p.name.endswith(".raw.h5") or p.name.endswith(".nwb")
-        ]
-    )
+    # Build the candidate set once, then validate uniformity of file
+    # extensions. Mixing ``.raw.h5`` and ``.nwb`` is rejected up front
+    # so the operator sees the bundle error here rather than a confusing
+    # downstream sampling-rate / channel-count mismatch from
+    # cross-format loading.
+    candidates = [
+        p
+        for p in rec_path.iterdir()
+        if p.name.endswith(".raw.h5") or p.name.endswith(".nwb")
+    ]
+    suffixes = {".raw.h5" if p.name.endswith(".raw.h5") else ".nwb" for p in candidates}
+    if len(suffixes) > 1:
+        raise ValueError(
+            f"Cannot concatenate: {rec_path} contains a mix of file types "
+            f"({sorted(suffixes)}). Concatenation requires all recordings to "
+            "share the same on-disk format. Move one of the formats to a "
+            "separate folder."
+        )
+    by_name = {p.name: p for p in candidates}
+    recording_names = natsorted(by_name.keys())
     for rec_name in recording_names:
-        rec_file = [p for p in rec_path.iterdir() if p.name == rec_name][0]
+        rec_file = by_name[rec_name]
         rec = load_single_recording(rec_file, config=config)
         recordings.append(rec)
-        print(
+        _logger.info(
             f"{rec_name}: DURATION: {rec.get_num_frames() / rec.get_sampling_frequency()} s -- "
             f"NUM. CHANNELS: {rec.get_num_channels()}"
         )
@@ -564,13 +588,17 @@ def _concatenate_recordings_with_state(
                 )
 
             # Warning: channel IDs differ
+            # stacklevel=3: skip _concatenate_recordings_with_state +
+            # skip its caller (concatenate_recordings or load_recording)
+            # so the warning is attributed to the user's call site, not
+            # the internal helper.
             ids_i = list(rec_i.get_channel_ids())
             if ids_i != ref_ids:
                 warnings.warn(
                     f"{name_i} has different channel IDs than {ref_name}. "
                     "Concatenation will proceed but results may be unreliable "
                     "if the electrode configurations differ.",
-                    stacklevel=2,
+                    stacklevel=3,
                 )
 
             # Warning: channel locations differ
@@ -602,8 +630,8 @@ def _concatenate_recordings_with_state(
         # and downstream metadata can address them.
         auto_rec_chunks = list(new_rec_chunks)
 
-    print(f"Done concatenating {len(recordings)} recordings")
-    print(f"Total duration: {rec.get_total_duration()}s")
+    _logger.info(f"Done concatenating {len(recordings)} recordings")
+    _logger.info(f"Total duration: {rec.get_total_duration()}s")
 
     return rec, auto_rec_chunks, recording_names
 
@@ -654,7 +682,7 @@ def extract_waveforms(
     if (
         not reextract_waveforms and (root_folder / "waveforms").is_dir()
     ):  # Load saved waveform extractor
-        print("Loading waveforms from folder")
+        _logger.info("Loading waveforms from folder")
         we = WaveformExtractor.load_from_folder(
             recording, sorting, root_folder, initial_folder, rng=rng
         )
@@ -674,7 +702,7 @@ def extract_waveforms(
             # Bounded peak RAM (one unit's buffer at a time); avoids the
             # 39 GB pre-allocated per-unit memmap pile that the parallel
             # path creates for high-unit-count sorts on dense MEAs.
-            print("Streaming waveform extraction (per-unit, low RAM)")
+            _logger.info("Streaming waveform extraction (per-unit, low RAM)")
             we.run_extract_waveforms_streaming()
             stopwatch.log_time("Done extracting waveforms (streaming).")
             # Templates already populated by the streaming pass.

@@ -459,9 +459,13 @@ class TestSpikeDataConstruction:
         from_idces_times with idces and times of different lengths.
 
         Tests:
-            (Test Case 1) Mismatched lengths raise IndexError from boolean indexing.
+            (Test Case 1) Mismatched lengths raise ValueError up-front
+                with a clear message naming both lengths. The new guard
+                (Tier F) replaces the previous deep-stack IndexError
+                that surfaced from boolean indexing inside
+                ``_train_from_i_t_list`` after silent broadcasting.
         """
-        with pytest.raises(IndexError):
+        with pytest.raises(ValueError, match="equal length"):
             SpikeData.from_idces_times([0, 0, 1], [10.0, 20.0], length=30.0)
 
     def test_from_idces_times_negative_indices_raise(self):
@@ -1165,6 +1169,73 @@ class TestSpikeDataSlicing:
         floats = sd.subset(units=[2.0, 0.0], preserve_order=True)
         assert [a["unit_id"] for a in floats.neuron_attributes] == [2, 0]
 
+    def test_subset_by_unknown_key_warns_with_known_keys(self):
+        """
+        ``subset(by="unitid", units=[...])`` (typo of canonical
+        ``"unit_id"``) emits a UserWarning naming both the typo and
+        the known attribute keys. Without the warning, typos silently
+        return empty SpikeData with no clue why.
+
+        Tests:
+            (Test Case 1) UserWarning is emitted.
+            (Test Case 2) The warning message contains the typoed key
+                ``"unitid"``.
+            (Test Case 3) The warning lists the known keys, including
+                the canonical ``"unit_id"``.
+        """
+        import warnings as _warnings
+
+        sd = SpikeData(
+            [[1.0], [2.0]],
+            length=50.0,
+            neuron_attributes=[{"unit_id": 0}, {"unit_id": 1}],
+        )
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sd.subset([0], by="unitid")
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "subset" in m]
+        assert relevant, warn_msgs
+        assert "unitid" in relevant[0]
+        assert "unit_id" in relevant[0]
+
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        explaining that ``preserve_order`` has no effect under the
+        ``by``-attribute path (attribute values have no positional
+        correspondence to unit indices).
+
+        Tests:
+            (Test Case 1) UserWarning is emitted.
+            (Test Case 2) The warning message contains ``preserve_order``
+                and ``by``.
+            (Test Case 3) The subset still succeeds and returns matching
+                units in self.train order.
+        """
+        import warnings as _warnings
+
+        sd = SpikeData(
+            [[1.0], [2.0], [3.0]],
+            length=50.0,
+            neuron_attributes=[
+                {"region": "MO"},
+                {"region": "VIS"},
+                {"region": "MO"},
+            ],
+        )
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = sd.subset(units=["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "preserve_order" in m and "by" in m]
+        assert relevant, warn_msgs
+        # Matching units come back in self.train order (0, 2).
+        assert sub.N == 2
+
     def test_subtime_start_equals_end(self):
         """
         subtime raises ValueError when start equals end.
@@ -1307,24 +1378,21 @@ class TestSpikeDataSlicing:
         assert result.raw_time.shape == (10,)
         np.testing.assert_array_equal(result.raw_data, raw1)
 
-    def test_append_negative_offset(self):
+    def test_append_negative_offset_rejected(self):
         """
-        append with a negative offset.
+        append with a negative offset is rejected up-front (Tier F).
 
         Tests:
-        (Test Case 1) The resulting length is self.length + other.length + offset,
-        which is shorter than the sum of both lengths.
-        (Test Case 2) Spike times from the appended data are shifted by
-        self.length + offset.
+            (Test Case 1) Negative offset raises ValueError naming the
+                offending value. The previous lenient behaviour silently
+                interleaved the appended spikes with self's by shifting
+                the concatenation point backwards — visually correct
+                length but semantically wrong train.
         """
         sd1 = SpikeData([[5.0]], length=20.0)
         sd2 = SpikeData([[3.0]], length=10.0)
-        result = sd1.append(sd2, offset=-5)
-        # length = 20 + 10 + (-5) = 25
-        np.testing.assert_equal(result.length, 25.0)
-        # Appended spike at 3.0 shifted by self.length + offset = 20 + (-5) = 15
-        expected_second_spike = 3.0 + 20.0 + (-5)
-        np.testing.assert_almost_equal(result.train[0][1], expected_second_spike)
+        with pytest.raises(ValueError, match="offset must be non-negative"):
+            sd1.append(sd2, offset=-5)
 
     def test_append_to_empty_spikedata(self):
         """
@@ -1404,6 +1472,31 @@ class TestSpikeDataSlicing:
         assert sub.N == 0
         assert sub.length == 10.0
         assert len(sub.train) == 0
+
+    def test_subset_empty_preserves_empty_neuron_attributes(self):
+        """
+        ``SpikeData.subset([])`` on a SpikeData with neuron_attributes
+        returns an instance whose ``neuron_attributes`` is the empty
+        list ``[]`` — NOT ``None``. The empty-list distinction matters:
+        ``None`` means "no attributes were ever attached", while ``[]``
+        means "attributes were present but every unit got filtered
+        out". Downstream code that branches on ``if ...
+        neuron_attributes is None`` would silently disagree with
+        callers asking ``len(...) == 0``.
+
+        Tests:
+            (Test Case 1) ``sd.subset([])`` returns an instance whose
+                ``neuron_attributes`` is the empty list ``[]``, not
+                ``None``.
+        """
+        sd = SpikeData(
+            [np.array([1.0]), np.array([2.0])],
+            length=10.0,
+            neuron_attributes=[{"region": "MO"}, {"region": "VIS"}],
+        )
+        sub = sd.subset([])
+        assert sub.neuron_attributes == []
+        assert sub.neuron_attributes is not None
 
     def test_subset_negative_unit_index(self):
         """
@@ -1710,6 +1803,40 @@ class TestSpikeDataSlicing:
         result = sd1.concatenate_spike_data(sd_empty)
         assert result.N == original_n
         assert len(result.train) == original_n
+
+
+class TestSpikeDataIdcesTimesPerf:
+    """``idces_times`` was rewritten in Tier K to use ``np.repeat`` +
+    ``np.concatenate`` instead of a Python append-loop. Pin
+    correctness against a small example (the perf optimisation must
+    not change values) plus the empty-SpikeData edge.
+    """
+
+    def test_idces_times_matches_repeat_and_concatenate(self):
+        """
+        Tests:
+            (Test Case 1) ``train=[[1.0, 2.0, 3.0], [], [10.0]]``
+                produces ``idces == [0, 0, 0, 2]`` and
+                ``times == [1.0, 2.0, 3.0, 10.0]``.
+        """
+        sd = SpikeData(
+            [np.array([1.0, 2.0, 3.0]), np.array([]), np.array([10.0])],
+            length=100.0,
+        )
+        idces, times = sd.idces_times()
+        np.testing.assert_array_equal(idces, np.array([0, 0, 0, 2]))
+        np.testing.assert_array_equal(times, np.array([1.0, 2.0, 3.0, 10.0]))
+
+    def test_idces_times_empty_spikedata_returns_two_empty_arrays(self):
+        """
+        Tests:
+            (Test Case 1) Empty ``train=[]`` returns ``(empty_int64,
+                empty_float)``.
+        """
+        sd = SpikeData([], N=0, length=100.0)
+        idces, times = sd.idces_times()
+        assert idces.size == 0
+        assert times.size == 0
 
 
 class TestSpikeDataRates:
@@ -2107,15 +2234,18 @@ class TestSpikeDataRates:
         a = SpikeData([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
         b = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) - 0.2
         # Make sure the latencies are correct, this is latencies relative
-        # to the input (b), so should all be .2 after
-        assert a.latencies(b)[0][0] == pytest.approx(0.2)
-        assert a.latencies(b)[0][-1] == pytest.approx(0.2)
+        # to the input (b), so should all be .2 after. Tier L-F1: the
+        # return type is now a NaN-padded (N_units, len(times)) ndarray;
+        # ``arr[u, i]`` is the signed latency from times[i] to the
+        # nearest spike in unit u, or NaN if outside window_ms.
+        assert a.latencies(b)[0, 0] == pytest.approx(0.2)
+        assert a.latencies(b)[0, -1] == pytest.approx(0.2)
 
-        # Small enough window, should be no latencies.
-        assert a.latencies(b, 0.1)[0] == []
+        # Small enough window, all entries fall outside → all NaN.
+        assert np.all(np.isnan(a.latencies(b, 0.1)[0]))
 
         # Can do negative
-        assert a.latencies([0.1])[0][0] == pytest.approx(-0.1)
+        assert a.latencies([0.1])[0, 0] == pytest.approx(-0.1)
 
     # --- resampled_isi return type and shape tests ---
 
@@ -2695,6 +2825,26 @@ class TestSpikeDataRates:
         rate = sd.binned_meanrate(bin_size=100.0)
         assert len(rate) == 1
 
+    def test_binned_n_zero_returns_zero_array(self):
+        """
+        ``SpikeData.binned`` short-circuits the N=0 case: a SpikeData
+        with no units returns a 1-D ndarray of length
+        ``ceil(length / bin_size)`` filled with zeros. Without the
+        short-circuit, the sparse-matrix sum path raises on the empty
+        input list (scipy version-dependent).
+
+        Tests:
+            (Test Case 1) ``binned(bin_size=10)`` on a length=100, N=0
+                SpikeData returns ``np.zeros(10)`` of dtype int64.
+            (Test Case 2) Mirrors ``binned_meanrate``'s zero-units
+                contract — both helpers are symmetric for N=0.
+        """
+        sd = SpikeData([], length=100.0, N=0)
+        result = sd.binned(bin_size=10.0)
+        assert result.shape == (10,)
+        np.testing.assert_array_equal(result, np.zeros(10, dtype=np.int64))
+        assert result.dtype == np.int64
+
     def test_binned_meanrate_n_zero_matches_sparse_raster_width(self):
         """
         binned_meanrate(N=0) returns a zero-vector whose length equals
@@ -2942,16 +3092,17 @@ class TestSpikeDataCorrelation:
         """
         a = SpikeData([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
         b = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) - 0.2
-        # Make sure the latencies are correct, this is latencies relative
-        # to the input (b), so should all be .2 after
-        assert a.latencies(b)[0][0] == pytest.approx(0.2)
-        assert a.latencies(b)[0][-1] == pytest.approx(0.2)
+        # Tier L-F1: latencies now returns a NaN-padded (U, len(times))
+        # ndarray. ``arr[u, i]`` is the signed latency from times[i] to
+        # the nearest spike in unit u, or NaN if outside window_ms.
+        assert a.latencies(b)[0, 0] == pytest.approx(0.2)
+        assert a.latencies(b)[0, -1] == pytest.approx(0.2)
 
-        # Small enough window, should be no latencies.
-        assert a.latencies(b, 0.1)[0] == []
+        # Small enough window → every entry exceeds it → all NaN.
+        assert np.all(np.isnan(a.latencies(b, 0.1)[0]))
 
         # Can do negative
-        assert a.latencies([0.1])[0][0] == pytest.approx(-0.1)
+        assert a.latencies([0.1])[0, 0] == pytest.approx(-0.1)
 
     def test_latencies_to_index(self):
         """
@@ -2968,9 +3119,12 @@ class TestSpikeDataCorrelation:
         lat_to_idx = sd.latencies_to_index(0, window_ms=10.0)
         lat_direct = sd.latencies(sd.train[0], window_ms=10.0)
 
-        assert len(lat_to_idx) == len(lat_direct)
-        for a, b in zip(lat_to_idx, lat_direct):
-            assert len(a) == len(b)
+        # Tier L-F1: both are now (U, len(train_i)) ndarrays.
+        assert lat_to_idx.shape == lat_direct.shape
+        np.testing.assert_array_equal(np.isnan(lat_to_idx), np.isnan(lat_direct))
+        # Numeric values match where both are non-NaN
+        mask = ~np.isnan(lat_to_idx)
+        np.testing.assert_array_almost_equal(lat_to_idx[mask], lat_direct[mask])
 
     def test_sttc_both_trains_empty(self):
         """
@@ -3025,12 +3179,16 @@ class TestSpikeDataCorrelation:
         """
         latencies with an empty times array.
 
+        Tier L-F1: empty input returns a (N_units, 0) ndarray
+        instead of an empty Python list. The shape is still
+        information-preserving — caller knows N_units up front.
+
         Tests:
-        (Test Case 1) Passing an empty list returns an empty list immediately.
+        (Test Case 1) Passing an empty list returns shape (N_units, 0).
         """
         sd = SpikeData([[1.0, 2.0, 3.0]], length=10.0)
         result = sd.latencies([])
-        assert result == []
+        assert result.shape == (1, 0)
 
     def test_latencies_spike_at_exactly_query_time(self):
         """
@@ -8189,15 +8347,16 @@ class TestSpikeDataLatenciesBoundary:
     def test_latencies_with_nan_time_silently_returns_empty(self):
         """
         latencies with a NaN query time: abs(NaN) <= window_ms is False so
-        no latency is recorded (silent empty list per unit).
+        no latency is recorded (NaN per unit in the (U, T) ndarray).
 
         Tests:
-            (Test Case 1) Query times = [NaN] returns one empty latency
-                list per unit, with no error.
+            (Test Case 1) Query times = [NaN] returns NaN-padded (1, 1)
+                array, with no error.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([float("nan")], window_ms=100.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
     def test_latencies_with_negative_window_returns_empty_per_unit(self):
         """
@@ -8205,11 +8364,12 @@ class TestSpikeDataLatenciesBoundary:
         is False for any non-negative abs_diff against a negative bound).
 
         Tests:
-            (Test Case 1) window_ms=-1 yields one empty latency list per unit.
+            (Test Case 1) window_ms=-1 yields NaN-padded (1, 1) array.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([5.0], window_ms=-1.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
     def test_latencies_with_window_zero_keeps_only_exact_matches(self):
         """
@@ -8218,15 +8378,17 @@ class TestSpikeDataLatenciesBoundary:
 
         Tests:
             (Test Case 1) Query time matches a spike: latency 0.0 is kept.
-            (Test Case 2) Query time off-spike: no latency is kept.
+            (Test Case 2) Query time off-spike: NaN is kept.
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         # Exact match at 5.0 → latency 0.0 retained.
         result_exact = sd.latencies([5.0], window_ms=0.0)
-        assert result_exact == [[0.0]]
-        # Off-spike at 5.5 → empty.
+        assert result_exact.shape == (1, 1)
+        assert result_exact[0, 0] == 0.0
+        # Off-spike at 5.5 → NaN.
         result_off = sd.latencies([5.5], window_ms=0.0)
-        assert result_off == [[]]
+        assert result_off.shape == (1, 1)
+        assert np.all(np.isnan(result_off))
 
 
 class TestSpikeDataSubsetEdgeCases:
@@ -8337,6 +8499,57 @@ class TestSpikeDataFramesOverlapBoundary:
         sd = SpikeData([[1.0, 11.0, 21.0, 31.0]], length=40.0)
         with pytest.raises(ValueError, match="overlap.*non-negative"):
             sd.frames(10.0, overlap=-10.0)
+
+
+class TestSpikeDataFramesULPBoundaryFrameCount:
+    """``SpikeData.frames`` counts frames via
+    ``int(np.floor(slot_span / step)) + 1`` rather than
+    ``np.arange(start, end - length + 1e-9, step)``. The previous
+    epsilon-pad form could emit an extra start at ``end_time - length
+    + ε`` for inputs where the slot span is an exact multiple of the
+    step, and the resulting frame end would fall ULPs past
+    ``end_time`` — the strict bounds check inside
+    ``_validate_time_start_to_end`` then rejected the otherwise-valid
+    frame.
+    """
+
+    def test_exact_integer_multiple_succeeds_with_expected_frame_count(self):
+        """
+        Tests:
+            (Test Case 1) ``frames(length=10, overlap=0)`` on a 100 ms
+                recording produces exactly 10 frames (no rejection
+                from a ULP-overshoot start) and the resulting
+                ``SpikeSliceStack`` is well-formed.
+        """
+        sd = SpikeData([[1.0, 5.0, 9.0]], length=100.0)
+        stack = sd.frames(10.0, overlap=0)
+        # int(np.floor(90/10)) + 1 = 10 frames.
+        assert len(stack.times) == 10
+        # Every frame's end is at most start + length and never past
+        # the recording end.
+        for start, end in stack.times:
+            assert end - start == pytest.approx(10.0)
+            assert end <= sd.start_time + sd.length + 1e-9
+
+    def test_slot_span_one_ulp_below_exact_integer_succeeds(self):
+        """
+        Tests:
+            (Test Case 1) When ``(end_time - length - start_time) /
+                step`` is one ULP below an integer (the case that
+                used to silently miss a frame under the
+                ``np.arange + epsilon`` form), the frame count
+                matches the floor-and-add-one rule.
+        """
+        # length=10 ms, step=5 ms, start=0; pick a recording length
+        # where slot_span is one ULP below 95 (an exact integer
+        # multiple of step) so the explicit floor + 1 returns 20
+        # frames deterministically.
+        sd = SpikeData([[1.0]], length=105.0 - np.nextafter(0.0, 1.0))
+        stack = sd.frames(10.0, overlap=5.0)
+        end_time = sd.start_time + sd.length
+        slot_span = end_time - 10.0 - sd.start_time
+        expected = int(np.floor(slot_span / 5.0)) + 1
+        assert len(stack.times) == expected
 
 
 class TestSpikeDataGetPairwiseCcgMaxLagClamp:
@@ -8607,6 +8820,41 @@ class TestSpikeDataSpikeTimeTilingsNumbaParity:
         # Shared (0,1) entry must match across paths.
         assert pcm2.matrix[0, 1] == pytest.approx(pcm3.matrix[0, 1], abs=1e-9)
 
+    def test_numba_path_matrix_symmetric_and_matches_slow_path(self):
+        """
+        The numba path (N >= 3) unpacks an upper-triangle vector into
+        the full symmetric matrix via ``triu_indices`` + a single
+        symmetric assignment. Pin that the result is exactly symmetric
+        and element-wise matches the slow (pure-numpy) reference.
+
+        Tests:
+            (Test Case 1) Matrix is symmetric (``M == M.T``).
+            (Test Case 2) Diagonal is exactly 1.0 (identity from
+                ``np.eye``).
+            (Test Case 3) Off-diagonal pair values agree with the
+                slow-path computation per-pair within numerical
+                tolerance.
+        """
+        rng = np.random.default_rng(0)
+        trains = [np.sort(rng.uniform(0, 1000, 50)) for _ in range(4)]
+        sd = SpikeData(trains, length=1000.0)
+        pcm = sd.spike_time_tilings(delt=10.0)
+        M = pcm.matrix
+
+        # Symmetric assignment must produce a literal-symmetric matrix.
+        np.testing.assert_array_equal(M, M.T)
+        np.testing.assert_array_equal(np.diag(M), np.ones(sd.N))
+
+        # Element-wise parity with the slow reference per pair (pairs
+        # are computed serially via ``get_sttc`` on N=2 SpikeData).
+        for i in range(sd.N):
+            for j in range(i + 1, sd.N):
+                ref = SpikeData(
+                    [trains[i], trains[j]], length=1000.0
+                ).spike_time_tilings(delt=10.0)
+                assert M[i, j] == pytest.approx(ref.matrix[0, 1], abs=1e-9)
+                assert M[j, i] == pytest.approx(ref.matrix[0, 1], abs=1e-9)
+
     def test_n_equals_1_returns_singleton_identity_matrix(self):
         """
         Single-unit ``SpikeData`` produces a (1,1) matrix with the
@@ -8770,27 +9018,26 @@ class TestCompareSorterNeighborChannelsValidation:
 
 
 class TestSpikeDataLatenciesInfTimes:
-    """``SpikeData.latencies(times=[np.inf])``: the argmin over
-    ``abs(train - inf)`` is well defined (all entries are inf, argmin
-    returns 0), but the candidate latency itself is +/-inf which
-    fails the ``abs_diff <= window_ms`` guard. Pin the silent-empty
-    behavior so a regression that surfaced the NaN/inf later in the
-    pipeline would be caught here."""
+    """``SpikeData.latencies(times=[np.inf])``: the candidate latency
+    is +/-inf which fails the ``abs_latency <= window_ms`` guard, so
+    the corresponding cell in the (U, T) NaN-padded ndarray remains
+    NaN. Pin the silent-NaN behavior so a regression that surfaced
+    the NaN/inf later in the pipeline would be caught here."""
 
     def test_latencies_inf_query_time_returns_empty_per_unit(self):
         """
-        Query time +inf produces argmin=0 (all distances are inf) and
-        a latency of -inf, which is rejected by the window check
-        (``abs_diff <= window_ms`` is False for inf), so each unit
-        gets an empty list.
+        Query time +inf produces a latency of -inf, which is rejected
+        by the window check (``abs(latency) <= window_ms`` is False
+        for inf), so each unit's slot is NaN.
 
         Tests:
-            (Test Case 1) ``times=[np.inf]`` returns ``[[]]`` for a
-                single non-empty train (no error raised).
+            (Test Case 1) ``times=[np.inf]`` returns a (1, 1) NaN
+                ndarray for a single non-empty train (no error raised).
         """
         sd = SpikeData([[5.0, 10.0]], length=20.0)
         result = sd.latencies([np.inf], window_ms=100.0)
-        assert result == [[]]
+        assert result.shape == (1, 1)
+        assert np.all(np.isnan(result))
 
 
 class TestSpikeDataSpikeTimeTilingsNEquals1:
@@ -10267,6 +10514,70 @@ class TestSpikeDataFromThresholdingDirectionBranches:
     pin the ``'up'`` and ``'down'`` branches separately.
     """
 
+    def test_zero_spikes_detected_emits_warning_naming_threshold(self):
+        """
+        When ``from_thresholding`` finds zero spikes (signal has no
+        crossings or threshold is too aggressive), a ``UserWarning``
+        is emitted naming the threshold value so callers iterating
+        over ``threshold_sigma`` values have a clear signal that the
+        threshold itself was the problem.
+
+        Tests:
+            (Test Case 1) Flat-zero signal with ``threshold_sigma=5.0``
+                emits a UserWarning.
+            (Test Case 2) The warning message contains
+                ``"zero spikes detected"``.
+            (Test Case 3) The warning message references the threshold
+                value (5.0).
+        """
+        import warnings as _warnings
+
+        data = np.zeros((1, 100), dtype=float)
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            SpikeData.from_thresholding(
+                data,
+                fs_Hz=1000.0,
+                threshold_sigma=5.0,
+                filter=False,
+                hysteresis=False,
+            )
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "zero spikes detected" in m]
+        assert relevant, warn_msgs
+        assert "5.0" in relevant[0] or "5" in relevant[0]
+
+    def test_direction_down_hysteresis_pins_crossing_at_correct_sample(self):
+        """
+        ``from_thresholding(direction="down", hysteresis=True)`` reports
+        the down-crossing at the sample where the signal first crosses
+        below ``-threshold``, not one sample earlier or later. The
+        prepended-False guard in the hysteresis path restores the
+        original (N, T) shape and keeps the crossing aligned to the
+        sample where the change actually occurred.
+
+        Tests:
+            (Test Case 1) A signal that crosses below ``-threshold``
+                at sample 5 produces a spike at ``5 * (1000/fs)`` ms
+                (5 ms here at ``fs_Hz=1000``), not at 4 ms or 6 ms.
+        """
+        # 1-channel signal: zeros, then a sharp dip below threshold at
+        # sample 5, then back to zeros.
+        data = np.zeros((1, 30), dtype=float)
+        data[0, 5:10] = -5.0  # down-crossing at sample 5
+        sd = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            direction="down",
+            hysteresis=True,
+        )
+        assert sd.train[0].size >= 1
+        # Sample 5 at fs=1000 Hz → 5 ms.
+        first_spike_ms = float(sd.train[0][0])
+        assert first_spike_ms == pytest.approx(5.0, abs=0.51)
+
     def test_direction_up_detects_positive_crossings_only(self):
         """
         Tests:
@@ -10338,6 +10649,55 @@ class TestSpikeDataFromThresholdingDirectionBranches:
         assert n_down < n_both
 
 
+class TestSpikeDataFromThresholdingLengthStartTimeKwargs:
+    """``from_thresholding`` accepts ``length`` and ``start_time`` kwargs
+    that are forwarded to the underlying ``from_raster``. Without
+    these kwargs the length is inferred from ``data.shape[1]`` and
+    ``start_time`` defaults to 0.0 — explicit values honour file-level
+    attrs (trailing silence, event-centered start).
+    """
+
+    def test_length_kwarg_overrides_inferred_length(self):
+        """
+        Tests:
+            (Test Case 1) Explicit ``length=500.0`` produces a SpikeData
+                whose ``length`` is 500.0, even when the raw data
+                covers a shorter span.
+        """
+        # 1 channel × 100 samples at 1 kHz → naive length would be
+        # 100 ms. Pass length=500.0 to honour trailing silence past
+        # the raw_data window.
+        data = np.zeros((1, 100), dtype=float)
+        data[0, 50] = 10.0  # one super-threshold sample at 50 ms
+        sd = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+            length=500.0,
+        )
+        assert sd.length == pytest.approx(500.0)
+
+    def test_start_time_kwarg_overrides_default_zero(self):
+        """
+        Tests:
+            (Test Case 1) ``start_time=-100.0`` (event-centered) is
+                forwarded to ``SpikeData.start_time``.
+        """
+        data = np.zeros((1, 100), dtype=float)
+        data[0, 50] = 10.0
+        sd = SpikeData.from_thresholding(
+            data,
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+            start_time=-100.0,
+        )
+        assert sd.start_time == pytest.approx(-100.0)
+
+
 # ============================================================================
 # Test Coverage Scan (2026-05-25) — pin tests for the partial-coverage
 # gaps surfaced by the /test_scanner pass.
@@ -10378,11 +10738,19 @@ class TestSpikeDataLatenciesToIndexContract:
 
     def test_latencies_to_index_matches_latencies_with_unit_i(self):
         """
+        Tier L-F1: ``latencies_to_index`` now returns the same
+        ``(N_units, len(self.train[i]))`` NaN-padded ndarray that
+        ``latencies(self.train[i], ...)`` returns. Pin both the
+        type/shape contract AND the per-unit value equivalence so a
+        regression that accidentally re-wrapped the output as a
+        list-of-lists would fail here too.
+
         Tests:
-            (Test Case 1) ``latencies_to_index(0, window_ms=50)``
-                returns the same per-unit results as
+            (Test Case 1) Return value is an ndarray with shape
+                ``(sd.N, len(sd.train[ref_index]))``.
+            (Test Case 2) Per-unit rows match
                 ``latencies(self.train[0], window_ms=50)`` for
-                non-self units.
+                non-self units, including the NaN positions.
         """
         sd = SpikeData(
             [
@@ -10395,14 +10763,28 @@ class TestSpikeDataLatenciesToIndexContract:
         ref_index = 0
         via_index = sd.latencies_to_index(ref_index, window_ms=50.0)
         via_direct = sd.latencies(sd.train[ref_index], window_ms=50.0)
-        assert len(via_index) == len(via_direct)
+
+        # Type/shape contract (Test Case 1).
+        assert isinstance(via_index, np.ndarray)
+        assert via_index.shape == (sd.N, len(sd.train[ref_index]))
+        assert via_index.shape == via_direct.shape
+
+        # Per-unit value equivalence (Test Case 2). Includes NaN
+        # positions: both rows must agree on which slots are NaN AND
+        # on the numeric values at the non-NaN slots.
         for u in range(sd.N):
             if u == ref_index:
                 continue
+            np.testing.assert_array_equal(
+                np.isnan(via_index[u]),
+                np.isnan(via_direct[u]),
+                err_msg=f"NaN-mask mismatch at unit {u}",
+            )
+            mask = ~np.isnan(via_direct[u])
             np.testing.assert_allclose(
-                np.sort(np.asarray(via_index[u])),
-                np.sort(np.asarray(via_direct[u])),
-                err_msg=f"mismatch at unit {u}",
+                via_index[u][mask],
+                via_direct[u][mask],
+                err_msg=f"value mismatch at unit {u}",
             )
 
 

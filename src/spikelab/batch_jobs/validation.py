@@ -6,17 +6,12 @@ from typing import Any, Dict
 
 from pydantic import ValidationError
 
-from .models import JobSpec, RunConfig
+from .models import JobSpec
 
 
 def validate_job_spec(payload: Dict[str, Any]) -> JobSpec:
     """Parse and validate a raw job spec payload."""
     return JobSpec.model_validate(payload)
-
-
-def validate_run_config(payload: Dict[str, Any]) -> RunConfig:
-    """Parse and validate a run config payload."""
-    return RunConfig.model_validate(payload)
 
 
 def summarize_validation_error(exc: ValidationError) -> str:

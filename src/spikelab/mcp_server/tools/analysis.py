@@ -229,17 +229,50 @@ async def compute_resampled_isi(
     """
     Compute instantaneous firing rates via the resampled ISI method and store
     the result as a RateData object in the workspace.
+
+    The ``times`` array must be strictly increasing and uniformly
+    spaced — the core ``resampled_isi`` requires it (commit ``a8ad4bc``
+    added the guard). Validate at the MCP boundary so the agent sees a
+    clear, actionable error instead of a deep-stack ValueError from
+    inside the core implementation.
     """
+    times_arr = np.asarray(times, dtype=float)
+    if times_arr.ndim != 1:
+        raise ValueError(
+            f"compute_resampled_isi: times must be a 1-D array, got "
+            f"shape {times_arr.shape}."
+        )
+    if times_arr.size < 2:
+        raise ValueError(
+            f"compute_resampled_isi: times must have at least 2 entries "
+            f"to infer a uniform step, got {times_arr.size}."
+        )
+    diffs = np.diff(times_arr)
+    if not np.all(diffs > 0):
+        raise ValueError(
+            "compute_resampled_isi: times must be strictly increasing. "
+            f"Got min diff={diffs.min():g}. Sort and deduplicate the "
+            "times array before calling."
+        )
+    median_step = float(np.median(diffs))
+    if median_step <= 0 or not np.allclose(diffs, median_step, rtol=1e-6, atol=1e-9):
+        raise ValueError(
+            "compute_resampled_isi: times must be uniformly spaced. "
+            f"Got median step={median_step:g}, min step={diffs.min():g}, "
+            f"max step={diffs.max():g}. Resample to a uniform grid "
+            "(e.g. ``np.arange(start, end, step)``) before calling."
+        )
+
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    rd = sd.resampled_isi(times=np.array(times), sigma_ms=sigma_ms)
+    rd = sd.resampled_isi(times=times_arr, sigma_ms=sigma_ms)
     ws.store(namespace, key, rd)
     return {
         "workspace_id": workspace_id,
         "namespace": namespace,
         "key": key,
         "sigma_ms": sigma_ms,
-        "n_timepoints": len(times),
+        "n_timepoints": len(times_arr),
         "info": ws.get_info(namespace, key),
     }
 
@@ -325,11 +358,18 @@ async def compute_latencies(
     times: List[float],
     window_ms: float = 100.0,
 ) -> Dict[str, Any]:
-    """Compute spike latencies relative to event times and store NaN-padded array to workspace."""
+    """Compute spike latencies relative to event times and store the (U, T) array to workspace.
+
+    Tier L-F1: ``SpikeData.latencies`` now returns a NaN-padded
+    ``(N_units, len(times))`` ndarray directly. The previous
+    ``_pad_ragged`` call became redundant — the shape comes out of
+    ``latencies`` ready to store. ``arr[u, i]`` is the signed latency
+    from ``times[i]`` to the nearest spike in unit ``u``, or NaN if
+    that spike is more than ``window_ms`` away.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    latencies = sd.latencies(times, window_ms=window_ms)
-    arr = _pad_ragged(latencies)
+    arr = sd.latencies(times, window_ms=window_ms)
     ws.store(namespace, key, arr)
     return {
         "workspace_id": workspace_id,
@@ -337,7 +377,7 @@ async def compute_latencies(
         "key": key,
         "window_ms": window_ms,
         "info": ws.get_info(namespace, key),
-        "note": "NaN-padded (U, max_latency_count) array; rows = units",
+        "note": "NaN-padded (U, len(times)) array; rows = units, columns = query times",
     }
 
 
@@ -348,11 +388,16 @@ async def compute_latencies_to_index(
     neuron_index: int,
     window_ms: float = 100.0,
 ) -> Dict[str, Any]:
-    """Compute spike latencies relative to a reference neuron and store to workspace."""
+    """Compute spike latencies relative to a reference neuron and store to workspace.
+
+    Tier L-F1: ``latencies_to_index`` delegates to
+    ``SpikeData.latencies`` which now returns a NaN-padded
+    ``(N_units, len(train_i))`` ndarray directly. The
+    ``_pad_ragged`` call is no longer needed.
+    """
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
-    latencies = sd.latencies_to_index(neuron_index, window_ms=window_ms)
-    arr = _pad_ragged(latencies)
+    arr = sd.latencies_to_index(neuron_index, window_ms=window_ms)
     ws.store(namespace, key, arr)
     return {
         "workspace_id": workspace_id,

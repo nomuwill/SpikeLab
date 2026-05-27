@@ -39,8 +39,23 @@ from .utils import (
 from concurrent.futures import ThreadPoolExecutor
 
 __all__ = [
+    # Primary class
     "SpikeData",
+    # Re-exports from utils — kept on this module's public surface
+    # because they are the documented entry points for spike-train
+    # analysis (the ``utils`` module is treated as internal). Tier
+    # L-E4: expand the previous minimal ``[SpikeData, get_sttc]``
+    # list to cover the comparison / similarity helpers and the
+    # shuffle / threshold-crossing utilities that callers reach for
+    # directly. ``plot_utils.py`` is intentionally NOT listed —
+    # matplotlib helpers are not part of the data-class API.
     "get_sttc",
+    "swap",
+    "randomize",
+    "trough_between",
+    "extract_unit_waveforms",
+    "compute_cross_correlation_with_lag",
+    "compute_cosine_similarity_with_lag",
 ]
 
 
@@ -89,6 +104,18 @@ class SpikeData:
               range (>= N).
         """
         idces = np.asarray(idces)
+        times = np.asarray(times)
+        # Reject length mismatch up-front. ``_train_from_i_t_list``
+        # uses ``times[idces == i]`` boolean indexing internally; on
+        # ``len(idces) != len(times)`` numpy silently broadcasts or
+        # truncates instead of erroring, silently producing wrong
+        # per-unit trains. Surface the mismatch at the input boundary.
+        if idces.shape != times.shape:
+            raise ValueError(
+                f"idces and times must have equal length and shape; got "
+                f"len(idces)={len(idces)} (shape {idces.shape}), "
+                f"len(times)={len(times)} (shape {times.shape})."
+            )
         if idces.size == 0:
             kwargs.setdefault("length", 0)
             N = 0 if N is None else N
@@ -262,11 +289,32 @@ class SpikeData:
             # bin earlier than its actual crossing time (since diff
             # shifts everything left by one). Prepend a False column to
             # restore both: the raster regains its original (N, T)
-            # shape, and a rising edge at original sample t+1 maps
-            # back to raster bin t+1. The prepended column is a true
-            # statement — a rising edge cannot occur at sample 0.
+            # shape, and a fresh threshold crossing at original sample
+            # t+1 maps back to raster bin t+1. The prepended column is
+            # a true statement under all directions: a crossing
+            # (up-cross, down-cross, or either-direction) cannot occur
+            # at sample 0 because there is no preceding sample to
+            # compare against.
             diff = np.diff(np.array(raster, dtype=int), axis=1) == 1
             raster = np.hstack([np.zeros((diff.shape[0], 1), dtype=bool), diff])
+
+        # Warn when the threshold produced zero detections anywhere in
+        # the raster. The most common cause is an over-aggressive
+        # ``threshold_sigma`` for the recording's noise profile —
+        # callers iterating over ``threshold_sigma`` values used to
+        # see an empty SpikeData and have no signal that the
+        # threshold itself was the problem.
+        n_spikes = int(np.sum(raster))
+        if n_spikes == 0:
+            warnings.warn(
+                f"from_thresholding: zero spikes detected at "
+                f"threshold_sigma={threshold_sigma}, direction={direction!r}. "
+                "Threshold may be too aggressive for the input noise "
+                "profile; lower threshold_sigma or verify the signal "
+                "has events to detect.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         kwargs: dict = {"raw_data": data, "raw_time": fs_Hz / 1e3}
         if length is not None:
@@ -439,11 +487,20 @@ class SpikeData:
             - This method is not a property unlike ``times`` and ``events``
               because the lists must actually be constructed in memory.
         """
-        idces, times = [], []
-        for i, t in self.events:
-            idces.append(i)
-            times.append(t)
-        return np.array(idces), np.array(times)
+        # Pre-allocate from the known total-spike count rather than
+        # appending to Python lists and converting at the end. For
+        # recordings with millions of spikes the append loop allocates
+        # a new Python int object per spike and rebuilds the list
+        # capacity multiple times; np.repeat + np.concatenate runs
+        # entirely in NumPy C.
+        if not self.train:
+            return np.array([], dtype=np.int64), np.array([], dtype=float)
+        counts = np.array([len(t) for t in self.train], dtype=np.int64)
+        idces = np.repeat(np.arange(self.N, dtype=np.int64), counts)
+        times = (
+            np.concatenate(self.train) if counts.sum() else np.array([], dtype=float)
+        )
+        return idces, times
 
     @property
     def unit_locations(self) -> Optional[np.ndarray]:
@@ -529,25 +586,20 @@ class SpikeData:
               stride.
         """
         from .spikeslicestack import SpikeSliceStack
+        from .utils import _frame_window_starts
 
-        if overlap < 0:
-            raise ValueError(
-                f"overlap must be non-negative, got {overlap}. The parameter "
-                "represents an overlap, not a stride; use a smaller `length` "
-                "and post-filter slices for gapped windows."
-            )
-        step = length - overlap
-        if step <= 0:
-            raise ValueError("overlap must be less than length")
-        end_time = self.start_time + self.length
-        times = [
-            (float(start), float(start) + length)
-            for start in np.arange(self.start_time, end_time - length + 1e-9, step)
-        ]
-        if not times:
-            raise ValueError(
-                f"Recording length ({self.length} ms) is shorter than frame length ({length} ms)"
-            )
+        # Tier L-E5: window-generation logic factored out to
+        # ``_frame_window_starts`` and shared with ``RateData.frames``.
+        # Behaviour preserved: ``effective_end = self.start_time +
+        # self.length`` (one past the last raster bin), windows that
+        # extend past it are excluded, frame count is deterministic
+        # via ``floor(slot_span / step) + 1`` (no ULP-padding magic).
+        times = _frame_window_starts(
+            t0=self.start_time,
+            effective_end=self.start_time + self.length,
+            length=length,
+            overlap=overlap,
+        )
         return SpikeSliceStack(self, times_start_to_end=times)
 
     def align_to_events(
@@ -684,6 +736,16 @@ class SpikeData:
             binned_raster (numpy.ndarray): Array of the number of events in
                 each bin.
         """
+        # Short-circuit the zero-units case explicitly rather than
+        # relying on ``scipy.sparse.csr_matrix.sum(axis=0)`` returning
+        # a ``(1, T)`` row vector for ``(0, T)`` inputs — that
+        # behaviour is undocumented and has varied across scipy
+        # versions. ``binned_meanrate`` (line ~720) already has the
+        # explicit guard; mirror it here so both helpers are
+        # symmetric.
+        if self.N == 0:
+            n_bins = int(np.ceil(self.length / bin_size)) if self.length > 0 else 0
+            return np.zeros(n_bins, dtype=np.int64)
         # sum(0) on CSR returns a (1, T) matrix in older SciPy; flatten to 1D array
         return np.asarray(self.sparse_raster(bin_size).sum(0)).ravel()  # type: ignore
 
@@ -981,17 +1043,53 @@ class SpikeData:
         if by is not None:
             if self.neuron_attributes is None:
                 raise ValueError("can't use `by` without `neuron_attributes`")
+            if preserve_order:
+                # ``by`` resolves to whichever units carry the matching
+                # attribute, in self.train order — caller-supplied
+                # order cannot be honoured because there's no
+                # positional correspondence between the attribute-value
+                # list and unit indices. Surface the no-op to the
+                # caller so the silent ineffectiveness is visible.
+                warnings.warn(
+                    "preserve_order=True has no effect when by= is set; "
+                    "the by-path returns matching units in self.train "
+                    "order (attribute values have no positional "
+                    "correspondence to unit indices). Drop "
+                    "preserve_order=True or use index-based subset() "
+                    "to silence this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             _missing = object()
+            # Warn when ``by`` references an attribute key that NO unit
+            # actually carries. Typos like ``by="unit_idx"`` (vs the
+            # canonical ``"unit_id"``) used to silently produce empty
+            # subsets — caller saw an empty SpikeData with no clue why.
+            if not any(
+                _get_attr(self.neuron_attributes[i], by, _missing) is not _missing
+                for i in range(self.N)
+            ):
+                known_keys = sorted(
+                    {
+                        k
+                        for attrs in self.neuron_attributes
+                        if isinstance(attrs, dict)
+                        for k in attrs.keys()
+                    }
+                )
+                warnings.warn(
+                    f"subset(by={by!r}): no unit's neuron_attributes carries "
+                    f"this key; returning an empty SpikeData. Known keys "
+                    f"across neuron_attributes: {known_keys}. Check for typos.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             wanted = set(units)
             matched = [
                 i
                 for i in range(self.N)
                 if _get_attr(self.neuron_attributes[i], by, _missing) in wanted
             ]
-            # ``by`` resolves to whichever units carry the matching
-            # attribute, in self.train order — caller-supplied order
-            # cannot be honoured because there's no positional
-            # correspondence between the value list and unit indices.
             selected = matched
         else:
             # Match historical semantics: only integer-typed entries
@@ -1029,12 +1127,19 @@ class SpikeData:
 
         # raw_data/raw_time are not propagated to subsets — they remain
         # on the original SpikeData object and can be accessed there.
+        # ``neuron_attributes`` is passed through as-is (consistent with
+        # ``RateData.subset``); an empty list survives as ``[]`` rather
+        # than being silently collapsed to ``None`` via the prior
+        # ``or None`` shortcut. ``[]`` is the more honest answer when
+        # the input had attrs that all got filtered out — downstream
+        # ``isinstance(neuron_attributes, list)`` checks now behave
+        # symmetrically across data classes.
         return SpikeData(
             train,
             length=self.length,
             start_time=self.start_time,
             N=len(train),
-            neuron_attributes=neuron_attributes or None,
+            neuron_attributes=neuron_attributes,
             metadata=self.metadata,
         )
 
@@ -1247,6 +1352,19 @@ class SpikeData:
         """
         if self.N != spikeData.N:
             raise ValueError("Cannot concatenate SpikeData with different N")
+        # Reject negative offsets up-front. A negative ``offset`` shifts
+        # the concatenation point *backwards* into self's recording
+        # window, silently interleaving the appended spikes with
+        # self's instead of appending them. The result's ``length``
+        # then computes incorrectly. If someone genuinely wants to
+        # overlay two recordings they should use a different API.
+        if offset < 0:
+            raise ValueError(
+                f"offset must be non-negative, got {offset}. A negative "
+                "offset would shift the concatenation point backwards "
+                "into self's recording window, silently interleaving "
+                "the appended spikes with self's."
+            )
         # Shift appended spikes from their own time base to follow self's time range.
         # Subtract spikeData.start_time to normalize to 0-based, then add the
         # concatenation point (self's end time + gap).
@@ -1657,6 +1775,12 @@ class SpikeData:
                 ratio = np.where(den > 0, num / den, np.nan)
             if not np.any(np.isfinite(ratio)):
                 continue
+            # Degenerate-mean note: at the N=3-spike boundary the unit
+            # has exactly 2 ISIs and therefore one adjacent ISI pair —
+            # ``np.nanmean(ratio)`` here is the mean of a single value
+            # (technically valid, statistically not an average).
+            # Callers should treat per-unit CV2 with caution when the
+            # spike count is at or near 3.
             out[u] = float(np.nanmean(ratio))
         return out
 
@@ -1737,13 +1861,15 @@ class SpikeData:
             if length is None:
                 length = float(np.max(flat)) if len(flat) > 0 else 0.0
             upper = nb_sttc_all_pairs(flat, offsets, self.N, delt, length)
-            # Unpack upper-triangle vector into symmetric matrix
+            # Unpack upper-triangle vector into symmetric matrix. The
+            # earlier Python double-loop ran ~N^2/2 iterations at
+            # interpreter speed — for N=1000 that is ~500k iterations
+            # purely to copy floats. ``triu_indices`` + a single
+            # symmetric assignment runs entirely in NumPy C.
             ret = np.eye(self.N)
-            k = 0
-            for i in range(self.N):
-                for j in range(i + 1, self.N):
-                    ret[i, j] = ret[j, i] = upper[k]
-                    k += 1
+            triu_idx = np.triu_indices(self.N, k=1)
+            ret[triu_idx] = upper
+            ret[(triu_idx[1], triu_idx[0])] = upper
             return PairwiseCompMatrix(matrix=ret, metadata={"delt": delt})
 
         ret = np.eye(self.N)
@@ -1884,39 +2010,72 @@ class SpikeData:
         )
 
     def latencies(self, times, window_ms=100.0):
-        """Compute latencies from each time to the nearest spike per unit.
+        """Compute latencies from each query time to the nearest spike per unit.
+
+        Tier L-F1: rewrote from the previous O(N_units * N_times *
+        N_train) inner loop (per-iteration ``np.argmin(np.abs(train -
+        time))`` + redundant ``np.array(train)`` allocation) to a
+        ``np.searchsorted``-based vectorisation that is
+        O(N_units * (N_times + N_train * log N_train)) — orders of
+        magnitude faster on long trains. The return shape also
+        changed: a NaN-padded ``(U, len(times))`` ndarray instead
+        of the previous nested ``list[list[float]]``. The new shape
+        is information-preserving — ``arr[u, i]`` is the signed
+        latency from ``times[i]`` to the nearest spike in unit ``u``,
+        or ``NaN`` if that nearest spike is more than ``window_ms``
+        away. The previous nested-list shape silently dropped the
+        time-index correspondence (collapsing out-of-window entries
+        produced ``[lat_t2, lat_t3]`` with no way to tell which
+        query times those corresponded to).
 
         Parameters:
-            times (list): List of times.
-            window_ms (float): Window in milliseconds (default: 100.0).
+            times (array-like): Query times in milliseconds.
+            window_ms (float): Latency window in milliseconds; entries
+                whose nearest-spike distance exceeds the window are
+                returned as ``NaN`` (default: 100.0).
 
         Returns:
-            latencies (list): 2D list, each row is a list of latencies from
-                a time to the nearest spike in the train.
+            latencies (np.ndarray): Shape ``(N_units, len(times))``
+                ndarray of signed latencies (``spike_time - query_time``)
+                or NaN for out-of-window entries. Empty ``times`` →
+                returns an ``(N_units, 0)`` array.
         """
-        latencies = []
-        if len(times) == 0:
-            return latencies
+        times_arr = np.asarray(times, dtype=float)
+        n_times = times_arr.size
+        out = np.full((self.N, n_times), np.nan, dtype=float)
+        if n_times == 0:
+            return out
 
-        for train in self.train:
-            cur_latencies = []
-            if len(train) == 0:
-                latencies.append(cur_latencies)
-                continue
-            for time in times:
-                # Subtract time from all spikes in the train
-                # and take the absolute value
-                abs_diff_ind = np.argmin(np.abs(train - time))
+        for u, train in enumerate(self.train):
+            train_arr = np.asarray(train, dtype=float)
+            if train_arr.size == 0:
+                continue  # row stays all-NaN
 
-                # Calculate the actual latency
-                latency = np.array(train) - time
-                latency = latency[abs_diff_ind]
+            if train_arr.size == 1:
+                # Single-spike train: no nearest-vs-predecessor choice.
+                latencies = train_arr[0] - times_arr
+            else:
+                # ``searchsorted`` returns the insertion index per
+                # query time. The nearest spike is either the spike
+                # AT that index (just-after) or the one just before.
+                # Clip the index to ``[1, len(train) - 1]`` so both
+                # candidates always exist; the comparison below picks
+                # the closer.
+                idx = np.searchsorted(train_arr, times_arr)
+                idx = np.clip(idx, 1, train_arr.size - 1)
+                left = train_arr[idx - 1] - times_arr
+                right = train_arr[idx] - times_arr
+                # Pick whichever spike is closer in absolute distance
+                # to the query time. Ties go to the predecessor (left)
+                # — matches the previous ``argmin`` behaviour, which
+                # also returned the first equal index.
+                use_right = np.abs(right) < np.abs(left)
+                latencies = np.where(use_right, right, left)
 
-                abs_diff = np.abs(latency)
-                if abs_diff <= window_ms:
-                    cur_latencies.append(latency)
-            latencies.append(cur_latencies)
-        return latencies
+            # NaN out entries outside the window.
+            in_window = np.abs(latencies) <= window_ms
+            out[u, in_window] = latencies[in_window]
+        return out
 
     def get_pairwise_latencies(self, window_ms=None, return_distributions=False):
         """Compute pairwise nearest-spike latency distributions between all unit pairs.
@@ -2030,13 +2189,21 @@ class SpikeData:
     def latencies_to_index(self, i, window_ms=100.0):
         """Compute the latency from one unit to all other units.
 
+        Thin wrapper around :meth:`latencies` that uses unit ``i``'s
+        spike train as the query times.
+
         Parameters:
-            i (int): Index of the unit.
+            i (int): Index of the reference unit.
             window_ms (float): Window in milliseconds (default: 100.0).
 
         Returns:
-            latencies (list): 2D list, each row is a list of latencies per
-                neuron.
+            latencies (np.ndarray): Shape ``(N_units, len(self.train[i]))``
+                float64 ndarray. Entry ``[u, k]`` is the signed latency
+                from the ``k``-th spike of unit ``i`` to the nearest
+                spike of unit ``u`` (within ``window_ms``), or ``NaN``
+                when no spike of unit ``u`` falls within the window.
+                Row ``i`` contains zeros where self-latencies match
+                exactly.
         """
         return self.latencies(self.train[i], window_ms)
 
@@ -2242,8 +2409,13 @@ class SpikeData:
 
         Parameters:
             n_shuffles (int): Number of shuffled datasets to generate.
-            seed (int or None): Base random seed. Each shuffle uses
-                ``seed + i`` for reproducibility. None means no seed.
+            seed (int or None): Base random seed. When set, the n
+                child seeds are derived via
+                ``np.random.SeedSequence(seed).spawn(n_shuffles)`` so
+                that each shuffle gets an entropy-mixed independent
+                stream — the same idiomatic pattern
+                ``_rank_order_correlation_from_timing`` uses. None
+                means no seed (shuffles non-reproducible).
             swap_per_spike (int): Forwarded to ``spike_shuffle``
                 (default: 5).
             bin_size (int): Forwarded to ``spike_shuffle`` (default: 1).
@@ -2251,18 +2423,38 @@ class SpikeData:
         Returns:
             stack (SpikeSliceStack): Stack of n_shuffles shuffled SpikeData
                 objects. All slices share the same time bounds.
+
+        Notes:
+            - Reproducibility: ``spike_shuffle_stack(seed=42)`` produces
+              identical output across calls. Different seeds produce
+              different outputs.
+            - Pre-Tier-L the child seeds were ``seed + i``. Switching
+              to ``SeedSequence.spawn`` produces a different (but
+              still deterministic) sequence per seed value — exact
+              shuffle values from analysis snapshots pinned to the
+              old ``seed + i`` mapping will not bit-exact match the
+              new output. Null-distribution properties (the use case)
+              are statistically unaffected.
         """
         if n_shuffles < 1:
             raise ValueError("n_shuffles must be at least 1.")
 
         from .spikeslicestack import SpikeSliceStack
 
+        if seed is None:
+            child_seeds: list = [None] * n_shuffles
+        else:
+            # SeedSequence.spawn produces ``n_shuffles`` independent
+            # child SeedSequence objects. ``np.random.default_rng``
+            # (called inside ``randomize``) accepts SeedSequence
+            # directly — no extra conversion needed.
+            child_seeds = list(np.random.SeedSequence(seed).spawn(n_shuffles))
+
         shuffled = []
-        for i in range(n_shuffles):
-            s = seed + i if seed is not None else None
+        for child in child_seeds:
             shuffled.append(
                 self.spike_shuffle(
-                    swap_per_spike=swap_per_spike, seed=s, bin_size=bin_size
+                    swap_per_spike=swap_per_spike, seed=child, bin_size=bin_size
                 )
             )
 

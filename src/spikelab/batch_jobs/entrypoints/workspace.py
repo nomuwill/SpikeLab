@@ -3,10 +3,19 @@
 Invoked as ``python -m spikelab.batch_jobs.entrypoints.workspace``
 inside a Kubernetes job container.
 
-Environment variables:
+Environment variables (required):
     INPUT_URI: S3 URI of the input bundle zip.
     OUTPUT_PREFIX: S3 URI prefix for uploading the updated workspace.
     SCRIPT_NAME: Filename of the analysis script inside the bundle.
+
+Environment variables (optional, consulted by the S3 client):
+    S3_ENDPOINT_URL: Override the AWS S3 endpoint. Used by
+        non-AWS S3-compatible stores (MinIO, Wasabi, etc.). Default:
+        unset → boto3 routes to AWS S3.
+    AWS_DEFAULT_REGION: AWS region name passed to ``boto3.client``.
+        Required by some AWS regions to disambiguate the endpoint.
+        Default: unset → boto3 uses its own region-resolution chain
+        (env, profile, instance metadata).
 """
 
 from __future__ import annotations
@@ -166,11 +175,28 @@ def main() -> None:
         # The script receives the workspace as a global variable named
         # 'workspace'. It can modify it freely; the modified workspace
         # is saved and uploaded after the script completes.
+        #
+        # Wrap ``runpy.run_path`` so failures inside the analysis
+        # script surface with a clear stdout marker — the pod still
+        # exits non-zero (re-raise after the marker) but the operator
+        # can distinguish "script ran and raised" from "entrypoint
+        # bootstrap failed" or "result upload failed" when scanning
+        # pod logs.
+        import sys
+
         run_globals = {
             "workspace": workspace,
             "__name__": "__main__",
         }
-        runpy.run_path(script_path, init_globals=run_globals, run_name="__main__")
+        try:
+            runpy.run_path(script_path, init_globals=run_globals, run_name="__main__")
+        except BaseException as exc:
+            print(
+                f"WORKSPACE_SCRIPT_FAILED: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
 
         # In case the script replaced the workspace object
         workspace = run_globals.get("workspace", workspace)

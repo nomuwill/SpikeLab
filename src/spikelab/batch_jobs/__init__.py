@@ -13,7 +13,6 @@ def __getattr__(name):
         "ContainerSpec",
         "JobSpec",
         "ResourceSpec",
-        "RunConfig",
         "SubmitResult",
         "VolumeMountSpec",
         "RunSession",
@@ -27,7 +26,6 @@ def __getattr__(name):
                 "ContainerSpec",
                 "JobSpec",
                 "ResourceSpec",
-                "RunConfig",
                 "SubmitResult",
                 "VolumeMountSpec",
             }:
@@ -36,7 +34,6 @@ def __getattr__(name):
                     ContainerSpec,
                     JobSpec,
                     ResourceSpec,
-                    RunConfig,
                     SubmitResult,
                     VolumeMountSpec,
                 )
@@ -51,10 +48,29 @@ def __getattr__(name):
 
                 return RunSession
         except ImportError as exc:
-            raise ImportError(
-                f"Cannot import '{name}' — install the batch-jobs extra: "
-                "pip install spikelab[batch-jobs]"
-            ) from exc
+            # Tier L-D9: only emit the install-hint message when the
+            # missing module's name is one of the known optional
+            # dependencies. An ImportError raised by a typo inside
+            # our own module would otherwise be hidden behind the
+            # generic "install the batch-jobs extra" message, sending
+            # the operator down the wrong troubleshooting path.
+            _OPTIONAL_DEPS = {
+                "kubernetes",
+                "boto3",
+                "yaml",
+                "jinja2",
+                "pydantic",
+            }
+            missing_name = getattr(exc, "name", None)
+            if missing_name is None or missing_name.split(".")[0] in _OPTIONAL_DEPS:
+                raise ImportError(
+                    f"Cannot import '{name}' — install the batch-jobs extra: "
+                    "pip install spikelab[batch-jobs] "
+                    f"(underlying ImportError: {exc})"
+                ) from exc
+            # Re-raise unchanged for non-optional-dep errors (typos in
+            # our relative imports, etc.) so the real cause surfaces.
+            raise
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -63,7 +79,6 @@ __all__ = [
     "ContainerSpec",
     "JobSpec",
     "ResourceSpec",
-    "RunConfig",
     "SubmitResult",
     "VolumeMountSpec",
     "RunSession",

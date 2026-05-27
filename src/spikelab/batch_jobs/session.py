@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import pickle
+import subprocess
 import tempfile
 import time
 import warnings
@@ -21,8 +23,17 @@ from .policy import evaluate_policy, summarize_preflight
 from .storage_s3 import S3StorageClient
 from .templating import build_template_context, render_job_manifest
 
+_logger = logging.getLogger(__name__)
+
 # Workspace path convention: save(base) produces base.h5 + base.json
 _WORKSPACE_BASE_NAME = "workspace"
+
+# Kubernetes job-name budget. RFC 1123 caps DNS subdomain labels at 63
+# characters; we reserve 8 of those for the UUID-based suffix plus 1
+# for the '-' separator. The remaining 54 are available for the
+# user-supplied name_prefix.
+_JOB_NAME_MAX_LENGTH = 63
+_JOB_NAME_TOKEN_LENGTH = 8
 
 
 class RunSession:
@@ -47,8 +58,9 @@ class RunSession:
 
     @staticmethod
     def _build_job_name(prefix: str) -> str:
-        token = uuid4().hex[:8]
-        max_prefix = 63 - 1 - len(token)  # 54
+        token = uuid4().hex[:_JOB_NAME_TOKEN_LENGTH]
+        # Reserve room for the ``-`` separator and the suffix token.
+        max_prefix = _JOB_NAME_MAX_LENGTH - 1 - len(token)
         truncated = prefix[:max_prefix].rstrip("-")
         if not truncated:
             raise ValueError(
@@ -103,19 +115,12 @@ class RunSession:
         manifest_text = self.render_manifest(
             job_name=job_name, job_spec=job_spec, run_id=run_id
         )
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".yaml",
-            prefix=f"{job_name}-",
-            delete=False,
-            encoding="utf-8",
-        ) as f:
-            f.write(manifest_text)
-            manifest_path = f.name
-        try:
-            self.backend.apply_manifest(manifest_path)
-        finally:
-            os.unlink(manifest_path)
+        # ``apply_manifest`` accepts a raw YAML string (it does
+        # ``Path(arg).exists()`` to disambiguate a path argument from
+        # an inline YAML payload). Pass the rendered text directly
+        # instead of writing it to a tempfile only to read it back —
+        # avoids the round-trip to disk and the unlink cleanup.
+        self.backend.apply_manifest(manifest_text)
 
         # Render a second manifest with sensitive env values redacted
         # for the SubmitResult surface. The redaction policy lives in
@@ -309,12 +314,19 @@ class RunSession:
                 *[str(p) for p in recording_paths],
             ]
 
+            # Tier L-C2: declare the recording basenames so the
+            # pod-side entrypoint (entrypoints/sorting.main) can
+            # distinguish recordings from companion files (probe
+            # sidecars, metadata.csv, etc.) via the manifest's
+            # ``recording_files`` whitelist instead of the prior
+            # name-blacklist heuristic.
             bundle_zip = package_analysis_bundle(
                 input_paths=input_files,
                 run_id=run_id,
                 output_dir=temp_dir,
                 output_format="sorting",
                 metadata=metadata,
+                recording_files=[Path(p).name for p in recording_paths],
             )
 
             uploaded_input_uri = self.storage.upload_bundle(
@@ -569,14 +581,104 @@ class RunSession:
         job_name: str,
         max_wait_seconds: int = 3600,
         poll_interval_seconds: int = 10,
+        max_consecutive_failures: int = 5,
+        max_backoff_seconds: int = 300,
     ) -> str:
-        """Poll until completion/failure or timeout and return final state."""
+        """Poll until completion/failure or timeout and return final state.
+
+        Transient backend errors (kubectl network blips, K8s API
+        server restarts, urllib3 timeouts) no longer abort the wait.
+        The poll is wrapped in try/except; consecutive failures
+        accumulate, sleep doubles per failure (exponential backoff
+        capped at ``max_backoff_seconds``), and the loop gives up
+        only when either:
+
+          * ``max_consecutive_failures`` polls in a row raise — the
+            backend is considered unavailable; return
+            ``"Backend unavailable"``;
+          * the kubernetes-client path raises ``ApiException(404)``
+            — the job was deleted out-of-band, no completion can be
+            confirmed; return ``"Failed"``;
+          * ``max_wait_seconds`` elapses — return ``"Timeout"``.
+
+        A successful poll resets both the consecutive-failure counter
+        and the backoff sleep to ``poll_interval_seconds``.
+
+        Parameters:
+            job_name (str): K8s job identifier.
+            max_wait_seconds (int): Overall wall-clock budget.
+            poll_interval_seconds (int): Base sleep between polls.
+            max_consecutive_failures (int): How many polls may fail
+                back-to-back before declaring the backend unavailable.
+            max_backoff_seconds (int): Cap on the exponential-backoff
+                sleep so a long blip doesn't extend the next poll
+                arbitrarily.
+
+        Returns:
+            state (str): One of ``"Complete"``, ``"Failed"``,
+                ``"Timeout"``, ``"Backend unavailable"``.
+        """
+        # Optional kubernetes import — kubectl-only deployments don't
+        # need this. Empty tuple in the except clause never matches,
+        # so the kubectl/OSError branch covers all errors when the
+        # kubernetes client is absent.
+        try:
+            from kubernetes.client.exceptions import ApiException
+        except ImportError:  # pragma: no cover
+            ApiException = ()  # type: ignore[assignment, misc]
+
         deadline = time.time() + max_wait_seconds
+        consecutive_failures = 0
+        current_sleep = poll_interval_seconds
         while time.time() < deadline:
-            state = self.backend.job_status(job_name)
-            if state in {"Complete", "Failed"}:
-                return state
-            time.sleep(poll_interval_seconds)
+            try:
+                state = self.backend.job_status(job_name)
+            except ApiException as exc:  # type: ignore[misc]
+                if getattr(exc, "status", None) == 404:
+                    _logger.info(
+                        "wait_for_completion: job %s reports 404 — deleted "
+                        "out-of-band; returning Failed.",
+                        job_name,
+                    )
+                    return "Failed"
+                consecutive_failures += 1
+                _logger.warning(
+                    "wait_for_completion: ApiException polling job %s "
+                    "(consecutive_failures=%d): %r",
+                    job_name,
+                    consecutive_failures,
+                    exc,
+                )
+            except (subprocess.CalledProcessError, OSError) as exc:
+                consecutive_failures += 1
+                _logger.warning(
+                    "wait_for_completion: transient backend error polling "
+                    "job %s (consecutive_failures=%d): %r",
+                    job_name,
+                    consecutive_failures,
+                    exc,
+                )
+            else:
+                # Successful poll — reset failure counter AND backoff
+                # so the next failure starts at the base interval again.
+                consecutive_failures = 0
+                current_sleep = poll_interval_seconds
+                if state in {"Complete", "Failed"}:
+                    return state
+            if consecutive_failures >= max_consecutive_failures:
+                _logger.error(
+                    "wait_for_completion: %d consecutive polling failures "
+                    "for job %s — declaring backend unavailable.",
+                    consecutive_failures,
+                    job_name,
+                )
+                return "Backend unavailable"
+            if consecutive_failures > 0:
+                current_sleep = min(current_sleep * 2, max_backoff_seconds)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(current_sleep, remaining))
         return "Timeout"
 
     # ------------------------------------------------------------------

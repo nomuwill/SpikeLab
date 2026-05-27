@@ -8008,19 +8008,53 @@ class TestValidateRecordingInputsEdges:
 
     def test_none_entry_raises(self):
         """
-        ``None`` in the recording inputs list raises ``ValueError``
-        flagging the caller bug.
+        ``None`` in the recording inputs list produces a fail-level
+        ``recording_input_none`` finding rather than raising. The
+        preflight collects all problems then surfaces them together,
+        so individual entries return findings.
 
         Tests:
-            (Test Case 1) Single ``None`` entry raises ``ValueError``
-                whose message contains ``"caller bug"``.
+            (Test Case 1) Single ``None`` entry produces one
+                fail-level finding with code ``recording_input_none``.
         """
         from spikelab.spike_sorting.guards._preflight import (
             _validate_recording_inputs,
         )
 
-        with pytest.raises(ValueError, match="caller bug"):
-            _validate_recording_inputs([None])
+        findings = _validate_recording_inputs([None])
+        assert len(findings) == 1
+        assert findings[0].level == "fail"
+        assert findings[0].code == "recording_input_none"
+
+    def test_none_in_middle_of_list_records_finding_and_continues_loop(self, tmp_path):
+        """
+        ``_validate_recording_inputs`` accumulates findings across the
+        entire input list — a ``None`` in the middle produces one
+        ``recording_input_none`` finding and the loop continues to
+        evaluate subsequent entries (so two missing files produce two
+        ``recording_missing`` findings even after a ``None`` at index 1).
+
+        Tests:
+            (Test Case 1) ``[exists_path, None, missing_path]`` produces
+                findings including ``recording_input_none`` at index 1.
+            (Test Case 2) The loop reaches the entry at index 2 — its
+                missing-file finding is also present.
+        """
+        from spikelab.spike_sorting.guards._preflight import (
+            _validate_recording_inputs,
+        )
+
+        existing = tmp_path / "ok.h5"
+        existing.write_bytes(b"placeholder")
+        missing = tmp_path / "absent.h5"
+
+        findings = _validate_recording_inputs([existing, None, missing])
+        codes = [f.code for f in findings]
+        # Index 1's None surfaces.
+        assert "recording_input_none" in codes
+        # Index 2's missing path also surfaced — proves the loop kept
+        # iterating after the None entry.
+        assert "recording_missing" in codes
 
     def test_no_extension_path_yields_unfamiliar_warning(self, tmp_path):
         """
@@ -9730,7 +9764,11 @@ class TestCheckDockerSorterDockerPyPath:
             def ping(self):
                 return True
 
-        fake_docker = SimpleNamespace(from_env=lambda: _FakeClient())
+        # ``from_env`` accepts ``**kwargs`` so the stub matches the
+        # ``timeout=5`` kwarg added to ``_check_image_cached`` in
+        # Tier L-B4 (preflight image-cache check no longer hangs
+        # on a frozen Docker daemon).
+        fake_docker = SimpleNamespace(from_env=lambda **kwargs: _FakeClient())
         monkeypatch.setitem(sys.modules, "docker", fake_docker)
 
         # ``get_docker_image`` is imported inside the function, so
@@ -9751,6 +9789,62 @@ class TestCheckDockerSorterDockerPyPath:
         # Daemon reachable + image cached → no daemon-down or
         # image-missing finding.
         assert "sorter_dependency_missing" not in codes
+
+    def test_check_image_cached_passes_timeout_5_to_docker_py(self, monkeypatch):
+        """
+        ``_check_image_cached`` passes ``timeout=5`` to
+        ``docker.from_env`` so a half-frozen Docker daemon cannot
+        block preflight indefinitely.
+
+        Tests:
+            (Test Case 1) ``docker.from_env`` is invoked with
+                ``timeout=5`` in its kwargs.
+            (Test Case 2) When the image is found, the function
+                returns True.
+        """
+        from spikelab.spike_sorting.guards._preflight import _check_image_cached
+
+        captured_kwargs: dict = {}
+
+        class _FakeImages:
+            def get(self, _tag):
+                return SimpleNamespace()
+
+        class _FakeClient:
+            images = _FakeImages()
+
+        def fake_from_env(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _FakeClient()
+
+        fake_docker = SimpleNamespace(from_env=fake_from_env)
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        result = _check_image_cached("some:tag")
+        assert result is True
+        assert captured_kwargs.get("timeout") == 5
+
+    def test_check_image_cached_old_docker_py_without_timeout_kwarg(self, monkeypatch):
+        """
+        Older docker-py versions raise ``TypeError`` when
+        ``from_env(timeout=5)`` is called. The function catches the
+        error and returns False (caller falls through to "pull the
+        image" — the conservative answer).
+
+        Tests:
+            (Test Case 1) ``from_env(timeout=...)`` raising TypeError
+                results in False (no exception propagates).
+        """
+        from spikelab.spike_sorting.guards._preflight import _check_image_cached
+
+        def old_from_env(**kwargs):
+            raise TypeError("from_env() got an unexpected keyword argument 'timeout'")
+
+        fake_docker = SimpleNamespace(from_env=old_from_env)
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        result = _check_image_cached("some:tag")
+        assert result is False
 
     def test_docker_py_ping_raises_yields_fail(self, monkeypatch):
         """

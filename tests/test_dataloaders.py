@@ -110,7 +110,11 @@ class TestHDF5Loaders:
         Tests:
         (Method 1)  Writes 'idces' and 'times' datasets
         (Method 2)  Loads them using load_spikedata_from_hdf5
-        (Test Case 1)  Checks that the idces_times method returns the correct indices and times.
+        (Test Case 1)  Checks that the idces_times round-trips the original
+            (idces, times) pairs. Order is now per-unit grouped (Tier
+            K-C1 perf opt rewrote ``idces_times`` to use
+            ``np.repeat`` + ``np.concatenate``), so compare via sorted
+            (idx, time) pairs rather than positional equality.
         """
         path = str(tmp_path / "test.h5")
         idces = np.array([0, 1, 0, 1], dtype=int)
@@ -123,7 +127,11 @@ class TestHDF5Loaders:
             path, idces_dataset="idces", times_dataset="times", times_unit="ms"
         )
         loaded_idces, loaded_times = sd.idces_times()
-        np.testing.assert_allclose(loaded_times, times_ms)
+        # Order-independent comparison — (idx, time) pairs survive
+        # the per-unit grouping.
+        original_pairs = sorted(zip(idces.tolist(), times_ms.tolist()))
+        loaded_pairs = sorted(zip(loaded_idces.tolist(), loaded_times.tolist()))
+        assert loaded_pairs == original_pairs
 
     def test_hdf5_group_per_unit_seconds(self, tmp_path):
         """
@@ -1774,6 +1782,87 @@ class TestIBLLoader:
         assert sd.N == 0
         assert sd.length == pytest.approx(5_000.0)
 
+    def test_explicit_collection_short_circuits_heuristic_search(self):
+        """
+        Tier L-F2: passing ``collection="alf/probe00/pykilosort"`` must
+        skip the PID-suffix heuristic + fallback chain and issue exactly
+        one ``load_object("spikes", ...)`` call against the explicit
+        collection.
+
+        Tests:
+            (Test Case 1) With ``collection`` set, exactly one
+                ``load_object("spikes", ...)`` call is made and its
+                ``collection`` kwarg matches the explicit value.
+            (Test Case 2) Without ``collection`` (None / default), the
+                heuristic tries multiple candidates when the first
+                fails, so more than one ``load_object("spikes", ...)``
+                call is made.
+        """
+        eid, pid = "test-eid", "11111111-2222-3333-4444-555555555500"
+        # Build mocks where the heuristic-preferred ``alf/probe00/pykilosort``
+        # call fails so the fallback chain is exercised when ``collection``
+        # is None — but the explicit ``collection="alf"`` call succeeds.
+        mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
+            pid,
+            eid,
+            n_good=2,
+            fail_collections={"alf/probe00/pykilosort"},
+        )
+
+        # Test Case 1: explicit collection, exactly one spikes call.
+        with patch.dict(
+            sys.modules,
+            {
+                "one": MagicMock(),
+                "one.api": mock_one_api,
+                "brainwidemap": mock_brainwidemap,
+            },
+        ):
+            loaders.load_spikedata_from_ibl(
+                eid, pid, length_ms=200_000.0, collection="alf"
+            )
+
+        mock_one = mock_one_api.ONE.return_value
+        spikes_calls = [
+            c
+            for c in mock_one.load_object.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "spikes"
+        ]
+        assert len(spikes_calls) == 1, (
+            f"explicit collection should issue exactly one spikes call, "
+            f"got {len(spikes_calls)}: {spikes_calls}"
+        )
+        assert spikes_calls[0].kwargs.get("collection") == "alf"
+
+        # Test Case 2: no explicit collection, heuristic falls through
+        # at least one failed candidate so >1 spikes call is made.
+        mock_one_api2, mock_brainwidemap2, _, _, _ = self._build_mocks(
+            pid,
+            eid,
+            n_good=2,
+            fail_collections={"alf/probe00/pykilosort"},
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "one": MagicMock(),
+                "one.api": mock_one_api2,
+                "brainwidemap": mock_brainwidemap2,
+            },
+        ):
+            loaders.load_spikedata_from_ibl(eid, pid, length_ms=200_000.0)
+
+        mock_one2 = mock_one_api2.ONE.return_value
+        spikes_calls2 = [
+            c
+            for c in mock_one2.load_object.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "spikes"
+        ]
+        assert len(spikes_calls2) >= 2, (
+            f"no explicit collection: heuristic should try more than one "
+            f"candidate when the first fails, got {len(spikes_calls2)}"
+        )
+
 
 @skip_no_pandas
 class TestIBLQuery:
@@ -2438,6 +2527,57 @@ class TestS3Utils:
             with pytest.raises(PermissionError, match="Access denied"):
                 download_from_s3("s3://my-bucket/secret.h5")
 
+    def test_download_from_s3_clienterror_cleans_auto_temp_file(self, tmp_path):
+        """
+        When ``download_from_s3`` allocates a ``NamedTemporaryFile``
+        (caller passes ``local_path=None``) and the download then
+        raises a ``ClientError``, the auto-allocated temp file is
+        unlinked before the exception propagates.
+
+        Tests:
+            (Test Case 1) The auto-temp path observed by the failing
+                download no longer exists on disk after the exception
+                propagates.
+            (Test Case 2) A caller-supplied ``local_path`` is NOT
+                unlinked by the cleanup path.
+        """
+        from spikelab.data_loaders.s3_utils import download_from_s3
+
+        captured_paths: list[str] = []
+
+        def failing_download(bucket, key, local_path):
+            captured_paths.append(local_path)
+            # Ensure the temp file exists when the failure fires so the
+            # test can prove the cleanup path actually removed it.
+            with open(local_path, "wb") as f:
+                f.write(b"")
+            raise self._make_client_error("NoSuchBucket")
+
+        mock_client = MagicMock()
+        mock_client.download_file.side_effect = failing_download
+
+        with patch("spikelab.data_loaders.s3_utils.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_client
+            with pytest.raises(ValueError):
+                download_from_s3("s3://nonexistent-bucket/key.h5")
+
+        # Auto-allocated temp file should have been removed.
+        assert len(captured_paths) == 1
+        assert not os.path.exists(captured_paths[0])
+
+        # Caller-supplied local_path is preserved on failure (caller owns it).
+        caller_path = str(tmp_path / "caller_owned.h5")
+        with open(caller_path, "wb") as f:
+            f.write(b"existing-bytes")
+
+        mock_client.download_file.side_effect = self._make_client_error("AccessDenied")
+        with patch("spikelab.data_loaders.s3_utils.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_client
+            with pytest.raises(PermissionError):
+                download_from_s3("s3://my-bucket/file.h5", local_path=caller_path)
+        # Caller's file was not unlinked.
+        assert os.path.exists(caller_path)
+
     def test_download_from_s3_no_credentials(self):
         """
         download_from_s3 raises RuntimeError when AWS credentials are missing.
@@ -2988,6 +3128,61 @@ class TestReadRawArrays:
 
 
 @skip_no_h5py
+class TestHDF5RawThresholdedFileAttrRoundTrip:
+    """``load_spikedata_from_hdf5_raw_thresholded`` honours file-level
+    ``length_ms`` and ``start_time`` attributes — without them the
+    raster path and thresholded path would have asymmetric round-trip
+    semantics for trailing silence and event-centered windows.
+    """
+
+    def test_length_ms_attr_overrides_inferred_length(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) A file written with ``f.attrs['length_ms'] =
+                500.0`` produces a SpikeData with ``length == 500.0``
+                even though the raw data only spans 100 ms.
+        """
+        path = str(tmp_path / "trailing_silence.h5")
+        data = np.zeros((1, 100), dtype=float)
+        data[0, 50] = 10.0
+        with h5py.File(path, "w") as f:
+            f.create_dataset("raw", data=data)
+            f.attrs["length_ms"] = 500.0
+
+        sd = loaders.load_spikedata_from_hdf5_raw_thresholded(
+            path,
+            dataset="raw",
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+        )
+        assert sd.length == pytest.approx(500.0)
+
+    def test_start_time_attr_round_trips_event_centered_window(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``f.attrs['start_time'] = -100.0`` produces
+                a SpikeData with ``start_time == -100.0``.
+        """
+        path = str(tmp_path / "event_centered.h5")
+        data = np.zeros((1, 200), dtype=float)
+        data[0, 100] = 10.0
+        with h5py.File(path, "w") as f:
+            f.create_dataset("raw", data=data)
+            f.attrs["start_time"] = -100.0
+
+        sd = loaders.load_spikedata_from_hdf5_raw_thresholded(
+            path,
+            dataset="raw",
+            fs_Hz=1000.0,
+            threshold_sigma=1.0,
+            filter=False,
+            hysteresis=False,
+        )
+        assert sd.start_time == pytest.approx(-100.0)
+
+
 class TestHDF5RawThresholded:
     """Edge case tests for load_spikedata_from_hdf5_raw_thresholded."""
 
@@ -4681,6 +4876,32 @@ class TestPickleLoader2:
             loaders.load_spikedata_from_pickle(path)
 
 
+class TestSpikeInterfaceLoaderDocstring:
+    """Public docstring contract for ``load_spikedata_from_spikeinterface``.
+    The unit-order convention (``sorting.get_unit_ids()`` order is
+    backend-dependent — KS sequential vs SpikeInterface-reordered)
+    matters for cross-backend comparisons and is documented in the
+    function's docstring along with the ``unit_ids`` override knob.
+    """
+
+    def test_docstring_documents_backend_dependent_order_and_unit_ids(self):
+        """
+        Tests:
+            (Test Case 1) ``__doc__`` contains the substring
+                ``"backend-dependent"``.
+            (Test Case 2) ``__doc__`` names ``unit_ids`` as the
+                override knob callers rely on.
+        """
+        from spikelab.data_loaders.data_loaders import (
+            load_spikedata_from_spikeinterface,
+        )
+
+        doc = load_spikedata_from_spikeinterface.__doc__
+        assert doc is not None
+        assert "backend-dependent" in doc
+        assert "unit_ids" in doc
+
+
 class TestSpikeInterfaceLoader:
     """Edge case tests for load_spikedata_from_spikeinterface."""
 
@@ -5120,6 +5341,53 @@ class TestLoadHdf5RasterEdgeShapes:
 
 
 @skip_no_h5py
+class TestLoadHdf5PairedSparseClusterIdsWarning:
+    """``load_spikedata_from_hdf5`` paired style emits a UserWarning
+    when ``idces`` skips cluster IDs (e.g. Phy curation dropped some).
+    The warning surfaces the count of padded empty units so the operator
+    can tell "unit N had no spikes" from "unit N was dropped upstream".
+    """
+
+    def test_sparse_cluster_ids_warns_with_padded_count(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``idces = [0, 1, 47]`` (max+1=48 but only 3
+                distinct ids) emits a UserWarning.
+            (Test Case 2) The warning names the padded-unit count
+                (48 - 3 = 45).
+        """
+        try:
+            import h5py  # noqa: F401
+            import warnings as _warnings
+        except ImportError:
+            pytest.skip("h5py not installed")
+
+        path = str(tmp_path / "sparse_paired.h5")
+        with h5py.File(path, "w") as f:
+            f.create_dataset("idces", data=np.array([0, 1, 47], dtype=int))
+            f.create_dataset("times", data=np.array([1.0, 2.0, 3.0]))
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sd = loaders.load_spikedata_from_hdf5(
+                path,
+                idces_dataset="idces",
+                times_dataset="times",
+                times_unit="ms",
+            )
+
+        sparse_msgs = [
+            str(rec.message)
+            for rec in w
+            if rec.category is UserWarning and "sparse" in str(rec.message)
+        ]
+        assert sparse_msgs, [str(rec.message) for rec in w]
+        # Padded-unit count (45) is in the message.
+        assert "45" in sparse_msgs[0]
+        # The SpikeData is still constructed with the padded layout.
+        assert sd.N == 48
+
+
 class TestLoadHdf5PairedMismatchedLengths:
     """``load_spikedata_from_hdf5(paired)`` with mismatched array lengths."""
 
@@ -5965,6 +6233,74 @@ class TestLoadNwbStartTimeAttribute:
         assert sd.start_time == 0.0
 
 
+class TestParseS3UrlTrailingSlash:
+    """``parse_s3_url`` strips a single trailing slash so
+    ``s3://bucket/key/`` reaches the same object as ``s3://bucket/key``
+    instead of falling through to boto3 as an empty prefix (cryptic
+    ``NoSuchKey``). An empty key after the strip raises ValueError.
+    """
+
+    def test_trailing_slash_stripped(self):
+        """
+        Tests:
+            (Test Case 1) ``s3://bucket/key/`` → ``("bucket", "key")``.
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        bucket, key = parse_s3_url("s3://bucket/key/")
+        assert bucket == "bucket"
+        assert key == "key"
+
+    def test_empty_key_after_strip_raises(self):
+        """
+        Tests:
+            (Test Case 1) ``s3://bucket//`` parses to an empty key
+                after the trailing-slash strip and raises ValueError
+                mentioning "no object key".
+        """
+        from spikelab.data_loaders.s3_utils import parse_s3_url
+
+        with pytest.raises(ValueError, match="no object key"):
+            parse_s3_url("s3://bucket//")
+
+
+class TestIsS3UrlHostnameSpoofing:
+    """``is_s3_url`` must reject look-alike hosts that embed
+    ``s3.amazonaws.com`` as a non-suffix substring (a common attacker
+    pattern: ``https://s3.evil.amazonaws.com.attacker.example/path``).
+    Legitimate path-style and virtual-hosted URLs must still pass.
+    """
+
+    def test_lookalike_host_rejected(self):
+        """
+        Tests:
+            (Test Case 1) A host that contains ``s3.amazonaws.com`` as
+                a non-suffix label is rejected.
+        """
+        from spikelab.data_loaders.s3_utils import is_s3_url
+
+        assert is_s3_url("https://s3.evil.amazonaws.com.attacker.example/path") is False
+
+    def test_legitimate_virtual_hosted_url_accepted(self):
+        """
+        Tests:
+            (Test Case 1) ``https://bucket.s3.us-west-2.amazonaws.com/key``
+                is accepted.
+        """
+        from spikelab.data_loaders.s3_utils import is_s3_url
+
+        assert is_s3_url("https://my-bucket.s3.us-west-2.amazonaws.com/key") is True
+
+    def test_legitimate_path_style_url_accepted(self):
+        """
+        Tests:
+            (Test Case 1) ``https://s3.amazonaws.com/bucket/key`` is accepted.
+        """
+        from spikelab.data_loaders.s3_utils import is_s3_url
+
+        assert is_s3_url("https://s3.amazonaws.com/bucket/key") is True
+
+
 class TestParseS3UrlMixedCase:
     """``parse_s3_url`` should treat host buckets case-insensitively
     (S3 bucket names are restricted to lowercase, but path-style URLs
@@ -6034,22 +6370,37 @@ class TestTrainsFromFlatIndexLengthMismatch:
                 n_units=2,
             )
 
-    def test_n_units_zero_with_non_empty_end_indices_raises(self):
+    def test_n_units_zero_returns_empty_list(self):
         """
+        Tier L-D5: ``n_units=0`` short-circuits to return ``[]`` early,
+        regardless of what's in ``end_indices``. The previous behaviour
+        (raising ValueError on a length mismatch) was a convoluted code
+        path; the empty-list shortcut makes the intent obvious.
+
         Tests:
             (Test Case 1) ``n_units=0`` with non-empty ``end_indices``
-                raises ValueError via the length-mismatch branch.
+                returns ``[]`` without raising.
+            (Test Case 2) ``n_units=0`` with empty ``end_indices``
+                returns ``[]``.
         """
         from spikelab.data_loaders.data_loaders import _trains_from_flat_index
 
-        with pytest.raises(ValueError, match="does not match"):
-            _trains_from_flat_index(
-                np.array([0.1, 0.2]),
-                np.array([2]),
-                unit="s",
-                fs_Hz=None,
-                n_units=0,
-            )
+        result = _trains_from_flat_index(
+            np.array([0.1, 0.2]),
+            np.array([2]),
+            unit="s",
+            fs_Hz=None,
+            n_units=0,
+        )
+        assert result == []
+        result_empty = _trains_from_flat_index(
+            np.array([]),
+            np.array([]),
+            unit="s",
+            fs_Hz=None,
+            n_units=0,
+        )
+        assert result_empty == []
 
 
 class TestReadRawArraysZeroBoundaries:
@@ -6372,3 +6723,59 @@ class TestNwbLoaderStartTimeMsBrittleness:
             assert sd.start_time == -200.0
         finally:
             os.unlink(path)
+
+
+class TestNaturalSortKeyTypeStable:
+    """``_natural_sort_key`` returns ``(kind, value)`` tuples so the
+    sort is type-stable on Python 3 — mixing numeric and string tokens
+    at the same position cannot raise ``TypeError`` from comparing
+    ``int`` against ``str``.
+    """
+
+    def test_mixed_numeric_string_token_first_position(self):
+        """
+        Tests:
+            (Test Case 1) ``sorted(["unit_5", "5_unit"], key=...)``
+                succeeds (no TypeError).
+            (Test Case 2) The numeric-token-first key (``"5_unit"``)
+                sorts before the string-token-first key (``"unit_5"``)
+                because every numeric tuple compares less than every
+                string tuple at the same position.
+        """
+        from spikelab.data_loaders.data_loaders import _natural_sort_key
+
+        out = sorted(["unit_5", "5_unit"], key=_natural_sort_key)
+        assert out == ["5_unit", "unit_5"]
+
+
+class TestLoadKilosortTimeUnitValidationBeforeIo:
+    """``load_spikedata_from_kilosort`` validates ``time_unit`` against
+    the (samples, s, ms) allow-list BEFORE any ``.npy`` I/O — a typo
+    fails fast without partial side effects (file handles, allocations).
+    """
+
+    def test_typo_time_unit_rejected_before_np_load(self, monkeypatch, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``time_unit="seconds"`` raises ValueError.
+            (Test Case 2) ``np.load`` is not called during the
+                validation path (verified via a monkeypatched
+                ``np.load`` that would fail-loud if invoked).
+        """
+        from spikelab.data_loaders import data_loaders as loaders_mod
+
+        np_load_calls: list = []
+
+        def fail_loud_np_load(*args, **kwargs):
+            np_load_calls.append((args, kwargs))
+            raise AssertionError(
+                "np.load should NOT have been called — time_unit "
+                "validation must fire first."
+            )
+
+        monkeypatch.setattr(loaders_mod.np, "load", fail_loud_np_load)
+        with pytest.raises(ValueError, match="time_unit"):
+            loaders_mod.load_spikedata_from_kilosort(
+                str(tmp_path), fs_Hz=20000.0, time_unit="seconds"
+            )
+        assert np_load_calls == []

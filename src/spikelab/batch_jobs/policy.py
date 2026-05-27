@@ -22,10 +22,17 @@ class PolicyFinding:
     message: str
 
 
-_SLEEP_THRESHOLD = 86_400  # 24 hours in seconds
+_SLEEP_THRESHOLD_DEFAULT = 86_400  # 24 hours in seconds — backstop when no
+# PolicyConfig is supplied (kept as a
+# module constant for direct callers).
 
 
-def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> bool:
+def _contains_disallowed_sleep(
+    command: Sequence[str],
+    args: Sequence[str],
+    *,
+    threshold_s: int = _SLEEP_THRESHOLD_DEFAULT,
+) -> bool:
     """Detect idle-placeholder sleep patterns in batch job commands.
 
     This is a best-effort heuristic, not a security boundary. It catches
@@ -34,6 +41,14 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
     constructs like ``while true; do sleep 60; done`` or obfuscated
     variants. The goal is to flag accidental misuse, not to prevent
     determined circumvention.
+
+    Parameters:
+        command (Sequence[str]): The container's command tokens.
+        args (Sequence[str]): The container's arg tokens.
+        threshold_s (int): Cap (in seconds) above which a bare
+            ``sleep <number>`` is considered idle. Defaults to 24h.
+            Pulled from ``PolicyConfig.sleep_duration_threshold_s`` by
+            ``evaluate_policy``.
 
     Notes:
         - The bare-``sleep`` check fires only when ``sleep`` is the sole
@@ -70,7 +85,7 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
             # the actual sleep binary rejects these, and a job spec with
             # such a token is almost certainly a bug or an obfuscation
             # attempt around the literal "inf" / "infinity" check above.
-            if not math.isfinite(duration) or duration >= _SLEEP_THRESHOLD:
+            if not math.isfinite(duration) or duration >= threshold_s:
                 return True
         except (ValueError, IndexError):
             pass
@@ -81,8 +96,30 @@ def _contains_disallowed_sleep(command: Sequence[str], args: Sequence[str]) -> b
 def evaluate_policy(
     job_spec: JobSpec,
     profile: ClusterProfile,
+    *,
+    include_passes: bool = False,
 ) -> List[PolicyFinding]:
-    """Evaluate policy checks using profile-driven thresholds."""
+    """Evaluate policy checks using profile-driven thresholds.
+
+    Returns a list of :class:`PolicyFinding` entries describing the
+    outcome of each policy check.
+
+    Parameters:
+        job_spec (JobSpec): The job to evaluate.
+        profile (ClusterProfile): Cluster profile carrying the
+            :class:`PolicyConfig` thresholds.
+        include_passes (bool): When True, every check emits a
+            ``PolicyFinding(level="PASS", ...)`` entry alongside the
+            WARN / BLOCK entries — useful for compliance audit
+            tooling that needs a record that each check ran and
+            passed. Default False (Tier L-C4): the common case
+            (CLI preflight, job submission) gets terse output
+            containing only WARN / BLOCK entries, eliminating the
+            ~4 PASS-line log noise per compliant submission.
+
+    Returns:
+        findings (list[PolicyFinding]): Per-check outcomes.
+    """
     findings: List[PolicyFinding] = []
     res = job_spec.resources
     cfg: PolicyConfig = profile.policy
@@ -96,7 +133,7 @@ def evaluate_policy(
                 f"({cfg.max_interactive_gpus} GPUs).",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "interactive_gpu_limit",
@@ -106,7 +143,9 @@ def evaluate_policy(
         )
 
     sleep_present = _contains_disallowed_sleep(
-        job_spec.container.command, job_spec.container.args
+        job_spec.container.command,
+        job_spec.container.args,
+        threshold_s=cfg.sleep_duration_threshold_s,
     )
     if cfg.block_sleep_infinity and sleep_present:
         findings.append(
@@ -119,10 +158,10 @@ def evaluate_policy(
         )
     elif sleep_present:
         # ``block_sleep_infinity`` is disabled in the profile, but a
-        # sleep pattern *was* detected. Surfacing this as a WARN keeps
-        # the audit trail honest — the previous code emitted a PASS
-        # ("No forbidden sleep patterns detected") even though the
-        # pattern was present, just not blocked.
+        # sleep pattern *was* detected. WARN keeps the audit trail
+        # honest — the previous code emitted a PASS even though the
+        # pattern was present, just not blocked. WARN is always
+        # emitted regardless of include_passes.
         findings.append(
             PolicyFinding(
                 "sleep_in_batch_job",
@@ -132,7 +171,7 @@ def evaluate_policy(
                 "but the pattern is recorded for audit.",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "sleep_in_batch_job",
@@ -151,7 +190,7 @@ def evaluate_policy(
                 "Cluster recommends requests close to limits; tune with monitoring.",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "request_limit_mismatch",
@@ -162,14 +201,15 @@ def evaluate_policy(
 
     if not job_spec.active_deadline_seconds:
         # No deadline set; the cluster's own max applies via Kubernetes.
-        # Emit a PASS finding so the audit trail is complete.
-        findings.append(
-            PolicyFinding(
-                "long_runtime",
-                "PASS",
-                "No active_deadline_seconds set; cluster default applies.",
+        # Audit-only PASS — gated by include_passes.
+        if include_passes:
+            findings.append(
+                PolicyFinding(
+                    "long_runtime",
+                    "PASS",
+                    "No active_deadline_seconds set; cluster default applies.",
+                )
             )
-        )
     elif job_spec.active_deadline_seconds > cfg.max_runtime_seconds:
         findings.append(
             PolicyFinding(
@@ -179,7 +219,7 @@ def evaluate_policy(
                 f"configured maximum ({cfg.max_runtime_seconds}s).",
             )
         )
-    else:
+    elif include_passes:
         findings.append(
             PolicyFinding(
                 "long_runtime",
@@ -192,7 +232,14 @@ def evaluate_policy(
 
 
 def summarize_preflight(findings: Iterable[PolicyFinding]) -> tuple[Level, str]:
-    """Return aggregate level and text summary."""
+    """Return aggregate level and text summary.
+
+    Empty input: when *findings* is an empty iterable the function
+    returns ``("PASS", "")``. Callers that distinguish "policy ran and
+    everything passed" from "policy did not run / produced no
+    findings" must inspect the source iterable's length rather than
+    relying on the returned level alone.
+    """
     levels = {finding.level for finding in findings}
     if "BLOCK" in levels:
         status: Level = "BLOCK"

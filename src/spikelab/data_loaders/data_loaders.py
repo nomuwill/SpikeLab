@@ -58,8 +58,17 @@ def _natural_sort_key(s: str):
 
     `sorted(["1", "10", "2"], key=_natural_sort_key)` returns
     `["1", "2", "10"]` instead of the lexicographic `["1", "10", "2"]`.
+
+    Notes:
+        Returns a list of ``(kind, value)`` tuples so the comparison is
+        type-stable on Python 3 — mixing bare ``int`` and ``str`` tokens
+        in the same list would raise ``TypeError`` when two keys
+        compare a numeric token against a string token (e.g.
+        ``"unit_5"`` vs ``"5_unit"``). The ``kind`` prefix (``0`` for
+        numeric, ``1`` for string) puts every numeric token strictly
+        less than every string token at the same position.
     """
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.split(r"(\d+)", s)]
 
 
 def _trains_from_flat_index(
@@ -149,6 +158,13 @@ def _split_by_index(
             type conversion is applied.
     """
     end_indices = np.asarray(end_indices)
+    # Early return for n_units=0 — an all-empty NWB file or a sorting
+    # with no surviving units. The disambiguation logic below has a
+    # convoluted branch for the n_units=0 + leading-zero ``[0]``
+    # variant; bypassing it makes the intent obvious and avoids the
+    # n_units=0 + len(end_indices)=1 special case entirely.
+    if n_units == 0:
+        return []
     if len(end_indices) > 0:
         # Reject float / non-integer dtype upfront with a friendly error;
         # numpy slicing on float indices raises a confusing TypeError mid-loop.
@@ -300,6 +316,15 @@ def _build_spikedata(
             # scales (~1e5 ms) that's ~1.5e-11 ms — far below any
             # measurable precision but enough to keep the inequality
             # strict.
+            #
+            # Edge case at very short recordings: when ``max_last`` is
+            # near zero (e.g. ``max_last=0.001 ms`` and ``start_time=0``),
+            # the ULP scales down with it (~1e-307 ms at the smallest
+            # float64 magnitudes). The subtraction ``max_last -
+            # start_time`` is still exact in float arithmetic, so the
+            # tiny ULP addition does not change behaviour — the comment
+            # describes the dominant case (large recordings), not the
+            # short-recording edge.
             max_last = float(max(last))
             length_ms = max_last - start_time + np.spacing(max_last)
         else:
@@ -895,10 +920,25 @@ def load_spikedata_from_spikeinterface(
         sampling_frequency (float | None): Optional override for sampling
             frequency (Hz).
         unit_ids (Sequence | None): Optional subset of unit IDs to include.
+            When provided, the order of the returned SpikeData's units
+            follows the caller's order (after presence validation).
         segment_index (int): Segment index for multi-segment sortings.
 
     Returns:
         sd (SpikeData): The converted spike train data.
+
+    Notes:
+        - When ``unit_ids is None``, the resulting unit order follows
+          ``sorting.get_unit_ids()`` order, which is backend-dependent
+          (KiloSort returns sequential IDs; some SpikeInterface
+          variants reorder by sort metric). Two SpikeData objects
+          built from different backends may therefore index the same
+          physical unit at different positions. Pass an explicit
+          ``unit_ids`` sequence when the unit ordering matters across
+          backends.
+        - ``neuron_attributes[i]["unit_id"]`` records the original
+          backend ID, providing a stable mapping from position to
+          source ID irrespective of the order convention.
     """
     try:
         get_unit_ids = sorting.get_unit_ids  # type: ignore[attr-defined]
@@ -1011,6 +1051,16 @@ def load_spikedata_from_kilosort(
         - Reads spike_times.npy (samples) and spike_clusters.npy; groups
           times per cluster and converts to ms using fs_Hz.
     """
+    # Pre-loop validation. ``to_ms`` raises ValueError for unknown
+    # ``time_unit`` values, but only when it is reached mid-loop after
+    # spike_times.npy / spike_clusters.npy / channel_map.npy I/O has
+    # already completed. Surface the typo here so a typo'd time_unit
+    # surfaces before any disk reads.
+    if time_unit not in ("samples", "s", "ms"):
+        raise ValueError(
+            f"time_unit={time_unit!r} is not one of "
+            "('samples', 's', 'ms'); pass a valid unit."
+        )
     st_path = os.path.join(folder, spike_times_file)
     sc_path = os.path.join(folder, spike_clusters_file)
     spike_times = np.load(st_path)
@@ -1634,6 +1684,7 @@ def load_spikedata_from_ibl(
     pid: str,
     *,
     length_ms: Optional[float] = None,
+    collection: Optional[str] = None,
 ) -> SpikeData:
     """Load spike trains for a single IBL probe into SpikeData.
 
@@ -1648,6 +1699,14 @@ def load_spikedata_from_ibl(
         pid (str): IBL probe ID (UUID string).
         length_ms (float | None): Recording duration in milliseconds.
             If not provided, the maximum spike time across all units is used.
+        collection (str | None): If provided, skip the heuristic
+            collection search and load spikes directly from this
+            collection (e.g. ``"alf/probe00/pykilosort"``). Saves 3-4
+            network round-trips per call when the caller already knows
+            the canonical collection (e.g. in batch workflows that
+            resolve the collection once and reuse it). ``None``
+            (default) falls back to the PID-suffix heuristic + fallback
+            chain.
 
     Returns:
         sd (SpikeData): Loaded spike train data.
@@ -1665,8 +1724,10 @@ def load_spikedata_from_ibl(
         - Requires ``one-api`` and ``brainwidemap`` packages (optional dependencies).
         - Spike times are converted from seconds (IBL convention) to milliseconds.
         - Trial times are converted from seconds to milliseconds.
-        - Probe collection is inferred from the PID suffix; falls back through
-          ``alf/probe00/pykilosort``, ``alf/probe01/pykilosort``, and ``alf``.
+        - When ``collection`` is ``None``, the probe collection is
+          inferred from the PID suffix; falls back through
+          ``alf/probe00/pykilosort``, ``alf/probe01/pykilosort``, and
+          ``alf``.
     """
     try:
         from one.api import ONE  # type: ignore
@@ -1692,28 +1753,35 @@ def load_spikedata_from_ibl(
     unit_df = bwm_units(one)
     good_units = unit_df[(unit_df["pid"] == pid) & (unit_df["label"] == 1)]
 
-    # Build the ordered list of collections to try, with the probe-specific
-    # one first when the PID suffix hints at the probe number. This is a
-    # best-effort heuristic for ordering (PIDs are UUIDs, so the last two
-    # hex chars can coincidentally match "00"/"01"). All candidates are
-    # tried regardless, so correctness is not affected — only the order.
-    collections = []
-    if pid.endswith("00") or pid.endswith("01"):
-        collections.append(f"alf/probe{pid[-2:]}/pykilosort")
-    collections.extend(_IBL_FALLBACK_COLLECTIONS)
-    # Deduplicate while preserving order.
-    seen: set = set()
-    ordered_collections: List[str] = []
-    for c in collections:
-        if c not in seen:
-            seen.add(c)
-            ordered_collections.append(c)
+    # Build the ordered list of collections to try. When the caller
+    # supplied an explicit ``collection``, short-circuit the heuristic
+    # search — saves 3-4 network round-trips per call in batch
+    # workflows that already know the canonical collection.
+    if collection is not None:
+        ordered_collections: List[str] = [collection]
+    else:
+        # With the probe-specific collection first when the PID suffix
+        # hints at the probe number. This is a best-effort heuristic
+        # for ordering (PIDs are UUIDs, so the last two hex chars can
+        # coincidentally match "00"/"01"). All candidates are tried
+        # regardless, so correctness is not affected — only the order.
+        collections = []
+        if pid.endswith("00") or pid.endswith("01"):
+            collections.append(f"alf/probe{pid[-2:]}/pykilosort")
+        collections.extend(_IBL_FALLBACK_COLLECTIONS)
+        # Deduplicate while preserving order.
+        seen: set = set()
+        ordered_collections = []
+        for c in collections:
+            if c not in seen:
+                seen.add(c)
+                ordered_collections.append(c)
 
     # Load spikes from the first available collection.
     spikes = None
-    for collection in ordered_collections:
+    for candidate in ordered_collections:
         try:
-            spikes = one.load_object(eid, "spikes", collection=collection)
+            spikes = one.load_object(eid, "spikes", collection=candidate)
             break
         except (ValueError, KeyError, FileNotFoundError):
             continue

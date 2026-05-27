@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,7 +91,9 @@ def test_render_job_manifest_contains_job_name():
     )
     manifest = render_job_manifest(context)
     parsed = yaml.safe_load(manifest)
-    assert "name: analysis-job-1234" in manifest
+    # Quoting in the template means the name shows up as
+    # ``name: "analysis-job-1234"`` post-J-A12.
+    assert parsed["metadata"]["name"] == "analysis-job-1234"
     assert parsed["kind"] == "Job"
     assert "run_id" in manifest
 
@@ -132,6 +135,326 @@ def test_namespace_hooks_no_match_leaves_manifest_unchanged():
     mounts = parsed["spec"]["template"]["spec"]["containers"][0].get("volumeMounts", [])
     mount_paths = {item.get("mountPath") for item in mounts}
     assert "/etc/test-creds" not in mount_paths
+
+
+def test_image_pull_secrets_default_omits_field_from_manifest():
+    """
+    Tier L-F7: when the active ``ClusterProfile`` has no
+    ``image_pull_secrets`` configured (the default for public-registry
+    workflows), the rendered manifest contains no ``imagePullSecrets``
+    key — preserving the prior behaviour for clusters relying on the
+    default ServiceAccount's pull secrets.
+
+    Tests:
+        (Test Case 1) ``ClusterProfile(name=...)`` with default
+            ``image_pull_secrets=[]`` renders a manifest whose pod
+            spec does NOT include ``imagePullSecrets``.
+    """
+    job_spec = validate_job_spec(_example_payload())
+    profile = ClusterProfile(name="public-cluster")
+    context = build_template_context(
+        job_name="lf7-default",
+        job_spec=job_spec,
+        profile=profile,
+    )
+    manifest = render_job_manifest(context)
+    parsed = yaml.safe_load(manifest)
+    pod_spec = parsed["spec"]["template"]["spec"]
+    assert "imagePullSecrets" not in pod_spec
+    # ``imagePullSecrets`` should not appear textually either —
+    # commented-out renderings would still confuse downstream tools.
+    assert "imagePullSecrets" not in manifest
+
+
+def test_image_pull_secrets_single_secret_renders_into_manifest():
+    """
+    Tier L-F7: a single pull secret on the profile renders as a
+    one-element ``imagePullSecrets:`` list under the pod spec,
+    exactly as Kubernetes expects.
+
+    Tests:
+        (Test Case 1) ``ClusterProfile(image_pull_secrets=["regcred"])``
+            renders ``imagePullSecrets: [{"name": "regcred"}]`` on
+            the pod spec.
+    """
+    job_spec = validate_job_spec(_example_payload())
+    profile = ClusterProfile(name="private-cluster", image_pull_secrets=["regcred"])
+    context = build_template_context(
+        job_name="lf7-single",
+        job_spec=job_spec,
+        profile=profile,
+    )
+    manifest = render_job_manifest(context)
+    parsed = yaml.safe_load(manifest)
+    pod_spec = parsed["spec"]["template"]["spec"]
+    assert pod_spec["imagePullSecrets"] == [{"name": "regcred"}]
+
+
+def test_image_pull_secrets_multiple_secrets_render_in_order():
+    """
+    Tier L-F7: multiple pull secrets render in the order given on the
+    profile. K8s does not document an evaluation order for multiple
+    pull secrets, but preserving caller order keeps the manifest
+    diff-stable across runs.
+
+    Tests:
+        (Test Case 1) Two secrets render as a two-element list in
+            the same order as the profile's
+            ``image_pull_secrets`` list.
+    """
+    job_spec = validate_job_spec(_example_payload())
+    profile = ClusterProfile(
+        name="multi-registry-cluster",
+        image_pull_secrets=["ghcr-cred", "ecr-cred"],
+    )
+    context = build_template_context(
+        job_name="lf7-multi",
+        job_spec=job_spec,
+        profile=profile,
+    )
+    manifest = render_job_manifest(context)
+    parsed = yaml.safe_load(manifest)
+    pod_spec = parsed["spec"]["template"]["spec"]
+    assert pod_spec["imagePullSecrets"] == [
+        {"name": "ghcr-cred"},
+        {"name": "ecr-cred"},
+    ]
+
+
+def test_image_pull_secrets_yaml_unsafe_name_raises():
+    """
+    Tier L-F7: a pull-secret name containing YAML-unsafe characters
+    (newline, etc.) is rejected by ``build_template_context`` rather
+    than silently stripped — same fail-fast policy as labels /
+    volume names elsewhere in the templating path (Tier L-C1).
+
+    Tests:
+        (Test Case 1) ``image_pull_secrets=["bad\\nname"]`` causes
+            ``build_template_context`` to raise ValueError mentioning
+            the offending field.
+    """
+    import pytest
+
+    job_spec = validate_job_spec(_example_payload())
+    profile = ClusterProfile(
+        name="bad-secret-cluster",
+        image_pull_secrets=["bad\nname"],
+    )
+    with pytest.raises(ValueError, match="YAML-unsafe character"):
+        build_template_context(
+            job_name="lf7-bad",
+            job_spec=job_spec,
+            profile=profile,
+        )
+
+
+def test_volume_mount_name_with_newline_raises():
+    """
+    Tier L-C1: ``VolumeMountSpec(name="bad\\nname", ...)`` flowing
+    through ``build_template_context`` now raises ``ValueError``
+    instead of silently stripping the newline. The error message
+    names the offending field path so the operator can locate the
+    bad entry.
+
+    Tests:
+        (Test Case 1) ``build_template_context`` raises ValueError
+            whose message contains ``volume[bad\\nname].name`` and
+            mentions the newline char.
+    """
+    import pytest
+
+    payload = _example_payload()
+    payload["namespace"] = "test-ns"
+    payload["volumes"] = [
+        {
+            "name": "bad\nname",
+            "mount_path": "/x",
+            "secret_name": "test-secret",
+        }
+    ]
+    job_spec = validate_job_spec(payload)
+    profile = ClusterProfile(name="vol-sanitize-test")
+    with pytest.raises(ValueError, match="YAML-unsafe character"):
+        build_template_context(
+            job_name="vol-test",
+            job_spec=job_spec,
+            profile=profile,
+        )
+
+
+def test_namespace_hook_env_defaults_with_newline_raises():
+    """
+    Tier L-C1: hook-supplied ``env_defaults`` values containing YAML-
+    unsafe characters now raise ValueError when the hook merges into
+    the container env, instead of silently stripping the offending
+    chars. The error names the hook + key path so the offending
+    profile entry can be located.
+
+    Tests:
+        (Test Case 1) ``NamespaceHookSpec(env_defaults={"FOO":
+            "value\\nwith\\nnewlines"})`` causes
+            ``build_template_context`` to raise ValueError whose
+            message mentions ``hooks.test-ns.env_defaults.FOO``.
+    """
+    import pytest
+
+    payload = _example_payload()
+    payload["namespace"] = "test-ns"
+    # No user-set FOO so the hook value wins.
+    payload["container"]["env"] = {"NORMAL": "value"}
+    job_spec = validate_job_spec(payload)
+    profile = ClusterProfile(
+        name="env-sanitize-test",
+        namespace_hooks={
+            "test-ns": NamespaceHookSpec(
+                env_defaults={"FOO": "value\nwith\nnewlines"},
+                required_volumes=[
+                    VolumeMountSpec(
+                        name="dummy",
+                        mount_path="/dummy",
+                        secret_name="dummy",
+                    ),
+                ],
+            )
+        },
+    )
+    with pytest.raises(ValueError, match="YAML-unsafe character"):
+        build_template_context(
+            job_name="env-test",
+            job_spec=job_spec,
+            profile=profile,
+        )
+
+
+def test_job_yaml_quoting_handles_special_characters():
+    """
+    ``job.yaml.j2`` quotes string fields so values with YAML-sensitive
+    characters (``:``) still parse cleanly.
+
+    Tests:
+        (Test Case 1) Volume name containing a colon (``"weird:name"``
+            via the unsafe-character sanitizer leaves the colon
+            intact, since ``:`` isn't in the YAML-unsafe set) parses
+            successfully through ``yaml.safe_load``.
+        (Test Case 2) ``metadata.name``, ``metadata.namespace`` and
+            container image round-trip via the parsed YAML.
+    """
+    payload = _example_payload()
+    payload["namespace"] = "ns"
+    payload["container"]["image"] = "img"
+    payload["volumes"] = [
+        {
+            "name": "weird:name",
+            "mount_path": "/m",
+            "secret_name": "test-secret",
+        }
+    ]
+    job_spec = validate_job_spec(payload)
+    profile = ClusterProfile(name="quoting-test")
+    context = build_template_context(
+        job_name="job-x",
+        job_spec=job_spec,
+        profile=profile,
+    )
+    manifest = render_job_manifest(context)
+    parsed = yaml.safe_load(manifest)
+    assert parsed["metadata"]["name"] == "job-x"
+    assert parsed["metadata"]["namespace"] == "ns"
+    assert parsed["spec"]["template"]["spec"]["containers"][0]["image"] == "img"
+
+
+class TestSanitizeYamlValueRaisesOnUnsafeChars:
+    """``_sanitize_yaml_value`` raises ``ValueError`` on unsafe
+    characters instead of silently stripping them. The field-path
+    argument is included in the error message so operators can
+    locate the offending entry in the job spec.
+    """
+
+    def test_unsafe_char_raises_with_repr_in_message(self):
+        """
+        Tests:
+            (Test Case 1) Newline in the value raises ValueError.
+            (Test Case 2) The error message includes the substring
+                "YAML-unsafe character" and the offending char's repr.
+            (Test Case 3) A clean value passes through unchanged.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value("hello\nworld")
+
+        assert _sanitize_yaml_value("safe value") == "safe value"
+
+    def test_field_argument_appears_in_error(self):
+        """
+        Tests:
+            (Test Case 1) ``field="container.env.FOO"`` shows up in
+                the raised error so operators can locate the failing
+                entry in their job spec.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        with pytest.raises(ValueError, match="container.env.FOO"):
+            _sanitize_yaml_value("bad\nval", field="container.env.FOO")
+
+    def test_sanitize_map_names_offending_subkey(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_map({"FOO": "x\\ny"},
+                field="container.env")`` raises ValueError naming
+                ``container.env.FOO``.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_map
+
+        with pytest.raises(ValueError, match=r"container\.env\.FOO"):
+            _sanitize_map({"FOO": "x\nY"}, field="container.env")
+
+    def test_sanitize_list_names_offending_index(self):
+        """
+        Tests:
+            (Test Case 1) ``_sanitize_list(["ok", "bad\\nval"],
+                field="container.command")`` raises ValueError naming
+                ``container.command[1]``.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_list
+
+        with pytest.raises(ValueError, match=r"container\.command\[1\]"):
+            _sanitize_list(["ok", "bad\nval"], field="container.command")
+
+    def test_volume_mount_unsafe_name_raises_from_build_template_context(self):
+        """
+        Tests:
+            (Test Case 1) ``build_template_context`` with a
+                VolumeMountSpec whose ``name`` contains a newline
+                raises ValueError naming the volume entry.
+        """
+        payload = _example_payload()
+        payload["namespace"] = "ns"
+        payload["volumes"] = [
+            {
+                "name": "bad\nname",
+                "mount_path": "/x",
+                "secret_name": "test-secret",
+            }
+        ]
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="vol-raise")
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            build_template_context(job_name="job-x", job_spec=job_spec, profile=profile)
+
+    def test_safe_punctuation_passes_through(self):
+        """
+        Tests:
+            (Test Case 1) Characters like ``:``, ``#``, ``{``, ``[``,
+                ``&``, ``*``, ``!``, ``|``, ``>``, ``'``, ``%``,
+                ``@``, ``` ` ``` are safe inside double-quoted YAML
+                scalars and pass through ``_sanitize_yaml_value``
+                unchanged.
+        """
+        from spikelab.batch_jobs.templating import _sanitize_yaml_value
+
+        safe = "a:b#c{d}e[f]g&h*i!j|k>l'm%n@o`p"
+        assert _sanitize_yaml_value(safe) == safe
 
 
 def test_namespace_hooks_preserve_user_affinity():
@@ -280,6 +603,60 @@ class TestSleepDetection:
     def test_normal_command_allowed(self):
         assert not _contains_disallowed_sleep(["python"], ["-m", "my_script"])
 
+    def test_threshold_s_parameter_controls_cutoff(self):
+        """
+        The ``threshold_s`` kwarg sets the cap above which a bare
+        ``sleep <number>`` is considered idle. Lowering it flags
+        durations that the default cap permits.
+
+        Tests:
+            (Test Case 1) ``sleep 100`` with ``threshold_s=50`` → True.
+            (Test Case 2) ``sleep 100`` with ``threshold_s=200`` → False.
+        """
+        assert _contains_disallowed_sleep(["sleep"], ["100"], threshold_s=50)
+        assert not _contains_disallowed_sleep(["sleep"], ["100"], threshold_s=200)
+
+    def test_evaluate_policy_propagates_sleep_duration_threshold(self):
+        """
+        ``evaluate_policy`` forwards ``cfg.sleep_duration_threshold_s``
+        to ``_contains_disallowed_sleep`` so users can tighten or
+        loosen the policy without editing the heuristic itself.
+
+        Tests:
+            (Test Case 1) ``PolicyConfig(sleep_duration_threshold_s=50)``
+                + ``sleep 100`` produces a sleep-related finding (the
+                stricter threshold flags it).
+            (Test Case 2) The default threshold (24h) allows the same
+                ``sleep 100`` without flagging it.
+        """
+        from spikelab.batch_jobs.policy import PolicyConfig, evaluate_policy
+
+        payload = _example_payload()
+        payload["container"]["command"] = ["sleep"]
+        payload["container"]["args"] = ["100"]
+        job_spec = validate_job_spec(payload)
+
+        # Strict profile: 50 s threshold flags ``sleep 100``.
+        strict_profile = ClusterProfile(
+            name="strict",
+            policy=PolicyConfig(sleep_duration_threshold_s=50),
+        )
+        findings_strict = evaluate_policy(job_spec, strict_profile)
+        levels_strict = {(f.code, f.level) for f in findings_strict}
+        # A BLOCK-level sleep finding fires because the duration
+        # exceeds the strict threshold.
+        assert any(
+            "sleep" in code and level == "BLOCK" for code, level in levels_strict
+        )
+
+        # Default profile: 24 h threshold lets ``sleep 100`` through.
+        default_profile = ClusterProfile(name="default")
+        findings_default = evaluate_policy(job_spec, default_profile)
+        levels_default = {(f.code, f.level) for f in findings_default}
+        assert not any(
+            "sleep" in code and level == "BLOCK" for code, level in levels_default
+        )
+
     def test_sleep_as_substring_allowed(self):
         """'sleep' appearing as part of another word is not flagged."""
         assert not _contains_disallowed_sleep(["python"], ["-m", "sleeper_module"])
@@ -318,7 +695,14 @@ def test_policy_blocks_sleep_infinity():
 
 
 def test_policy_uses_profile_thresholds():
-    """Policy thresholds come from the profile, not hardcoded values."""
+    """Policy thresholds come from the profile, not hardcoded values.
+
+    Tier L-C4 changed the default to ``include_passes=False`` so a
+    passing check no longer emits a PASS finding. The relaxed-profile
+    branch now asserts the absence of an ``interactive_gpu_limit``
+    finding, and passes ``include_passes=True`` to confirm the PASS
+    finding is still available for audit tooling.
+    """
     payload = _example_payload()
     payload["resources"]["requests_gpu"] = 3
     payload["resources"]["limits_gpu"] = 3
@@ -328,7 +712,7 @@ def test_policy_uses_profile_thresholds():
     findings = evaluate_policy(job_spec, profile_default)
     gpu_finding = [f for f in findings if f.code == "interactive_gpu_limit"][0]
     assert gpu_finding.level == "WARN"
-    # Raise threshold to 4 — should pass
+    # Raise threshold to 4 — should pass (silently under the default)
     from spikelab.batch_jobs.models import PolicyConfig
 
     profile_relaxed = ClusterProfile(
@@ -336,10 +720,17 @@ def test_policy_uses_profile_thresholds():
         policy=PolicyConfig(max_interactive_gpus=4),
     )
     findings_relaxed = evaluate_policy(job_spec, profile_relaxed)
-    gpu_finding_relaxed = [
+    gpu_findings_relaxed = [
         f for f in findings_relaxed if f.code == "interactive_gpu_limit"
+    ]
+    # Default (include_passes=False): no finding when the check passes.
+    assert gpu_findings_relaxed == []
+    # Audit mode: opt in to PASS findings.
+    findings_audit = evaluate_policy(job_spec, profile_relaxed, include_passes=True)
+    gpu_finding_audit = [
+        f for f in findings_audit if f.code == "interactive_gpu_limit"
     ][0]
-    assert gpu_finding_relaxed.level == "PASS"
+    assert gpu_finding_audit.level == "PASS"
 
 
 def test_redaction_hides_sensitive_fields():
@@ -533,12 +924,14 @@ class TestArtifactPackager:
         input_file = tmp_path / "result.h5"
         input_file.write_bytes(b"fake workspace content")
 
+        # Tier L-C2: sorting bundles must declare ``recording_files``.
         zip_path = package_analysis_bundle(
             input_paths=[str(input_file)],
             run_id="run-002",
             output_dir=str(tmp_path / "out"),
             output_format="sorting",
             metadata={"workspace_id": "ws-42"},
+            recording_files=["result.h5"],
         )
 
         import json
@@ -553,6 +946,7 @@ class TestArtifactPackager:
         assert len(manifest["files"]) == 1
         assert manifest["files"][0]["name"] == "result.h5"
         assert len(manifest["files"][0]["sha256"]) == 64  # hex SHA256
+        assert manifest["recording_files"] == ["result.h5"]
 
     def test_multiple_input_files(self, tmp_path):
         """Multiple input files are all included in the bundle."""
@@ -615,6 +1009,20 @@ class TestArtifactPackager:
             assert "run-empty/manifest.json" in names
             manifest = json.loads(zf.read("run-empty/manifest.json"))
             assert manifest["files"] == []
+
+    def test_sha256_chunk_bytes_constant_exposed(self):
+        """
+        ``_SHA256_CHUNK_BYTES`` is exposed at module scope so callers
+        can read (or override) the chunk size. The constant value is
+        1 MiB.
+
+        Tests:
+            (Test Case 1) ``_SHA256_CHUNK_BYTES`` equals ``1 << 20``
+                (1 MiB).
+        """
+        from spikelab.batch_jobs.artifact_packager import _SHA256_CHUNK_BYTES
+
+        assert _SHA256_CHUNK_BYTES == 1 << 20
 
     def test_sha256_correctness(self, tmp_path):
         """_sha256 produces correct hex digest for known content."""
@@ -772,6 +1180,34 @@ class TestS3StorageClient:
             )
             assert result == "s3://bucket/pfx/inputs/run-1/data.pkl"
 
+    def test_upload_file_missing_local_path_raises_before_boto3(self, tmp_path):
+        """
+        ``upload_file`` validates ``local_path`` and raises
+        ``FileNotFoundError`` before any boto3 call. Without this,
+        boto3 produces a less informative error and the upload still
+        opens a client connection on a nonexistent file.
+
+        Tests:
+            (Test Case 1) Missing path raises FileNotFoundError.
+            (Test Case 2) The error message names the missing path.
+            (Test Case 3) The boto3 client's ``upload_file`` is NOT
+                invoked.
+        """
+        with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+            missing_path = str(tmp_path / "does_not_exist.pkl")
+            with pytest.raises(FileNotFoundError) as excinfo:
+                client.upload_file(
+                    local_path=missing_path,
+                    s3_uri="s3://bucket/pfx/inputs/run-1/data.pkl",
+                )
+            # The error message embeds the path via repr() — match on
+            # the basename to stay portable across OS path separators.
+            assert "does_not_exist.pkl" in str(excinfo.value)
+            mock_s3.upload_file.assert_not_called()
+
     def test_upload_bundle_builds_uri_and_uploads(self, tmp_path):
         """upload_bundle composes build_uri + upload_file."""
         local_zip = tmp_path / "run-7.zip"
@@ -795,11 +1231,129 @@ class TestS3StorageClient:
         assert client.output_prefix_for_run("r1") == "s3://b/p/out/r1/"
         assert client.logs_prefix_for_run("r1") == "s3://b/p/lg/r1/"
 
-    def test_boto3_not_installed(self):
-        """ImportError raised when boto3 is not available."""
+    def test_boto3_not_installed_constructor_succeeds_for_uri_ops(self):
+        """boto3 missing is tolerated at construction (Tier H).
+
+        Pure-string operations like ``build_uri`` /
+        ``output_prefix_for_run`` / ``logs_prefix_for_run`` don't need
+        boto3, so the constructor no longer eagerly checks for the
+        optional dependency. The ImportError is deferred to the first
+        call that actually needs the boto3 client (upload, download,
+        list).
+        """
         with patch("spikelab.batch_jobs.storage_s3.boto3", None):
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+            # URI-only operations work without boto3.
+            assert (
+                client.output_prefix_for_run("run-1")
+                == "s3://bucket/pfx/outputs/run-1/"
+            )
+            # Client-using operations raise the deferred ImportError.
             with pytest.raises(ImportError, match="boto3 is required"):
-                S3StorageClient(prefix="s3://bucket/pfx/")
+                client.upload_file(local_path=__file__, s3_uri="s3://bucket/pfx/x.bin")
+
+    def test_list_output_files_caps_at_default_limit(self):
+        """
+        ``list_output_files`` raises ValueError when the paginator
+        yields more objects than ``max_keys`` (default
+        ``DEFAULT_LIST_OUTPUT_LIMIT = 10_000``). Pinning the cap as a
+        class attribute lets callers raise it explicitly without
+        editing the source.
+
+        Tests:
+            (Test Case 1) Mocked paginator yielding 10_001 keys raises
+                ValueError mentioning ``max_keys=10000``.
+            (Test Case 2) With ``max_keys=20_000`` the same fixture
+                returns the full list.
+            (Test Case 3) The cap is exposed as
+                ``S3StorageClient.DEFAULT_LIST_OUTPUT_LIMIT``.
+        """
+        # Class attribute is documented and stable.
+        assert S3StorageClient.DEFAULT_LIST_OUTPUT_LIMIT == 10_000
+
+        def make_pages(n_keys):
+            # Yield 1000 keys per page.
+            for start in range(0, n_keys, 1000):
+                stop = min(start + 1000, n_keys)
+                yield {"Contents": [{"Key": f"k{i}"} for i in range(start, stop)]}
+
+        # 10_001 keys → exceeds the default cap.
+        with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = make_pages(10_001)
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        with pytest.raises(ValueError, match="max_keys=10000"):
+            client.list_output_files("run-1")
+
+        # With a larger cap, the same fixture returns all keys.
+        mock_paginator.paginate.return_value = make_pages(10_001)
+        keys = client.list_output_files("run-1", max_keys=20_000)
+        assert len(keys) == 10_001
+
+    def test_boto3_not_installed_download_and_list_also_raise_deferred(self):
+        """
+        Reinforces the lazy-init detail of Tier H5: download_file and
+        list_output_files raise the same deferred ImportError as
+        upload_file when boto3 is unavailable. All client-using
+        operations should hit the same lazy property, so an absent
+        boto3 produces a consistent error message across the surface.
+
+        Tests:
+            (Test Case 1) ``download_file`` raises ImportError naming boto3.
+            (Test Case 2) ``list_output_files`` raises ImportError naming boto3.
+        """
+        with patch("spikelab.batch_jobs.storage_s3.boto3", None):
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+            with pytest.raises(ImportError, match="boto3 is required"):
+                client.download_file(
+                    s3_uri="s3://bucket/pfx/x.bin", local_path="/tmp/x.bin"
+                )
+            with pytest.raises(ImportError, match="boto3 is required"):
+                client.list_output_files(run_id="run-1")
+
+    def test_build_uri_invalid_category_warns_with_known_categories(self):
+        """
+        ``build_uri`` with an unknown ``category`` falls back to the
+        ``inputs`` template and emits a UserWarning naming the known
+        categories so typos ("input", "logs/") don't silently land in
+        the wrong S3 prefix.
+
+        Tests:
+            (Test Case 1) A UserWarning is emitted for an unknown
+                category.
+            (Test Case 2) The warning names the known categories
+                ("inputs", "outputs", "logs").
+            (Test Case 3) The returned URI uses the ``inputs`` template
+                as the fallback.
+        """
+        import warnings as _warnings
+
+        with patch("spikelab.batch_jobs.storage_s3.boto3") as mock_boto3:
+            mock_boto3.client.return_value = MagicMock()
+            client = S3StorageClient(prefix="s3://bucket/pfx/")
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            uri = client.build_uri(
+                run_id="run-1",
+                filename="data.pkl",
+                category="not-a-real-category",
+            )
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "build_uri" in m]
+        assert relevant, warn_msgs
+        # Known categories listed in the warning.
+        assert "inputs" in relevant[0]
+        assert "outputs" in relevant[0]
+        assert "logs" in relevant[0]
+        # Fallback to the inputs template.
+        assert uri == "s3://bucket/pfx/inputs/run-1/data.pkl"
 
     def test_build_uri_invalid_category_falls_back_to_inputs(self):
         """Invalid category string falls back to inputs template."""
@@ -1177,6 +1731,51 @@ class TestProfiles:
         profile = load_profile_from_name("unknown-cluster")
         assert profile.name == "defaults"
 
+    def test_unknown_name_warns_with_recognised_aliases(self):
+        """
+        Unknown names emit a UserWarning naming the recognised aliases
+        so a typo doesn't silently land on the wrong profile.
+
+        Tests:
+            (Test Case 1) A UserWarning is emitted for an unknown name.
+            (Test Case 2) The warning lists at least one recognised
+                alias ("defaults") so the operator can correct the typo.
+        """
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            profile = load_profile_from_name("not-a-real-profile")
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "Unknown profile" in m]
+        assert relevant, warn_msgs
+        assert "defaults" in relevant[0]
+        # Falls back to defaults regardless.
+        assert profile.name == "defaults"
+
+    def test_known_names_do_not_warn(self):
+        """
+        Recognised names (``"defaults"``, ``"nrp"``) load without
+        emitting the unknown-name warning.
+
+        Tests:
+            (Test Case 1) ``load_profile_from_name("defaults")`` emits
+                no "Unknown profile" warning.
+            (Test Case 2) ``load_profile_from_name("nrp")`` emits no
+                "Unknown profile" warning.
+        """
+        import warnings as _warnings
+
+        for name in ("defaults", "nrp"):
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                load_profile_from_name(name)
+            warn_msgs = [str(rec.message) for rec in w]
+            assert not any(
+                "Unknown profile" in m for m in warn_msgs
+            ), f"{name!r}: {warn_msgs}"
+
     def test_nautilus_alias(self):
         """'nautilus' loads the same profile as 'nrp'."""
         profile = load_profile_from_name("nautilus")
@@ -1346,37 +1945,18 @@ class TestModelValidation:
 # Validation module edge cases
 # ---------------------------------------------------------------------------
 
-from spikelab.batch_jobs.validation import (
-    validate_run_config,
-    summarize_validation_error,
-)
+from spikelab.batch_jobs.validation import summarize_validation_error
 
 
 class TestValidationModule:
-    def test_validate_run_config_happy_path(self):
-        """validate_run_config parses a valid RunConfig payload."""
-        config = validate_run_config({"input_path": "/data/recording.h5"})
-        assert config.input_path == "/data/recording.h5"
-        assert config.profile_name == "defaults"
-
-    def test_validate_run_config_missing_required_field(self):
-        """validate_run_config raises for missing input_path."""
-        with pytest.raises(PydanticValidationError):
-            validate_run_config({})
-
-    def test_validate_run_config_invalid_wait(self):
-        """validate_run_config rejects max_wait_seconds below minimum."""
-        with pytest.raises(PydanticValidationError):
-            validate_run_config({"input_path": "/data/x.h5", "max_wait_seconds": 0})
-
     def test_summarize_validation_error_format(self):
         """summarize_validation_error produces a readable string."""
         try:
-            validate_run_config({})
+            validate_job_spec({})
         except PydanticValidationError as exc:
             summary = summarize_validation_error(exc)
-            assert "input_path" in summary
             assert isinstance(summary, str)
+            assert summary.startswith("Invalid job config")
 
     def test_summarize_validation_error_multiple_errors(self):
         """summarize_validation_error puts each error on its own line.
@@ -1433,11 +2013,29 @@ class TestCredential:
         assert creds.aws_secret_access_key is None
         assert creds.kubeconfig is None
 
-    def test_redact_none_values(self):
-        """redact_sensitive_map converts None values to empty strings."""
+    def test_redact_none_values_renders_unset_sentinel(self):
+        """
+        ``None`` inputs render as the literal ``"<unset>"`` so the
+        audit log can distinguish "credential is not configured" from
+        "credential is configured but empty" (the prior implementation
+        collapsed both into ``""``).
+
+        Tests:
+            (Test Case 1) ``{"FIELD": None}`` produces
+                ``{"FIELD": "<unset>"}``.
+            (Test Case 2) Non-None values still pass through.
+            (Test Case 3) ``None`` short-circuits before the redaction
+                pattern check — a None-valued sensitive key (e.g.
+                ``SECRET_TOKEN``) also renders as ``"<unset>"``, not
+                ``"***REDACTED***"``.
+        """
         redacted = redact_sensitive_map({"FIELD": None, "OTHER": "ok"})
-        assert redacted["FIELD"] == ""
+        assert redacted["FIELD"] == "<unset>"
         assert redacted["OTHER"] == "ok"
+
+        # None short-circuits the sensitive-key redaction branch.
+        secret = redact_sensitive_map({"SECRET_TOKEN": None})
+        assert secret["SECRET_TOKEN"] == "<unset>"
 
 
 # ---------------------------------------------------------------------------
@@ -1547,21 +2145,29 @@ class TestPolicy:
 
     def test_policy_long_runtime_pass_when_not_set(self):
         """
-        No active_deadline_seconds set produces a PASS finding (cluster
-        default applies). The other policy checks always emit a finding;
-        long_runtime now matches that pattern for audit-trail symmetry.
+        Tier L-C4: with the default ``include_passes=False``, a
+        passing long_runtime check emits NO finding. Opting in
+        with ``include_passes=True`` still produces the audit-trail
+        PASS entry naming the cluster-default fallback.
 
         Tests:
-            (Test Case 1) None deadline produces a long_runtime PASS.
-            (Test Case 2) The PASS message names the cluster-default
-                fallback so operators can see why no warning fired.
+            (Test Case 1) Default call returns no long_runtime
+                finding when active_deadline_seconds is None.
+            (Test Case 2) include_passes=True produces a PASS
+                finding whose message names the cluster-default
+                fallback.
         """
         payload = _example_payload()
         # active_deadline_seconds defaults to None
         job_spec = validate_job_spec(payload)
         profile = ClusterProfile(name="test")
+        # Default: silent on passing checks.
         findings = evaluate_policy(job_spec, profile)
-        long_finding = [f for f in findings if f.code == "long_runtime"][0]
+        long_findings = [f for f in findings if f.code == "long_runtime"]
+        assert long_findings == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        long_finding = [f for f in findings_audit if f.code == "long_runtime"][0]
         assert long_finding.level == "PASS"
         assert "cluster default" in long_finding.message
 
@@ -1577,7 +2183,12 @@ class TestPolicy:
         assert codes["request_limit_mismatch"] == "WARN"
 
     def test_policy_warn_mismatch_disabled_by_profile(self):
-        """request_limit_mismatch check can be disabled via profile."""
+        """request_limit_mismatch check can be disabled via profile.
+
+        Tier L-C4: default ``include_passes=False`` → no finding is
+        emitted when the check is disabled or passes. ``include_passes
+        =True`` restores the PASS audit entry.
+        """
         payload = _example_payload()
         payload["resources"]["requests_cpu"] = "1"
         payload["resources"]["limits_cpu"] = "4"
@@ -1586,9 +2197,148 @@ class TestPolicy:
             name="test",
             policy=PolicyConfig(warn_request_limit_mismatch=False),
         )
+        # Default: silent on disabled / passing checks.
         findings = evaluate_policy(job_spec, profile)
-        codes = {f.code: f.level for f in findings}
+        assert [f for f in findings if f.code == "request_limit_mismatch"] == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        codes = {f.code: f.level for f in findings_audit}
         assert codes["request_limit_mismatch"] == "PASS"
+
+    def test_default_suppresses_pass_on_fully_compliant_spec(self):
+        """
+        Tier L-C4: a fully compliant job spec produces NO findings by
+        default, and exactly four PASS findings under
+        ``include_passes=True``.
+
+        Tests:
+            (Test Case 1) Default ``include_passes=False`` returns an
+                empty list when every check passes — eliminating the
+                ~4 PASS-line log noise per compliant submission.
+            (Test Case 2) ``include_passes=True`` returns four PASS
+                findings, one per check
+                (interactive_gpu_limit, sleep_in_batch_job,
+                 request_limit_mismatch, long_runtime).
+        """
+        job_spec = validate_job_spec(_example_payload())
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        assert findings_default == []
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        codes_levels = {f.code: f.level for f in findings_audit}
+        assert codes_levels == {
+            "interactive_gpu_limit": "PASS",
+            "sleep_in_batch_job": "PASS",
+            "request_limit_mismatch": "PASS",
+            "long_runtime": "PASS",
+        }
+
+    def test_warn_emitted_regardless_of_include_passes(self):
+        """
+        Tier L-C4: WARN findings are emitted regardless of
+        ``include_passes``. Only PASS findings are gated by the flag.
+
+        Tests:
+            (Test Case 1) A WARN-triggering interactive_gpu_limit
+                spec emits the WARN finding under
+                ``include_passes=False`` (the default).
+            (Test Case 2) The same WARN finding is also present under
+                ``include_passes=True``, alongside the PASS entries
+                for the other checks.
+        """
+        payload = _example_payload()
+        payload["resources"]["requests_gpu"] = 8
+        payload["resources"]["limits_gpu"] = 8
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        warn_findings = [
+            f for f in findings_default if f.code == "interactive_gpu_limit"
+        ]
+        assert len(warn_findings) == 1
+        assert warn_findings[0].level == "WARN"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        warn_findings_audit = [
+            f for f in findings_audit if f.code == "interactive_gpu_limit"
+        ]
+        assert len(warn_findings_audit) == 1
+        assert warn_findings_audit[0].level == "WARN"
+
+    def test_block_emitted_regardless_of_include_passes(self):
+        """
+        Tier L-C4: BLOCK findings are emitted regardless of
+        ``include_passes`` — the flag only gates PASS entries.
+
+        Tests:
+            (Test Case 1) A BLOCK-triggering sleep_in_batch_job
+                payload emits the BLOCK finding under the default
+                ``include_passes=False``.
+            (Test Case 2) The same BLOCK finding is also present
+                under ``include_passes=True``.
+        """
+        payload = _example_payload()
+        payload["container"]["args"] = ["sleep", "infinity"]
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        block_findings = [f for f in findings_default if f.code == "sleep_in_batch_job"]
+        assert len(block_findings) == 1
+        assert block_findings[0].level == "BLOCK"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        block_findings_audit = [
+            f for f in findings_audit if f.code == "sleep_in_batch_job"
+        ]
+        assert len(block_findings_audit) == 1
+        assert block_findings_audit[0].level == "BLOCK"
+
+    def test_mixed_compliance_default_returns_only_warn(self):
+        """
+        Tier L-C4: a spec that triggers ONE WARN and passes the
+        other three checks returns exactly one finding by default
+        (the WARN). ``include_passes=True`` returns four findings
+        (1 WARN + 3 PASS).
+
+        Tests:
+            (Test Case 1) Default call returns one finding —
+                the request_limit_mismatch WARN.
+            (Test Case 2) ``include_passes=True`` returns four
+                findings — one WARN plus three PASS entries.
+        """
+        payload = _example_payload()
+        payload["resources"]["requests_cpu"] = "1"
+        payload["resources"]["limits_cpu"] = "4"
+        job_spec = validate_job_spec(payload)
+        profile = ClusterProfile(name="test")
+        findings_default = evaluate_policy(job_spec, profile)
+        assert len(findings_default) == 1
+        assert findings_default[0].code == "request_limit_mismatch"
+        assert findings_default[0].level == "WARN"
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        assert len(findings_audit) == 4
+        levels = sorted(f.level for f in findings_audit)
+        assert levels == ["PASS", "PASS", "PASS", "WARN"]
+
+    def test_summarize_preflight_compliant_spec_empty_text(self):
+        """
+        Tier L-C4: a fully compliant job spec evaluated under the
+        default ``include_passes=False`` produces an empty findings
+        list. ``summarize_preflight`` on that empty list returns
+        ``("PASS", "")`` — the level stays PASS, the text body is
+        empty (no more ``[PASS] ... [PASS] ...`` noise).
+
+        Tests:
+            (Test Case 1) ``evaluate_policy`` on a compliant spec
+                returns ``[]`` by default.
+            (Test Case 2) ``summarize_preflight([])`` returns
+                ``("PASS", "")`` — the level stays PASS, text empty.
+        """
+        job_spec = validate_job_spec(_example_payload())
+        profile = ClusterProfile(name="test")
+        findings = evaluate_policy(job_spec, profile)
+        assert findings == []
+        level, text = summarize_preflight(findings)
+        assert level == "PASS"
+        assert text == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1633,7 +2383,13 @@ class TestBackend:
 
 class TestPolicyBoundary:
     def test_gpu_exactly_at_threshold(self):
-        """requests_gpu == max_interactive_gpus should PASS (not WARN)."""
+        """requests_gpu == max_interactive_gpus is treated as within-limit.
+
+        Tier L-C4: with the default ``include_passes=False``, an at-
+        threshold-but-not-over GPU request emits NO finding. The
+        ``include_passes=True`` opt-in still produces the PASS audit
+        entry.
+        """
         payload = _example_payload()
         payload["resources"]["requests_gpu"] = 2
         payload["resources"]["limits_gpu"] = 2
@@ -1642,8 +2398,14 @@ class TestPolicyBoundary:
             name="test",
             policy=PolicyConfig(max_interactive_gpus=2),
         )
+        # Default: silent on passing checks.
         findings = evaluate_policy(job_spec, profile)
-        gpu_finding = [f for f in findings if f.code == "interactive_gpu_limit"][0]
+        assert [f for f in findings if f.code == "interactive_gpu_limit"] == []
+        # Audit mode: PASS entry returns.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        gpu_finding = [f for f in findings_audit if f.code == "interactive_gpu_limit"][
+            0
+        ]
         assert gpu_finding.level == "PASS"
 
     def test_block_sleep_infinity_disabled_emits_warn(self):
@@ -1668,13 +2430,15 @@ class TestPolicyBoundary:
     def test_active_deadline_at_boundary(self):
         """
         active_deadline_seconds == max_runtime_seconds is treated as
-        within-limit and produces a long_runtime PASS finding (not WARN).
+        within-limit. Tier L-C4: default ``include_passes=False`` →
+        no finding emitted (the WARN threshold is strict ``>``).
+        Opt-in ``include_passes=True`` produces the PASS audit entry.
 
         Tests:
-            (Test Case 1) Boundary deadline produces PASS (the WARN
-                threshold is strict ``>``).
-            (Test Case 2) The PASS message names both the actual
-                deadline and the configured maximum.
+            (Test Case 1) Default call returns no long_runtime
+                finding at the boundary.
+            (Test Case 2) include_passes=True produces a PASS whose
+                message names both the actual deadline and the max.
         """
         payload = _example_payload()
         payload["active_deadline_seconds"] = 1_209_600  # exactly 14 days
@@ -1683,8 +2447,12 @@ class TestPolicyBoundary:
             name="test",
             policy=PolicyConfig(max_runtime_seconds=1_209_600),
         )
+        # Default: silent.
         findings = evaluate_policy(job_spec, profile)
-        long_finding = [f for f in findings if f.code == "long_runtime"][0]
+        assert [f for f in findings if f.code == "long_runtime"] == []
+        # Audit mode: PASS entry.
+        findings_audit = evaluate_policy(job_spec, profile, include_passes=True)
+        long_finding = [f for f in findings_audit if f.code == "long_runtime"][0]
         assert long_finding.level == "PASS"
         assert "1209600" in long_finding.message
 
@@ -1740,23 +2508,11 @@ class TestBuildJobName:
 
 
 # ---------------------------------------------------------------------------
-# RunConfig validation edge cases
+# PolicyConfig validation edge cases
 # ---------------------------------------------------------------------------
 
-from spikelab.batch_jobs.models import RunConfig
 
-
-class TestRunConfigValidation:
-    def test_max_wait_seconds_zero_rejected(self):
-        """max_wait_seconds=0 should fail validation (ge=1)."""
-        with pytest.raises(PydanticValidationError):
-            RunConfig(input_path="/data/test.h5", max_wait_seconds=0)
-
-    def test_max_wait_seconds_one_accepted(self):
-        """max_wait_seconds=1 is the minimum allowed value."""
-        config = RunConfig(input_path="/data/test.h5", max_wait_seconds=1)
-        assert config.max_wait_seconds == 1
-
+class TestPolicyConfigValidation:
     def test_max_runtime_seconds_zero_rejected(self):
         """PolicyConfig max_runtime_seconds=0 should fail validation (ge=1)."""
         with pytest.raises(PydanticValidationError):
@@ -2019,6 +2775,64 @@ class TestRunSessionWorkspaceJob:
         storage.upload_bundle.assert_called_once()
         backend.apply_manifest.assert_called_once()
 
+    def test_submit_returns_redacted_manifest_but_applies_real_one(self, tmp_path):
+        """
+        ``RunSession._submit`` writes the *real* manifest (with secrets
+        intact) to the tempfile applied via ``backend.apply_manifest``,
+        but returns a *redacted* manifest in ``SubmitResult.manifest_yaml``
+        so the value can be logged/audited without leaking credentials.
+
+        Tests:
+            (Test Case 1) ``SubmitResult.manifest_yaml`` contains
+                ``***REDACTED***`` for the secret-named env var and the
+                non-secret value verbatim.
+            (Test Case 2) The manifest path passed to
+                ``backend.apply_manifest`` carries the REAL secret on
+                disk at the time of the call.
+        """
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        session, backend, storage = self._make_session()
+
+        # Tier L-D8: ``_submit`` now passes the manifest YAML string
+        # directly to ``apply_manifest`` instead of writing to a
+        # tempfile and passing the path. Capture the string argument
+        # for post-call inspection.
+        captured_manifest = {"text": None}
+
+        def capture_apply(manifest_text_or_path):
+            captured_manifest["text"] = manifest_text_or_path
+            return "test-job-abc"
+
+        backend.apply_manifest.side_effect = capture_apply
+
+        ws = AnalysisWorkspace(name="redact-secret")
+        script = tmp_path / "analyze.py"
+        script.write_text("print('hello')", encoding="utf-8")
+
+        payload = _example_payload()
+        payload["container"]["env"] = {
+            "AWS_SECRET_ACCESS_KEY": "real-secret-value",
+            "NORMAL_VAR": "value",
+        }
+        job_spec = validate_job_spec(payload)
+
+        result = session.submit_workspace_job(
+            workspace=ws,
+            script=str(script),
+            job_spec=job_spec,
+        )
+
+        # Test Case 1: returned manifest carries the redacted env.
+        assert "***REDACTED***" in result.manifest_yaml
+        assert "real-secret-value" not in result.manifest_yaml
+        assert "NORMAL_VAR" in result.manifest_yaml
+        assert "value" in result.manifest_yaml
+
+        # Test Case 2: the applied manifest carried the real secret.
+        assert captured_manifest["text"] is not None
+        assert "real-secret-value" in captured_manifest["text"]
+
     def test_submit_workspace_job_with_path(self, tmp_path):
         """
         submit_workspace_job accepts a string path to a saved workspace.
@@ -2065,6 +2879,43 @@ class TestRunSessionWorkspaceJob:
                 script=str(script),
                 job_spec=job_spec,
             )
+
+    def test_submit_workspace_with_string_base_missing_json_raises(self, tmp_path):
+        """
+        ``_save_workspace`` for a string base-path verifies both ``.h5``
+        and ``.json`` exist. A missing ``.json`` (but present ``.h5``)
+        raises FileNotFoundError mentioning the index file — without
+        this, the partial save would silently propagate downstream.
+
+        Tests:
+            (Test Case 1) Path with only ``.h5`` (no ``.json``) raises
+                FileNotFoundError.
+            (Test Case 2) Error message names the missing ``.json``
+                file.
+        """
+        try:
+            import h5py
+        except ImportError:
+            pytest.skip("h5py not installed")
+
+        session, _, _ = self._make_session()
+        script = tmp_path / "analyze.py"
+        script.write_text("print('hello')", encoding="utf-8")
+
+        # Create only the .h5 file; omit the .json index.
+        base = tmp_path / "partial"
+        with h5py.File(str(base) + ".h5", "w") as f:
+            f.attrs["__workspace_id__"] = "test"
+
+        job_spec = validate_job_spec(_example_payload())
+        with pytest.raises(FileNotFoundError) as excinfo:
+            session.submit_workspace_job(
+                workspace=str(base),
+                script=str(script),
+                job_spec=job_spec,
+            )
+        msg = str(excinfo.value)
+        assert "partial.json" in msg or "index" in msg.lower()
 
     def test_submit_workspace_job_missing_script_raises(self, tmp_path):
         """
@@ -2654,6 +3505,78 @@ class TestWorkspaceEntrypoint:
         monkeypatch.setenv("INPUT_URI", "s3://bucket/input.zip")
         assert _require_env("INPUT_URI") == "s3://bucket/input.zip"
 
+    def test_main_script_failure_prints_marker_and_reraises(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        ``entrypoints/workspace.main`` wraps ``runpy.run_path`` so a
+        failure inside the analysis script surfaces with a clear
+        ``WORKSPACE_SCRIPT_FAILED: <type>: <msg>`` marker on stderr,
+        then re-raises so the pod exits non-zero. Without this, the
+        operator scanning pod logs would have to distinguish "script
+        ran and raised" from "entrypoint bootstrap failed" by stack-
+        trace shape alone.
+
+        Tests:
+            (Test Case 1) The marker substring ``WORKSPACE_SCRIPT_FAILED``
+                with the exception class name and message appears on
+                stderr.
+            (Test Case 2) The original exception propagates to the
+                caller (re-raise behaviour).
+        """
+        import json
+        import zipfile
+        import shutil
+
+        from spikelab.batch_jobs.entrypoints import workspace as ws_entrypoint
+        from spikelab.workspace.workspace import AnalysisWorkspace
+
+        ws = AnalysisWorkspace(name="failure-marker-test")
+        ws_base = str(tmp_path / "workspace")
+        ws.save(ws_base)
+
+        script = tmp_path / "failing_script.py"
+        script.write_text("raise RuntimeError('synthetic failure')\n", encoding="utf-8")
+
+        bundle_dir = tmp_path / "bundle" / "run-1"
+        bundle_dir.mkdir(parents=True)
+        shutil.copy2(f"{ws_base}.h5", bundle_dir / "workspace.h5")
+        shutil.copy2(f"{ws_base}.json", bundle_dir / "workspace.json")
+        shutil.copy2(str(script), bundle_dir / "failing_script.py")
+        manifest = {"run_id": "run-1", "output_format": "workspace", "files": []}
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        shutil.make_archive(
+            str(tmp_path / "bundle"),
+            "zip",
+            root_dir=str(tmp_path / "bundle"),
+            base_dir="run-1",
+        )
+        zip_path = str(tmp_path / "bundle.zip")
+
+        def fake_download(*, s3_uri, local_path):
+            shutil.copy2(zip_path, local_path)
+            return local_path
+
+        mock_storage = MagicMock()
+        mock_storage.download_file.side_effect = fake_download
+        monkeypatch.setattr(
+            "spikelab.batch_jobs.storage_s3.S3StorageClient",
+            lambda **kwargs: mock_storage,
+        )
+        monkeypatch.setenv("INPUT_URI", "s3://bucket/input/bundle.zip")
+        monkeypatch.setenv("OUTPUT_PREFIX", "s3://bucket/outputs/run-1/")
+        monkeypatch.setenv("SCRIPT_NAME", "failing_script.py")
+
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            ws_entrypoint.main()
+
+        captured = capsys.readouterr()
+        assert "WORKSPACE_SCRIPT_FAILED" in captured.err
+        assert "RuntimeError" in captured.err
+        assert "synthetic failure" in captured.err
+
     def test_main_runs_script_with_workspace(self, tmp_path, monkeypatch):
         """
         Workspace entrypoint loads workspace, runs script, uploads result.
@@ -2894,6 +3817,35 @@ class TestFindWorkspaceH5:
         result = _find_workspace_h5(bundle)
         assert result == ws
 
+    def test_only_corrupt_h5_raises_with_diagnostic_listing(self, tmp_path):
+        """
+        When the bundle contains ONLY corrupt .h5 files (no readable
+        workspace), the FileNotFoundError message lists the corrupt
+        path under a ``could not be inspected`` line so the operator
+        can tell "no workspace" apart from "workspace was unreadable".
+
+        Tests:
+            (Test Case 1) FileNotFoundError is raised.
+            (Test Case 2) The error names the corrupt file.
+            (Test Case 3) The error mentions "could not be inspected".
+        """
+        try:
+            import h5py  # noqa: F401
+        except ImportError:
+            pytest.skip("h5py not installed")
+        from spikelab.batch_jobs.entrypoints.workspace import _find_workspace_h5
+
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        corrupt = bundle / "corrupt.h5"
+        corrupt.write_bytes(b"not an HDF5 file")
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            _find_workspace_h5(bundle)
+        msg = str(excinfo.value)
+        assert "corrupt.h5" in msg
+        assert "could not be inspected" in msg
+
 
 class TestSortingEntrypoint:
     def test_require_env_raises_on_missing(self):
@@ -2947,6 +3899,44 @@ class TestSortingEntrypoint:
         config_dict = dataclasses.asdict(config)
         reconstructed = _reconstruct_config(config_dict)
         assert reconstructed.recording.freq_min == 200
+
+    def test_reconstruct_config_resolves_string_annotations(self, monkeypatch):
+        """
+        Under ``from __future__ import annotations`` (or other
+        deferred-evaluation modes), dataclass ``field.type`` carries
+        the annotation as a *string* rather than the actual class.
+        The reconstruction path resolves string annotations via
+        ``typing.get_type_hints`` so both modes work; without this,
+        ``f.type(**sub_dict)`` would raise
+        ``TypeError: 'str' object is not callable``.
+
+        Tests:
+            (Test Case 1) Setting ``SortingPipelineConfig.__annotations__[
+                "recording"] = "RecordingConfig"`` (string form) does
+                not break ``_reconstruct_config`` — it still produces a
+                valid SortingPipelineConfig.
+        """
+        import dataclasses
+
+        from spikelab.batch_jobs.entrypoints.sorting import _reconstruct_config
+        from spikelab.spike_sorting.config import (
+            SortingPipelineConfig,
+            RecordingConfig,
+        )
+
+        # Build a valid baseline config dict.
+        config_dict = dataclasses.asdict(SortingPipelineConfig())
+
+        # Monkeypatch one annotation to the string form. ``get_type_hints``
+        # resolves "RecordingConfig" against the class's module globals,
+        # which already imports the class.
+        original = dict(SortingPipelineConfig.__annotations__)
+        new_annotations = dict(original)
+        new_annotations["recording"] = "RecordingConfig"
+        monkeypatch.setattr(SortingPipelineConfig, "__annotations__", new_annotations)
+
+        reconstructed = _reconstruct_config(config_dict)
+        assert isinstance(reconstructed.recording, RecordingConfig)
 
 
 class TestSortingEntrypointMain:
@@ -3007,9 +3997,13 @@ class TestSortingEntrypointMain:
         # A second .bin to verify multi-recording handling.
         rec_b = bundle_dir / "rec_b.bin"
         rec_b.write_bytes(b"second recording payload")
-        # Manifest is excluded by the entrypoint's recording-file
-        # discovery loop.
-        (bundle_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        # Tier L-C2: manifest declares the recording basenames so the
+        # entrypoint can distinguish recordings from companion files
+        # via the declared whitelist (not a name blacklist).
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps({"recording_files": ["rec_a.bin", "rec_b.bin"]}),
+            encoding="utf-8",
+        )
 
         zip_path = tmp_path / "bundle.zip"
         with zipfile.ZipFile(zip_path, "w") as zf:
@@ -3124,6 +4118,144 @@ class TestSortingEntrypointMain:
             loaded = pickle.loads(payload)
             assert isinstance(loaded, SpikeData)
 
+    def test_main_uploads_sort_run_report_and_prints_partial_failure_marker(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        After a sort with mixed success/failure, ``main()`` must upload
+        ``sort_run_report.json`` with per-recording status records and
+        print a ``partial failures`` marker to stdout so a "job exit 0"
+        doesn't silently mask a degraded run.
+
+        Tests:
+            (Test Case 1) ``sort_run_report.json`` is uploaded under
+                OUTPUT_PREFIX.
+            (Test Case 2) The uploaded JSON contains one record per
+                recording with the populated ``status`` field
+                (mixed success / failure).
+            (Test Case 3) Stdout contains a ``partial failures`` marker
+                naming the failed recording.
+        """
+        import dataclasses
+        import json
+        import shutil
+        import zipfile
+        from unittest.mock import MagicMock
+
+        from spikelab.batch_jobs.entrypoints.sorting import main as sorting_main
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+        from spikelab.spike_sorting.pipeline import RecordingResult
+        from spikelab.spikedata import SpikeData
+
+        # --- Build bundle with two recordings ---
+        bundle_dir = tmp_path / "bundle"
+        bundle_dir.mkdir(parents=True)
+        config = SortingPipelineConfig()
+        (bundle_dir / "sorting_config.json").write_text(
+            json.dumps(dataclasses.asdict(config)), encoding="utf-8"
+        )
+        (bundle_dir / "rec_ok.bin").write_bytes(b"payload-a")
+        (bundle_dir / "rec_bad.bin").write_bytes(b"payload-b")
+        # Tier L-C2: declare the recording basenames in the manifest.
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps({"recording_files": ["rec_ok.bin", "rec_bad.bin"]}),
+            encoding="utf-8",
+        )
+
+        zip_path = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for path in bundle_dir.iterdir():
+                zf.write(path, path.name)
+
+        # --- Mock S3 with payload capture ---
+        upload_calls: list[tuple[str, bytes]] = []
+
+        def fake_download(*, s3_uri, local_path):
+            shutil.copy2(zip_path, local_path)
+            return local_path
+
+        def fake_upload(*, local_path, s3_uri):
+            with open(local_path, "rb") as f:
+                upload_calls.append((s3_uri, f.read()))
+            return s3_uri
+
+        mock_storage = MagicMock()
+        mock_storage.download_file.side_effect = fake_download
+        mock_storage.upload_file.side_effect = fake_upload
+        monkeypatch.setattr(
+            "spikelab.batch_jobs.storage_s3.S3StorageClient",
+            lambda **kwargs: mock_storage,
+        )
+
+        # --- Mock sort_recording: succeed on rec_ok, fail on rec_bad ---
+        def fake_sort_recording(
+            recording_files,
+            config,
+            intermediate_folders,
+            results_folders,
+            out_report=None,
+            **kwargs,
+        ):
+            results = []
+            for rec_path, res_folder in zip(recording_files, results_folders):
+                rec_name = Path(rec_path).stem
+                if rec_name == "rec_ok":
+                    out_report.add(
+                        RecordingResult(
+                            rec_name=rec_name,
+                            rec_path=str(rec_path),
+                            results_folder=str(res_folder),
+                            status="success",
+                            wall_time_s=0.1,
+                            n_curated_units=1,
+                        )
+                    )
+                    results.append(SpikeData([[1.0]], length=10.0))
+                else:
+                    out_report.add(
+                        RecordingResult(
+                            rec_name=rec_name,
+                            rec_path=str(rec_path),
+                            results_folder=str(res_folder),
+                            status="failed",
+                            wall_time_s=0.05,
+                            error_class="RuntimeError",
+                            error_message="synthetic failure",
+                        )
+                    )
+                    # main() still expects one SpikeData per recording.
+                    results.append(SpikeData([[]], length=10.0))
+            return results
+
+        monkeypatch.setattr(
+            "spikelab.spike_sorting.pipeline.sort_recording", fake_sort_recording
+        )
+
+        monkeypatch.setenv("INPUT_URI", "s3://b/in/bundle.zip")
+        monkeypatch.setenv("OUTPUT_PREFIX", "s3://b/out/run/")
+
+        sorting_main()
+
+        # Test Case 1: sort_run_report.json uploaded.
+        report_uploads = [
+            (uri, payload)
+            for uri, payload in upload_calls
+            if uri.endswith("sort_run_report.json")
+        ]
+        assert len(report_uploads) == 1
+        # Test Case 2: report content names both recordings + their statuses.
+        report = json.loads(report_uploads[0][1].decode("utf-8"))
+        assert report["n_total"] == 2
+        assert report["n_succeeded"] == 1
+        assert report["n_failed"] == 1
+        status_by_name = {r["rec_name"]: r["status"] for r in report["records"]}
+        assert status_by_name == {"rec_ok": "success", "rec_bad": "failed"}
+
+        # Test Case 3: stdout carries the partial-failure marker.
+        captured = capsys.readouterr().out
+        assert "partial failures" in captured.lower()
+        assert "rec_bad" in captured
+
     def test_main_raises_on_missing_sorting_config(self, tmp_path, monkeypatch):
         """
         ``main()`` raises FileNotFoundError when the bundle contains
@@ -3168,12 +4300,17 @@ class TestSortingEntrypointMain:
 
     def test_main_raises_on_no_recording_files(self, tmp_path, monkeypatch):
         """
-        ``main()`` raises FileNotFoundError when the bundle contains
-        ``sorting_config.json`` but no recording files. Documents the
-        ``"No recording files found in input bundle"`` branch.
+        Tier L-C2: ``main()`` raises ``ValueError`` when the manifest
+        has no ``recording_files`` declaration. Previously the
+        entrypoint guessed via a name blacklist and would raise
+        ``FileNotFoundError("No recording files found in input
+        bundle")``; the new declared-whitelist contract surfaces the
+        missing manifest field instead.
 
         Tests:
-            (Test Case 1) Config-only bundle raises FileNotFoundError.
+            (Test Case 1) Bundle with empty manifest.json (no
+                ``recording_files`` field) raises ValueError naming
+                the missing field.
         """
         import dataclasses
         import json
@@ -3211,7 +4348,7 @@ class TestSortingEntrypointMain:
         monkeypatch.setenv("INPUT_URI", "s3://bucket/input/bundle.zip")
         monkeypatch.setenv("OUTPUT_PREFIX", "s3://bucket/outputs/run-1/")
 
-        with pytest.raises(FileNotFoundError, match="recording files"):
+        with pytest.raises(ValueError, match="recording_files"):
             sorting_main()
 
 
@@ -3260,6 +4397,37 @@ class TestJobSpecNamePrefix:
         payload_all_non_ascii["name_prefix"] = "áöü"
         with pytest.raises(ValueError, match="no usable ASCII content"):
             validate_job_spec(payload_all_non_ascii)
+
+    def test_oversized_name_prefix_emits_truncation_warning(self):
+        """
+        A name_prefix longer than 40 chars (after stripping) emits a
+        UserWarning whose message contains both the original input
+        and the truncated form so the operator can shorten upstream.
+
+        Tests:
+            (Test Case 1) A 50-char alphanumeric prefix triggers a
+                UserWarning.
+            (Test Case 2) The warning message contains the original
+                value (e.g. via ``repr``).
+            (Test Case 3) The warning message contains the truncated
+                40-char form.
+        """
+        import warnings as _warnings
+
+        payload = _example_payload()
+        original = "a" * 50
+        payload["name_prefix"] = original
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            job_spec = validate_job_spec(payload)
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        relevant = [m for m in warn_msgs if "name_prefix" in m and "truncated" in m]
+        assert relevant, warn_msgs
+        # Both the original and the truncated 40-char form appear.
+        assert original in relevant[0]
+        assert job_spec.name_prefix in relevant[0]
+        assert len(job_spec.name_prefix) == 40
 
     def test_trailing_hyphens_stripped_after_truncation(self):
         """Trailing hyphens exposed by 40-char truncation are stripped.
@@ -3332,6 +4500,198 @@ class TestPolicySummarizePreflight:
         ]
         level, _ = summarize_preflight(findings)
         assert level == "PASS"
+
+
+class TestWaitForCompletionRetryBackoff:
+    """``wait_for_completion`` retries transient backend errors with
+    exponential backoff capped at ``max_backoff_seconds``. Persistent
+    failures eventually surface as ``"Backend unavailable"`` after
+    ``max_consecutive_failures`` consecutive raises. A 404 from the
+    K8s client returns ``"Failed"`` immediately (no retry — job
+    deleted out-of-band). A successful poll resets both the failure
+    counter and the backoff to ``poll_interval_seconds``.
+    """
+
+    @staticmethod
+    def _make_session(backend=None):
+        from spikelab.batch_jobs.session import RunSession
+
+        profile = ClusterProfile(name="test")
+        backend = backend or MagicMock(spec=KubernetesBatchJobBackend)
+        storage = MagicMock(spec=S3StorageClient)
+        return (
+            RunSession(
+                profile=profile,
+                backend=backend,
+                storage_client=storage,
+                credentials=MagicMock(),
+            ),
+            backend,
+        )
+
+    def test_immediate_complete_single_poll(self):
+        """
+        Tests:
+            (Test Case 1) ``job_status`` returning "Complete" causes
+                ``wait_for_completion`` to return after exactly one
+                call.
+        """
+        session, backend = self._make_session()
+        backend.job_status.return_value = "Complete"
+        state = session.wait_for_completion(
+            job_name="job-x", max_wait_seconds=10, poll_interval_seconds=1
+        )
+        assert state == "Complete"
+        assert backend.job_status.call_count == 1
+
+    def test_transient_recovery_after_calledprocesserror(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After 3 transient ``CalledProcessError``
+                raises followed by a "Complete" return, the loop
+                surfaces "Complete" with exactly 4 total calls.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = [
+            subprocess.CalledProcessError(1, "kubectl"),
+            subprocess.CalledProcessError(1, "kubectl"),
+            subprocess.CalledProcessError(1, "kubectl"),
+            "Complete",
+        ]
+        # Patch time.sleep to a no-op so the test is fast.
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=60,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Complete"
+        assert backend.job_status.call_count == 4
+
+    def test_persistent_failure_returns_backend_unavailable(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After ``max_consecutive_failures`` raises in
+                a row, the loop returns "Backend unavailable" and
+                ``job_status`` was called exactly
+                ``max_consecutive_failures`` times.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = subprocess.CalledProcessError(1, "kubectl")
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=600,
+            poll_interval_seconds=1,
+            max_consecutive_failures=3,
+        )
+        assert state == "Backend unavailable"
+        assert backend.job_status.call_count == 3
+
+    def test_apiexception_404_returns_failed_immediately(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) An ``ApiException(status=404)`` from the K8s
+                client returns "Failed" on the first poll (no retry).
+        """
+        try:
+            from kubernetes.client.exceptions import ApiException
+        except ImportError:
+            pytest.skip("kubernetes client not installed")
+
+        session, backend = self._make_session()
+        # Build a 404 ApiException.
+        exc = ApiException(status=404, reason="Not Found")
+        backend.job_status.side_effect = exc
+
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=60,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Failed"
+        assert backend.job_status.call_count == 1
+
+    def test_running_then_timeout(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) ``job_status`` returning "Running"
+                indefinitely yields "Timeout" once
+                ``max_wait_seconds`` elapses.
+        """
+        session, backend = self._make_session()
+        backend.job_status.return_value = "Running"
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda _s: None)
+
+        # Use a tiny budget and a counter-based fake time to keep the
+        # test deterministic and fast.
+        time_now = {"t": 0.0}
+
+        def fake_time():
+            time_now["t"] += 0.6  # each call ticks 0.6s
+            return time_now["t"]
+
+        monkeypatch.setattr(session_mod.time, "time", fake_time)
+        state = session.wait_for_completion(
+            job_name="job-x", max_wait_seconds=2, poll_interval_seconds=1
+        )
+        assert state == "Timeout"
+
+    def test_successful_poll_resets_backoff(self, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) After two failures, one success, then
+                another failure followed by Complete — the second
+                failure's sleep starts back at
+                ``poll_interval_seconds``, not the prior backoff
+                value. The reset is asserted by capturing
+                ``time.sleep`` arg-lists and checking the pattern.
+        """
+        import subprocess
+
+        session, backend = self._make_session()
+        backend.job_status.side_effect = [
+            subprocess.CalledProcessError(1, "kubectl"),  # fail 1
+            subprocess.CalledProcessError(1, "kubectl"),  # fail 2
+            "Running",  # success — resets counter+backoff
+            subprocess.CalledProcessError(1, "kubectl"),  # fail again
+            "Complete",
+        ]
+
+        sleeps: list = []
+        from spikelab.batch_jobs import session as session_mod
+
+        monkeypatch.setattr(session_mod.time, "sleep", lambda s: sleeps.append(s))
+        state = session.wait_for_completion(
+            job_name="job-x",
+            max_wait_seconds=600,
+            poll_interval_seconds=1,
+            max_consecutive_failures=5,
+        )
+        assert state == "Complete"
+        # Pattern: fail→2, fail→4, success→1 (reset to poll_interval),
+        # fail→2, then success returns without sleeping after the
+        # final iteration. Pin the reset by asserting the third sleep
+        # is exactly poll_interval_seconds.
+        assert len(sleeps) >= 3
+        assert sleeps[2] == 1
 
 
 class TestWaitForCompletion:
@@ -3420,6 +4780,64 @@ class TestKubernetesBatchJobBackendK8sClientPath:
         manifest = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  labels: {}\n"
         with pytest.raises(ValueError, match="metadata.name"):
             backend.apply_manifest(manifest)
+
+    def test_apply_manifest_rejects_namespace_disagreement(self):
+        """
+        ``apply_manifest`` raises ValueError when the manifest's
+        ``metadata.namespace`` is set and differs from the backend's
+        configured namespace — otherwise the apply would silently
+        deploy into the backend's namespace instead of the rendered
+        target.
+
+        Tests:
+            (Test Case 1) ValueError is raised.
+            (Test Case 2) The error message names both the manifest
+                namespace and the backend namespace.
+            (Test Case 3) The K8s client's ``create_namespaced_job``
+                is NOT invoked (we refused before issuing the apply).
+        """
+        backend = KubernetesBatchJobBackend(namespace="prod")
+        mock_batch_api = MagicMock()
+        backend._batch_api = mock_batch_api
+
+        manifest = (
+            "apiVersion: batch/v1\nkind: Job\n"
+            "metadata:\n  name: my-job\n  namespace: staging\n"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            backend.apply_manifest(manifest)
+        msg = str(excinfo.value)
+        assert "staging" in msg
+        assert "prod" in msg
+        mock_batch_api.create_namespaced_job.assert_not_called()
+
+    def test_apply_manifest_kubectl_fallback_returns_metadata_name(self, tmp_path):
+        """
+        Both the kubectl-fallback path and the Python-client path
+        return the bare ``metadata.name`` (E8). Pin the fallback path:
+        if the rendered YAML's ``metadata.name`` is available, the
+        returned value is the name (not raw ``kubectl apply`` stdout).
+
+        Tests:
+            (Test Case 1) The kubectl-fallback path returns
+                ``metadata.name`` from the parsed YAML, not the raw
+                ``kubectl apply`` stdout containing it.
+        """
+        backend = KubernetesBatchJobBackend(namespace="test-ns")
+        backend._batch_api = None  # force fallback
+        backend.use_kubectl_fallback = True
+
+        # Stub the kubectl invocation so the test stays hermetic.
+        backend._run_kubectl = lambda cmd: ("job.batch/clean-job-name created\n")
+
+        manifest_file = tmp_path / "job.yaml"
+        manifest_file.write_text(
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: clean-job-name\n",
+            encoding="utf-8",
+        )
+        result = backend.apply_manifest(str(manifest_file))
+        # Returns the bare name (E8 contract), not the raw stdout.
+        assert result == "clean-job-name"
 
     def test_delete_job_k8s_client(self):
         """delete_job via K8s client calls delete_namespaced_job."""
@@ -3634,6 +5052,100 @@ class TestK8sBackendConfigException:
                     assert backend._batch_api is None
                     assert backend._core_api is None
 
+    def test_apply_manifest_kubectl_fallback_unlinks_temp_on_write_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        The kubectl-fallback path writes the manifest YAML to a tempfile
+        via ``tempfile.mkstemp`` + ``os.fdopen``. If the inner write
+        raises, the ``finally`` branch must still unlink the temp
+        path — the previous pattern initialised ``temp_path = None``
+        before the write and skipped cleanup when the assignment never
+        happened.
+
+        Tests:
+            (Test Case 1) When ``os.fdopen`` raises after
+                ``mkstemp`` succeeded, the temp file path is unlinked
+                in the cleanup branch.
+            (Test Case 2) The original exception propagates to the
+                caller.
+        """
+        import os
+        import tempfile as _tempfile
+
+        backend = KubernetesBatchJobBackend(namespace="test-ns")
+        backend._batch_api = None  # force fallback
+        backend.use_kubectl_fallback = True
+
+        captured_temp_path: list[str] = []
+        real_mkstemp = _tempfile.mkstemp
+
+        def tracking_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            captured_temp_path.append(path)
+            return fd, path
+
+        def failing_fdopen(fd, *args, **kwargs):
+            # Close the fd before raising so the finally branch's
+            # ``Path(temp_path).unlink(missing_ok=True)`` can actually
+            # delete the file on Windows (where holding the fd blocks
+            # unlink). This mirrors what a real ``os.fdopen`` failure
+            # looks like for a properly-implemented file wrapper that
+            # closed the fd before propagating the error.
+            os.close(fd)
+            raise OSError("simulated write failure")
+
+        monkeypatch.setattr(
+            "spikelab.batch_jobs.backend_k8s.tempfile.mkstemp", tracking_mkstemp
+        )
+        monkeypatch.setattr("spikelab.batch_jobs.backend_k8s.os.fdopen", failing_fdopen)
+
+        manifest = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: my-job\n"
+        with pytest.raises(OSError, match="simulated write failure"):
+            backend.apply_manifest(manifest)
+
+        assert captured_temp_path, "mkstemp was never called"
+        assert not os.path.exists(captured_temp_path[0])
+
+    def test_non_config_exception_during_api_discovery_logs_and_falls_back(
+        self, caplog
+    ):
+        """
+        Non-ConfigException errors raised during ``client.BatchV1Api()``
+        / ``client.CoreV1Api()`` (network blip, urllib3 quirks, API
+        version mismatch) leave the backend in the partially-initialised
+        kubectl-fallback state — ``_batch_api is None`` — and emit a
+        DEBUG-level log record so operators can still see what went
+        wrong.
+
+        Tests:
+            (Test Case 1) Constructor returns successfully despite the
+                non-ConfigException error.
+            (Test Case 2) ``_batch_api`` and ``_core_api`` are both
+                None (kubectl fallback engaged).
+            (Test Case 3) A DEBUG-level log record was emitted to the
+                module's logger.
+        """
+        import logging
+
+        mock_client = MagicMock()
+        # ``BatchV1Api()`` raises a non-ConfigException-type error.
+        mock_client.BatchV1Api.side_effect = RuntimeError(
+            "simulated urllib3 MaxRetryError"
+        )
+        mock_config = MagicMock()
+        mock_config.ConfigException = type("ConfigException", (Exception,), {})
+
+        with caplog.at_level(logging.DEBUG, logger="spikelab.batch_jobs.backend_k8s"):
+            with patch("spikelab.batch_jobs.backend_k8s.client", mock_client):
+                with patch("spikelab.batch_jobs.backend_k8s.config", mock_config):
+                    backend = KubernetesBatchJobBackend(namespace="test")
+
+        assert backend._batch_api is None
+        assert backend._core_api is None
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert debug_records, "expected a DEBUG-level log record on fallback"
+
 
 class TestCli:
     """Edge cases for CLI module."""
@@ -3667,6 +5179,45 @@ class TestCli:
 
         with pytest.raises(ValueError, match="must contain an object"):
             cli._load_payload(str(config_path))
+
+    def test_apply_image_selection_does_not_mutate_caller_payload(self):
+        """
+        ``_apply_image_selection`` deep-copies the payload before
+        mutating so callers can reuse the same parsed config dict
+        across multiple invocations with different image profiles.
+
+        Tests:
+            (Test Case 1) The caller's payload dict is byte-equal
+                before and after the call (deep-copy via
+                ``copy.deepcopy`` then dict equality).
+            (Test Case 2) The returned dict carries the resolved
+                image (different from the caller's original).
+        """
+        import copy
+
+        payload = {
+            "container": {
+                "image": "",  # empty so resolution must fill it in
+                "command": ["python"],
+                "args": [],
+                "env": {"K": "v"},
+            },
+            "other_field": [1, 2, 3],
+        }
+        profile = ClusterProfile(
+            name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+        )
+        snapshot = copy.deepcopy(payload)
+        updated = cli._apply_image_selection(
+            payload,
+            profile=profile,
+            image_profile="cpu",
+            image_override=None,
+        )
+        # Caller's payload survives unmutated.
+        assert payload == snapshot
+        # Returned dict carries the resolved image.
+        assert updated["container"]["image"] == "ghcr.io/example/cpu:latest"
 
     def test_apply_image_selection_override_takes_precedence(self):
         """image_override takes precedence over image_profile."""
@@ -3904,25 +5455,36 @@ class TestCli:
 class TestTemplating:
     """Edge cases for the templating module."""
 
-    def test_sanitize_yaml_value_strips_unsafe_chars(self):
-        """_sanitize_yaml_value removes newlines, tabs, quotes, backslashes."""
+    def test_sanitize_yaml_value_raises_on_unsafe_chars(self):
+        """Tier L-C1: _sanitize_yaml_value raises ValueError on unsafe chars.
+
+        Previously the function silently stripped \\n / \\t / " / \\
+        from the value. Tier L-C1 replaces the silent strip with a
+        fail-fast ValueError so commands and label values that
+        depend on those characters can't be silently mangled.
+        """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
-        result = _sanitize_yaml_value('hello\nworld\t"test\\value')
-        assert "\n" not in result
-        assert "\t" not in result
-        assert '"' not in result
-        assert "\\" not in result
-        assert result == "helloworldtestvalue"
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value('hello\nworld\t"test\\value')
+        # Safe inputs round-trip unchanged.
+        assert _sanitize_yaml_value("hello world") == "hello world"
+        assert _sanitize_yaml_value("foo:bar/baz") == "foo:bar/baz"
 
-    def test_sanitize_yaml_value_injection_attempt(self):
-        """YAML injection via label values is stripped."""
+    def test_sanitize_yaml_value_injection_attempt_rejected(self):
+        """Tier L-C1: YAML injection via label values raises ValueError.
+
+        The fail-fast contract surfaces the offending characters in
+        the error message; operators can't silently ship a job spec
+        whose newlines would inject extra YAML nodes.
+        """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
         malicious = 'value"\ninjected_key: injected_value'
-        result = _sanitize_yaml_value(malicious)
-        assert "\n" not in result
-        assert '"' not in result
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value(malicious)
 
     def test_build_pod_volumes_mount_with_no_name_skipped(self):
         """Mounts with no name are silently dropped."""
@@ -4587,7 +6149,11 @@ class TestS3StorageDownloadOutputPathTraversalGuard:
 
         client = S3StorageClient.__new__(S3StorageClient)
         client.bucket = "test-bucket"
-        client._client = None  # never touched: validation fires first
+        # ``_client`` is now a lazy property; assign to the underlying
+        # ``_client_instance`` slot directly (also never touched, since
+        # validation fires first).
+        client._client_instance = None
+        client._boto3_kwargs = {}
 
         with pytest.raises(ValueError, match=r"path-traversal"):
             client.download_output(
@@ -4847,8 +6413,8 @@ class TestContainsDisallowedSleepBoundaries:
 
 
 class TestValidationModuleBoundaries:
-    """``validation.validate_job_spec`` and ``validate_run_config``
-    rejection contracts at the type-shape boundary.
+    """``validation.validate_job_spec`` rejection contracts at the
+    type-shape boundary.
     """
 
     def test_validate_job_spec_none_payload_raises(self):
@@ -4872,19 +6438,6 @@ class TestValidationModuleBoundaries:
         with pytest.raises(ValidationError):
             validate_job_spec([])
 
-    def test_validate_run_config_none_input_path_raises(self):
-        """
-        Tests:
-            (Test Case 1) ``{"input_path": None}`` raises (required
-                non-Optional string).
-        """
-        from pydantic import ValidationError
-
-        from spikelab.batch_jobs.validation import validate_run_config
-
-        with pytest.raises(ValidationError):
-            validate_run_config({"input_path": None})
-
 
 class TestTemplatingSanitizers:
     """``templating._sanitize_yaml_value`` boundary contracts."""
@@ -4898,14 +6451,20 @@ class TestTemplatingSanitizers:
 
         assert _sanitize_yaml_value("") == ""
 
-    def test_all_unsafe_chars_returns_empty(self):
+    def test_all_unsafe_chars_raises(self):
         """
+        Tier L-C1: an input composed entirely of unsafe characters
+        raises ValueError naming each unsafe character in the
+        message. Previously this returned empty string (silent mangle).
+
         Tests:
-            (Test Case 1) ``"\\n\\t\\""`` (all unsafe) returns empty.
+            (Test Case 1) ``"\\n\\t\\""`` raises ValueError.
         """
+        import pytest
         from spikelab.batch_jobs.templating import _sanitize_yaml_value
 
-        assert _sanitize_yaml_value('\n\t"') == ""
+        with pytest.raises(ValueError, match="YAML-unsafe character"):
+            _sanitize_yaml_value('\n\t"')
 
 
 class TestLoadProfileFromNameBoundaries:
@@ -4976,6 +6535,522 @@ class TestSubmitPreparedJobRunIdTraversal:
         # The guard rejects traversal-style run_ids at the session boundary.
         assert "current_run_id" in body
         assert '".." in' in body or "'..' in" in body
+
+
+class TestTierKBatchJobConstants:
+    """Pin the named-constant module attributes the parallel review
+    extracted in Tier K. These constants are part of the public API
+    (callers tune the defaults via these names rather than re-reading
+    magic numbers from the source).
+    """
+
+    def test_default_image_profile_constant(self):
+        """
+        Tests:
+            (Test Case 1) ``cli.DEFAULT_IMAGE_PROFILE`` equals ``"cpu"``.
+            (Test Case 2) Passing ``image_profile=None`` resolves
+                through the constant to the cpu image.
+        """
+        from spikelab.batch_jobs import cli as cli_mod
+
+        assert cli_mod.DEFAULT_IMAGE_PROFILE == "cpu"
+
+        # The constant drives the resolution path.
+        payload = _example_payload()
+        # Force ``container.image`` to be empty so the profile fallback
+        # must fill it in.
+        payload["container"]["image"] = ""
+        profile = ClusterProfile(
+            name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+        )
+        updated = cli_mod._apply_image_selection(
+            payload,
+            profile=profile,
+            image_profile=None,
+            image_override=None,
+        )
+        assert updated["container"]["image"] == "ghcr.io/example/cpu:latest"
+
+    def test_job_name_length_constants_match_rfc1123_budget(self):
+        """
+        Tests:
+            (Test Case 1) ``_JOB_NAME_MAX_LENGTH`` == 63 (RFC 1123 DNS
+                subdomain label cap).
+            (Test Case 2) ``_JOB_NAME_TOKEN_LENGTH`` == 8 (UUID suffix
+                budget).
+            (Test Case 3) ``RunSession._build_job_name`` output never
+                exceeds ``_JOB_NAME_MAX_LENGTH`` for prefixes at the
+                budget boundary.
+        """
+        from spikelab.batch_jobs.session import (
+            RunSession,
+            _JOB_NAME_MAX_LENGTH,
+            _JOB_NAME_TOKEN_LENGTH,
+        )
+
+        assert _JOB_NAME_MAX_LENGTH == 63
+        assert _JOB_NAME_TOKEN_LENGTH == 8
+
+        # Long prefix is truncated to fit the budget.
+        long_prefix = "a" * 200
+        out = RunSession._build_job_name(long_prefix)
+        assert len(out) <= _JOB_NAME_MAX_LENGTH
+
+    def test_reconstruct_config_typeerror_names_subconfig(self):
+        """
+        ``_reconstruct_config`` wraps the bare ``TypeError`` from
+        ``f.type(**sub_dict)`` so the message names which sub-config
+        failed to reconstruct — the operator sees ``Failed to
+        reconstruct 'execution': ...`` instead of the bare ``__init__()
+        got an unexpected keyword`` from the dataclass.
+
+        Tests:
+            (Test Case 1) An unknown key in the ``execution`` sub-dict
+                raises TypeError whose message contains
+                ``"Failed to reconstruct 'execution'"``.
+        """
+        import dataclasses
+
+        from spikelab.batch_jobs.entrypoints.sorting import _reconstruct_config
+        from spikelab.spike_sorting.config import SortingPipelineConfig
+
+        config_dict = dataclasses.asdict(SortingPipelineConfig())
+        # Inject an unknown key into the execution sub-dict.
+        config_dict["execution"]["nonexistent_field"] = 42
+
+        with pytest.raises(TypeError, match="Failed to reconstruct 'execution'"):
+            _reconstruct_config(config_dict)
+
+
+class TestCliCmdRenderNamespaceBackfill:
+    """``cli._cmd_render`` accepts an argparse.Namespace that only
+    carries the bare ``render`` subparser's attributes. It fills in
+    ``wait`` / ``follow_logs`` / ``max_wait_seconds`` /
+    ``allow_policy_risk`` / ``output_manifest`` defaults so the
+    delegate ``_cmd_deploy`` doesn't crash with ``AttributeError``.
+    """
+
+    def test_bare_render_namespace_does_not_raise_attributeerror(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Tests:
+            (Test Case 1) Calling ``_cmd_render`` with a Namespace
+                that lacks the deploy-only flags returns 0 without
+                ``AttributeError``.
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        # Minimal valid job config on disk so _cmd_render → _cmd_deploy →
+        # _load_payload finds something to validate.
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        # Stub heavy dependencies so the test stays hermetic.
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "rendered-yaml"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        # Build a bare Namespace carrying ONLY what the render subparser
+        # would set — no wait / follow_logs / max_wait_seconds /
+        # allow_policy_risk / output_manifest.
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+        )
+        result = cli_mod._cmd_render(args)
+        assert result == 0
+
+    def test_render_only_stdout_when_no_output_manifest(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        Tests:
+            (Test Case 1) Without ``output_manifest`` set on the
+                Namespace, ``_cmd_render`` prints the rendered manifest
+                to stdout (the documented fallback path).
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "yaml-from-stub"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+        )
+        cli_mod._cmd_render(args)
+        captured = capsys.readouterr().out
+        assert "yaml-from-stub" in captured
+
+
+class TestCliCmdDeployInvalidConfigMessages:
+    """``cli._cmd_deploy`` produces ``SystemExit("Invalid job config: …")``
+    for both pydantic ``ValidationError`` (uses the summariser) and
+    plain exceptions (uses ``str(exc)``). The split exists so unrelated
+    exceptions with an ``errors`` attribute don't accidentally route
+    through the pydantic summariser.
+    """
+
+    def test_validation_error_routes_through_summariser(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) An invalid job_config payload (e.g. empty
+                container.image) raises SystemExit whose message
+                starts with ``"Invalid job config:"``.
+            (Test Case 2) The summariser output is a non-empty
+                follow-on string after the prefix.
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        payload = _example_payload()
+        # Drop a required field that the profile fallback cannot fill in.
+        payload["container"]["image"] = ""
+        del payload["container"]["command"]
+        # Make name_prefix empty so the validator must reject it.
+        payload["name_prefix"] = ""
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: MagicMock()
+        )
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+            render_only=True,
+            wait=False,
+            follow_logs=False,
+            max_wait_seconds=1,
+            allow_policy_risk=False,
+            output_manifest=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            cli_mod._cmd_deploy(args)
+        msg = str(excinfo.value)
+        assert msg.startswith("Invalid job config:")
+        # Summariser produces some follow-on text.
+        assert len(msg) > len("Invalid job config:")
+
+    def test_non_validation_error_routes_through_str(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) A plain ``RuntimeError("x")`` raised from
+                ``validate_job_spec`` produces SystemExit with the
+                message ``"Invalid job config: x"`` (the raw
+                ``str(exc)`` rather than the pydantic summariser).
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(_example_payload()), encoding="utf-8")
+
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: MagicMock()
+        )
+
+        def raise_runtime_error(payload):
+            raise RuntimeError("x")
+
+        monkeypatch.setattr(cli_mod, "validate_job_spec", raise_runtime_error)
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+            render_only=True,
+            wait=False,
+            follow_logs=False,
+            max_wait_seconds=1,
+            allow_policy_risk=False,
+            output_manifest=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            cli_mod._cmd_deploy(args)
+        assert str(excinfo.value) == "Invalid job config: x"
+
+
+class TestCliCmdDeployRenderOnlyCreatesParentDirs:
+    """``cli._cmd_deploy`` with ``--render-only`` + ``--output-manifest``
+    creates the parent directory if it doesn't exist (otherwise
+    ``write_text`` raises FileNotFoundError on a missing intermediate
+    directory like ``./out/dry-run/`` when ``./out`` doesn't exist).
+    """
+
+    def test_render_only_creates_missing_parent_dirs(self, tmp_path, monkeypatch):
+        """
+        Tests:
+            (Test Case 1) Output path under a non-existent nested
+                subdirectory writes the manifest, creating the
+                missing parents.
+        """
+        import json
+        from spikelab.batch_jobs import cli as cli_mod
+
+        payload = _example_payload()
+        config_path = tmp_path / "job.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        mock_session = MagicMock()
+        mock_session.render_manifest.return_value = "rendered-yaml-payload"
+        monkeypatch.setattr(
+            cli_mod, "_build_session", lambda profile, kubeconfig: mock_session
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "_load_profile",
+            lambda name, path: ClusterProfile(
+                name="t", default_images={"cpu": "ghcr.io/example/cpu:latest"}
+            ),
+        )
+
+        output_path = tmp_path / "deep" / "nested" / "manifest.yaml"
+        assert not output_path.parent.exists()
+
+        args = argparse.Namespace(
+            profile=None,
+            profile_file=None,
+            kubeconfig=None,
+            job_config=str(config_path),
+            image_profile="cpu",
+            image=None,
+            render_only=True,
+            wait=False,
+            follow_logs=False,
+            max_wait_seconds=1,
+            allow_policy_risk=False,
+            output_manifest=str(output_path),
+        )
+        result = cli_mod._cmd_deploy(args)
+        assert result == 0
+        assert output_path.exists()
+        assert output_path.read_text(encoding="utf-8") == "rendered-yaml-payload"
+
+
+class TestPackageAnalysisBundleMetadataValidation:
+    """``package_analysis_bundle`` pre-validates ``metadata`` against
+    ``json.dumps`` before any I/O. Without this, the bundle would hash
+    every input, copy every file, then crash at the very end — wasting
+    the work.
+    """
+
+    def test_non_json_serializable_metadata_rejected_before_io(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``metadata={"path": Path("/tmp")}`` raises
+                ValueError mentioning "not JSON-serializable".
+            (Test Case 2) The metadata check runs before input-file
+                I/O — we pass a non-existent input path and confirm
+                no FileNotFoundError surfaces (metadata check fired
+                first).
+        """
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        nonexistent_input = str(tmp_path / "does_not_exist.bin")
+        with pytest.raises(ValueError, match="not JSON-serializable"):
+            package_analysis_bundle(
+                input_paths=[nonexistent_input],
+                run_id="run-meta",
+                output_dir=str(tmp_path / "out"),
+                output_format="workspace",
+                metadata={"path": Path("/tmp")},
+            )
+
+    def test_manifest_size_bytes_is_int_not_string(self, tmp_path):
+        """
+        ``manifest.json`` entries record ``size_bytes`` as an integer
+        (``json.loads`` returns ``int``), not a string. Readers should
+        not need to cast.
+
+        Tests:
+            (Test Case 1) ``isinstance(manifest["files"][0]["size_bytes"],
+                int)`` is True after a successful bundle.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        input_dir = tmp_path / "in"
+        input_dir.mkdir()
+        f = input_dir / "data.bin"
+        f.write_bytes(b"hello world")
+
+        bundle_path = package_analysis_bundle(
+            input_paths=[str(f)],
+            run_id="run-int",
+            output_dir=str(tmp_path / "out"),
+            output_format="workspace",
+        )
+
+        with zipfile.ZipFile(bundle_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+
+        assert manifest["files"]
+        # JSON int → Python int; a stringified int would deserialise as str.
+        first = manifest["files"][0]
+        assert isinstance(first["size_bytes"], int)
+        assert first["size_bytes"] == len(b"hello world")
+
+
+class TestPackageAnalysisBundleSortingRecordingFiles:
+    """``package_analysis_bundle(output_format='sorting', ...)``
+    declares ``recording_files`` in the manifest. The sorting
+    entrypoint uses that whitelist instead of a permissive name
+    blacklist. Sorting output requires the field; workspace / custom
+    bundles only include it when the caller passes it explicitly.
+    """
+
+    def test_sorting_manifest_carries_sorted_recording_files(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``output_format='sorting'`` writes
+                ``manifest.json["recording_files"]`` as a sorted list
+                of the supplied basenames.
+            (Test Case 2) Duplicates are deduplicated via ``set`` →
+                sorted.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "rec_a.bin").write_bytes(b"a")
+        (in_dir / "rec_b.bin").write_bytes(b"b")
+        (in_dir / "sorting_config.json").write_text("{}")
+
+        zip_path = package_analysis_bundle(
+            input_paths=[
+                str(in_dir / "rec_a.bin"),
+                str(in_dir / "rec_b.bin"),
+                str(in_dir / "sorting_config.json"),
+            ],
+            run_id="run-1",
+            output_dir=str(tmp_path / "out"),
+            output_format="sorting",
+            recording_files=["rec_b.bin", "rec_a.bin", "rec_a.bin"],
+        )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+        assert manifest["recording_files"] == ["rec_a.bin", "rec_b.bin"]
+
+    def test_sorting_bundle_requires_recording_files(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``output_format='sorting'`` without
+                ``recording_files=`` raises ValueError naming the
+                missing parameter.
+        """
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "rec.bin").write_bytes(b"x")
+
+        with pytest.raises(ValueError, match="recording_files"):
+            package_analysis_bundle(
+                input_paths=[str(in_dir / "rec.bin")],
+                run_id="run-1",
+                output_dir=str(tmp_path / "out"),
+                output_format="sorting",
+            )
+
+    def test_workspace_bundle_omits_recording_files_when_unspecified(self, tmp_path):
+        """
+        Tests:
+            (Test Case 1) ``output_format='workspace'`` without
+                ``recording_files=`` produces a manifest without the
+                ``recording_files`` key.
+        """
+        import json
+        import zipfile
+
+        from spikelab.batch_jobs.artifact_packager import package_analysis_bundle
+
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "data.pkl").write_bytes(b"x")
+
+        zip_path = package_analysis_bundle(
+            input_paths=[str(in_dir / "data.pkl")],
+            run_id="run-1",
+            output_dir=str(tmp_path / "out"),
+            output_format="workspace",
+        )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            manifest_name = next(
+                n for n in zf.namelist() if n.endswith("manifest.json")
+            )
+            manifest = json.loads(zf.read(manifest_name).decode("utf-8"))
+        assert "recording_files" not in manifest
 
 
 class TestPackageAnalysisBundleManifestCollision:

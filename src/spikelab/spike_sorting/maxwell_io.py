@@ -22,10 +22,13 @@ transparently.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 
 def list_maxwell_wells(h5_path: Any) -> List[Tuple[str, str]]:
@@ -105,7 +108,7 @@ def load_maxwell_with_fallback(rec_path: Any, *, stream_id: Optional[str] = None
         # entirely. Any other ValueError is re-raised.
         if "do not have unique ids" not in str(exc):
             raise
-        print(
+        _logger.info(
             "MaxwellRecordingExtractor rejected the file (non-unique "
             "channel IDs in settings/mapping); falling back to "
             "spikelab.spike_sorting.maxwell_io.load_maxwell_native()."
@@ -118,26 +121,25 @@ def load_maxwell_with_fallback(rec_path: Any, *, stream_id: Optional[str] = None
     # loader already opened the file with h5py (which would have
     # errored out without the plugin) and only returns the routed
     # channels.
-    test_file = h5py.File(rec_path)
-    if "sig" not in test_file:  # Test if hdf5_plugin_path is needed
-        try:
-            test_file["/data_store/data0000/groups/routed/raw"][0, 0]
-        except OSError as exception:
-            test_file.close()
-            print("*" * 10)
-            print("""This MaxWell Biosystems file format is based on HDF5.
-The internal compression requires a custom plugin.
-Please visit this page and install the missing decompression libraries:
-https://share.mxwbio.com/d/4742248b2e674a85be97/
-
-Setup options (choose one):
-    1. Pass hdf5_plugin_path='/path/to/plugin/' to sort_with_kilosort2().
-    2. Set os.environ['HDF5_PLUGIN_PATH'] BEFORE importing this module.
-    3. Follow the Maxwell instructions at the link above.
-""")
-            print("*" * 10)
-            raise exception
-    test_file.close()
+    with h5py.File(rec_path, "r") as test_file:
+        if "sig" not in test_file:  # Test if hdf5_plugin_path is needed
+            try:
+                test_file["/data_store/data0000/groups/routed/raw"][0, 0]
+            except OSError as exception:
+                _logger.error("*" * 10)
+                _logger.error(
+                    "This MaxWell Biosystems file format is based on HDF5.\n"
+                    "The internal compression requires a custom plugin.\n"
+                    "Please visit this page and install the missing decompression libraries:\n"
+                    "https://share.mxwbio.com/d/4742248b2e674a85be97/\n"
+                    "\n"
+                    "Setup options (choose one):\n"
+                    "    1. Pass hdf5_plugin_path='/path/to/plugin/' to sort_with_kilosort2().\n"
+                    "    2. Set os.environ['HDF5_PLUGIN_PATH'] BEFORE importing this module.\n"
+                    "    3. Follow the Maxwell instructions at the link above.\n"
+                )
+                _logger.error("*" * 10)
+                raise exception
     # Reconcile declared vs. routed channels. MaxOne recordings report
     # 1024 readout channels but get_traces() returns the full 1024-wide
     # array regardless of routing; slicing by the extractor's own

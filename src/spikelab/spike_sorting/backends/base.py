@@ -12,11 +12,14 @@ To add a new sorter:
 3. Register the backend in ``backends/__init__.py``.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
 
 from ..config import SortingPipelineConfig
+
+_logger = logging.getLogger(__name__)
 
 
 class SorterBackend(ABC):
@@ -241,9 +244,21 @@ class SorterBackend(ABC):
         try:
             n_samples = float(recording.get_num_samples())
             fs_hz = float(recording.get_sampling_frequency())
-        except Exception:
+        except Exception as exc:
+            _logger.info(
+                "inactivity watchdog disabled: could not read recording "
+                "duration metadata (%r). The sort will proceed without "
+                "a recording-aware sorter inactivity timeout.",
+                exc,
+            )
             return None
         if fs_hz <= 0.0:
+            _logger.info(
+                "inactivity watchdog disabled: recording reports "
+                "fs_Hz=%r (<= 0). The sort will proceed without a "
+                "recording-aware sorter inactivity timeout.",
+                fs_hz,
+            )
             return None
         duration_min = n_samples / fs_hz / 60.0
 

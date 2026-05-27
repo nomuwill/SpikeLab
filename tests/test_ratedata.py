@@ -50,6 +50,25 @@ def make_ratedata(n_units=3, n_times=100, step=1.0, t0=0.0, seed=0):
     return RateData(data, times)
 
 
+class TestRateDataRepr:
+    """``RateData.__repr__`` surfaces ``rate_unit`` so operators can
+    tell a Hz-scaled RateData from a count-scaled one at a glance.
+    """
+
+    def test_repr_contains_rate_unit(self):
+        """
+        Tests:
+            (Test Case 1) Repr of a RateData with ``rate_unit="Hz"``
+                contains the substring ``"rate_unit='Hz'"``.
+        """
+        rd = RateData(
+            np.ones((2, 4), dtype=float),
+            np.array([0.0, 1.0, 2.0, 3.0]),
+            rate_unit="Hz",
+        )
+        assert "rate_unit='Hz'" in repr(rd)
+
+
 class TestRateDataConstructor:
     """Tests for the RateData constructor."""
 
@@ -293,6 +312,33 @@ class TestRateDataSubset:
         np.testing.assert_array_equal(dedup.inst_Frate_data[0], rd.inst_Frate_data[2])
         np.testing.assert_array_equal(dedup.inst_Frate_data[1], rd.inst_Frate_data[0])
         np.testing.assert_array_equal(dedup.inst_Frate_data[2], rd.inst_Frate_data[1])
+
+    def test_subset_preserve_order_with_by_warns(self):
+        """
+        ``subset(by=..., preserve_order=True)`` emits a UserWarning
+        because ``preserve_order`` has no effect under the
+        ``by``-attribute path.
+
+        Tests:
+            (Test Case 1) A UserWarning naming ``preserve_order`` and
+                ``by`` is emitted.
+            (Test Case 2) The resulting subset still succeeds.
+        """
+        import warnings as _warnings
+
+        rd = make_ratedata(n_units=3, n_times=20, step=1.0)
+        rd.neuron_attributes = [
+            {"region": "MO"},
+            {"region": "VIS"},
+            {"region": "MO"},
+        ]
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            sub = rd.subset(["MO"], by="region", preserve_order=True)
+
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
+        assert any("preserve_order" in m and "by" in m for m in warn_msgs), warn_msgs
+        assert sub.N == 2
 
     def test_subset_by_attribute(self):
         """
@@ -828,18 +874,21 @@ class TestRateDataSubtimeByIndex:
         with pytest.raises(ValueError):
             rd.subtime_by_index(10, 10)
 
-    def test_subtime_by_index_zero_column(self):
+    def test_subtime_by_index_zero_column_raises_empty_times_error(self):
         """
-        subtime_by_index on zero-column RateData raises ValueError.
+        ``subtime_by_index`` on a zero-column RateData raises a
+        ValueError whose message mentions "empty times array" — the
+        same diagnostic as ``subtime`` so MCP callers see consistent
+        wording regardless of which path they hit.
 
         Tests:
-            (Test Case 1) (U, 0) shape means len(times)=0, so any start_idx
-                is out of range.
+            (Test Case 1) Empty ``times`` array raises ValueError with
+                "empty times array" in the message.
         """
         data = np.empty((2, 0))
         times = np.array([])
         rd = RateData(data, times)
-        with pytest.raises(ValueError, match="start_idx .* out of range"):
+        with pytest.raises(ValueError, match="empty times array"):
             rd.subtime_by_index(0, 1)
 
     def test_subtime_by_index_both_negative(self):
@@ -860,6 +909,58 @@ class TestRateDataSubtimeByIndex:
             result.inst_Frate_data, rd.inst_Frate_data[:, 5:8]
         )
         assert float(result.times[0]) == pytest.approx(5.0)  # index 5, step=1.0
+
+
+class TestRateDataFramesULPBoundaryFrameCount:
+    """``RateData.frames`` counts frames via
+    ``int(np.floor(slot_span / step)) + 1`` rather than
+    ``np.arange(t0, end - length + 1e-9, step)``. The previous
+    epsilon-pad form could emit a window whose end fell ULPs past
+    the last time bin, then ``_validate_time_start_to_end`` rejected
+    the frame.
+    """
+
+    def test_exact_integer_multiple_succeeds_with_expected_frame_count(self):
+        """
+        Tests:
+            (Test Case 1) ``frames(length=20)`` on uniform 1 ms times
+                ``[0..99]`` produces exactly 5 frames (no ULP
+                overshoot, no rejection).
+            (Test Case 2) Each frame spans exactly ``length`` ms.
+        """
+        rd = make_ratedata(n_units=3, n_times=100, step=1.0)
+        stack = rd.frames(20)
+        assert len(stack.times) == 5
+        for start, end in stack.times:
+            assert end - start == pytest.approx(20.0)
+
+
+class TestRateDataFramesStepSizeFromMedianDiff:
+    """``RateData.frames`` infers the bin ``step_size`` from
+    ``np.median(np.diff(times))`` rather than ``times[1] - times[0]``,
+    so the uniformity-check error message reports the median rather
+    than mis-attributing a bad step to the first pair.
+    """
+
+    def test_non_uniform_grid_error_reports_median_step(self):
+        """
+        Tests:
+            (Test Case 1) On a non-uniform grid, the uniformity-check
+                ValueError surfaces ``median step``, ``min step``, and
+                ``max step`` — confirming median is the inferred
+                ``step_size`` used downstream.
+        """
+        # Uniform 1 ms grid except one 4 ms gap; this fails the
+        # allclose uniformity check (correctly), but the error message
+        # must surface the median step inference.
+        times = np.array([0.0, 1.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        rates = np.ones((3, len(times)), dtype=float)
+        rd = RateData(rates, times)
+        with pytest.raises(ValueError) as excinfo:
+            rd.frames(2.0)
+        msg = str(excinfo.value)
+        assert "median step" in msg
+        assert "uniformly-spaced" in msg
 
 
 class TestRateDataFrames:

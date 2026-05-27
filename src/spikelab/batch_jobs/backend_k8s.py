@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +17,8 @@ except ImportError:  # pragma: no cover
     client = None
     config = None
     watch = None
+
+_logger = logging.getLogger(__name__)
 
 
 class KubernetesBatchJobBackend:
@@ -37,7 +41,21 @@ class KubernetesBatchJobBackend:
                 self._batch_api = client.BatchV1Api()
                 self._core_api = client.CoreV1Api()
             except config.ConfigException:
-                pass  # No valid kubeconfig — fall back to kubectl
+                # No valid kubeconfig — fall back to kubectl silently.
+                pass
+            except Exception as exc:
+                # ``client.BatchV1Api()`` / ``client.CoreV1Api()`` can
+                # raise non-``ConfigException`` errors during async API
+                # discovery (network blip, urllib3 quirks, version
+                # mismatch). Without this branch the partially-initialised
+                # state (``_batch_api=None``) escaped silently and the
+                # caller saw an unhelpful traceback from a later
+                # ``self._batch_api.create_namespaced_job`` call.
+                _logger.debug(
+                    "KubernetesBatchJobBackend: client initialisation "
+                    "failed (%r); falling back to kubectl.",
+                    exc,
+                )
 
     def _run_kubectl(self, args: List[str]) -> str:
         command = ["kubectl"]
@@ -122,20 +140,24 @@ class KubernetesBatchJobBackend:
                     ["apply", "-f", str(path), "-n", self.namespace]
                 )
                 return fallback_job_name or stdout
-            temp_path = None
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".yaml", encoding="utf-8", delete=False
-            ) as f:
-                f.write(manifest_path_or_str)
-                temp_path = f.name
+            # ``mkstemp`` is used in place of ``NamedTemporaryFile +
+            # try/finally`` so the path is known BEFORE the write — the
+            # previous pattern initialised ``temp_path = None`` and
+            # assigned only after ``f.name`` was created; if the write
+            # raised before that assignment, ``finally`` would see
+            # ``temp_path is None`` and silently skip cleanup. The
+            # current form guarantees the cleanup branch knows the
+            # path even when ``os.write`` itself raises.
+            fd, temp_path = tempfile.mkstemp(suffix=".yaml")
             try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(manifest_path_or_str)
                 stdout = self._run_kubectl(
                     ["apply", "-f", temp_path, "-n", self.namespace]
                 )
                 return fallback_job_name or stdout
             finally:
-                if temp_path:
-                    Path(temp_path).unlink(missing_ok=True)
+                Path(temp_path).unlink(missing_ok=True)
 
         # Python-client path: parse strictly. ``create_namespaced_job``
         # requires a structured payload with metadata.name, so we raise

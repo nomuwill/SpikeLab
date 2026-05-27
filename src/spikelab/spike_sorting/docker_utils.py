@@ -6,9 +6,13 @@ that Docker-based sorting works across different GPU architectures
 without manual image selection.
 """
 
+import logging
 import subprocess
+import sys
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # CUDA driver → maximum supported toolkit version mapping
@@ -327,7 +331,7 @@ def _try_register_container_kill(client: Any) -> None:
             try:
                 c.stop(timeout=2)
             except Exception as exc:
-                print(f"[container kill] container.stop() failed: {exc!r}")
+                _logger.warning(f"[container kill] container.stop() failed: {exc!r}")
             try:
                 # ``stop`` should have done it; ``kill`` is the
                 # belt-and-braces path for hung containers that
@@ -368,7 +372,7 @@ def _try_register_container_kill(client: Any) -> None:
             try:
                 inactivity_wd.__enter__()
             except Exception as exc:
-                print(
+                _logger.warning(
                     f"[container kill] failed to start container "
                     f"inactivity watchdog: {exc!r}"
                 )
@@ -381,7 +385,7 @@ def _try_register_container_kill(client: Any) -> None:
                     inactivity_wd,
                 )
     except Exception as exc:
-        print(
+        _logger.warning(
             f"[container kill] failed to register kill hooks: {exc!r}; "
             "container will rely on Docker's mem_limit and SI's teardown only."
         )
@@ -399,4 +403,14 @@ def _safe_exit_inactivity_watchdog(watchdog: Any) -> None:
     try:
         watchdog.__exit__(None, None, None)
     except Exception as exc:
-        print(f"[container kill] inactivity watchdog __exit__ failed: {exc!r}")
+        # ``__stderr__`` not ``stderr``: finalizers may run during
+        # interpreter shutdown when ``sys.stderr`` has been swapped
+        # for a closed stream, while ``sys.__stderr__`` retains the
+        # original handle.
+        try:
+            print(
+                f"[container kill] inactivity watchdog __exit__ failed: {exc!r}",
+                file=sys.__stderr__,
+            )
+        except Exception:
+            pass

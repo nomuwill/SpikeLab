@@ -477,10 +477,23 @@ def _validate_recording_inputs(
     findings: List[PreflightFinding] = []
     for i, entry in enumerate(recording_files):
         if entry is None:
-            raise ValueError(
-                f"recording_inputs[{i}] is None (caller bug — pass a path, "
-                f"BaseRecording, or omit the entry)"
+            findings.append(
+                PreflightFinding(
+                    level="fail",
+                    code="recording_input_none",
+                    category="environment",
+                    message=(
+                        f"recording_inputs[{i}] is None — expected a path "
+                        "or BaseRecording."
+                    ),
+                    remediation=(
+                        "Drop the None entry from recording_inputs, or "
+                        "pass a path / pre-loaded BaseRecording in its "
+                        "place."
+                    ),
+                )
             )
+            continue
         rec = entry
         if not isinstance(rec, (str, Path)):
             # Pre-loaded recording object — skip.
@@ -805,7 +818,7 @@ def _ping_docker_daemon() -> Tuple[bool, Optional[PreflightFinding]]:
         subprocess.run(
             ["docker", "info"],
             check=True,
-            timeout=5,
+            timeout=30,
             capture_output=True,
         )
         return True, None
@@ -841,7 +854,15 @@ def _check_image_cached(image_tag: str) -> bool:
         import docker as _docker  # type: ignore[import-not-found]
 
         try:
-            _docker.from_env().images.get(image_tag)
+            # ``timeout=5`` caps the underlying HTTP client's wait so
+            # a half-frozen Docker daemon (Desktop hung, snap-installed
+            # daemon stuck) cannot block preflight indefinitely. Older
+            # docker-py versions that don't accept the ``timeout``
+            # kwarg raise ``TypeError`` here — caught by the broad
+            # ``except Exception`` below, which returns False; the
+            # caller treats "uncertain → assume not cached → pull" as
+            # the conservative answer.
+            _docker.from_env(timeout=5).images.get(image_tag)
             return True
         except Exception:
             return False

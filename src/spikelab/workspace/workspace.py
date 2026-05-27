@@ -60,7 +60,12 @@ def _make_summary(obj: Any) -> dict:
         return {"type": "ndarray", "shape": list(obj.shape), "dtype": str(obj.dtype)}
 
     if SpikeData is not None and isinstance(obj, SpikeData):
-        return {"type": "SpikeData", "N": obj.N, "length_ms": obj.length}
+        return {
+            "type": "SpikeData",
+            "N": obj.N,
+            "length_ms": obj.length,
+            "start_time": obj.start_time,
+        }
 
     if RateData is not None and isinstance(obj, RateData):
         return {"type": "RateData", "shape": list(obj.inst_Frate_data.shape)}
@@ -69,9 +74,20 @@ def _make_summary(obj: Any) -> dict:
         return {"type": "RateSliceStack", "shape": list(obj.event_stack.shape)}
 
     if SpikeSliceStack is not None and isinstance(obj, SpikeSliceStack):
-        length_ms = (
-            float(obj.times[0][1] - obj.times[0][0]) if len(obj.times) > 0 else None
-        )
+        # Report the per-slice length range so heterogeneous-duration
+        # stacks (allowed by the time_peaks + time_bounds constructor)
+        # are visible from ``describe()`` rather than misrepresented
+        # by the first slice. For uniform-duration stacks the min/max
+        # collapse to a single value.
+        if len(obj.times) > 0:
+            durations = [float(t1 - t0) for (t0, t1) in obj.times]
+            length_ms = (
+                durations[0]
+                if min(durations) == max(durations)
+                else (min(durations), max(durations))
+            )
+        else:
+            length_ms = None
         n_units = obj.spike_stack[0].N if len(obj.spike_stack) > 0 else 0
         return {
             "type": "SpikeSliceStack",
@@ -513,8 +529,13 @@ class LazyAnalysisWorkspace(AnalysisWorkspace):
     @property
     def _items(self):
         raise NotImplementedError(
-            "LazyAnalysisWorkspace does not use _items. "
-            "Override the parent method to use _index and the HDF5 file instead."
+            "LazyAnalysisWorkspace does not expose ``_items``; objects "
+            "are deserialised from the temp HDF5 file on each ``get()`` "
+            "call. Use ``list_namespaces()`` / ``list_keys(namespace)`` "
+            "/ ``get(namespace, key)`` instead. (Note: ``dump_workspace`` "
+            "iterates ``ws._items.items()`` and therefore cannot be "
+            "called on a LazyAnalysisWorkspace — use ``save(path)`` "
+            "which copies the temp file directly.)"
         )
 
     @_items.setter
@@ -786,11 +807,24 @@ class LazyAnalysisWorkspace(AnalysisWorkspace):
         self._index = {}
 
     def __del__(self) -> None:
-        # Best-effort fallback; explicit ``close()`` is preferred.
+        # Best-effort fallback; explicit ``close()`` is preferred. Log
+        # the failure rather than swallowing it so a bug in temp-file
+        # cleanup (read-only filesystem, open handle on Windows) leaves
+        # a trace in the audit log rather than vanishing silently.
         try:
             self.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                import sys
+
+                print(
+                    f"[LazyAnalysisWorkspace.__del__] cleanup failed: {exc!r}",
+                    file=sys.__stderr__,
+                )
+            except Exception:
+                # ``sys`` may already be torn down during interpreter
+                # shutdown — give up silently in that case.
+                pass
 
     def __repr__(self) -> str:
         ns_count = len(self._index)
@@ -926,10 +960,22 @@ class WorkspaceManager:
 
         Notes:
             - If a workspace with the same ID is already registered, it
-              will be overwritten by the loaded version.
+              will be overwritten by the loaded version. A UserWarning
+              is emitted so callers do not silently lose in-memory
+              mutations when they reload a saved snapshot of the same
+              workspace.
         """
         ws = AnalysisWorkspace.load(path)
         with self._lock:
+            if ws.workspace_id in self._workspaces:
+                warnings.warn(
+                    f"load_workspace: workspace_id={ws.workspace_id!r} is "
+                    "already registered; the in-memory workspace will be "
+                    "overwritten by the loaded version. Any pending "
+                    "mutations on the in-memory instance are lost.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             self._workspaces[ws.workspace_id] = ws
         return ws.workspace_id
 

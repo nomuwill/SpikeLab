@@ -339,13 +339,29 @@ _KS4_SVD_EMPTY_RE = re.compile(
     re.DOTALL,
 )
 _KS4_KMEANS_RE = re.compile(r"n_samples=(\d+)\s+should be\s+>=\s+n_clusters=(\d+)")
+#: Permissive fallback regex for the sklearn KMeans "not enough
+#: samples" diagnostic. The strict ``_KS4_KMEANS_RE`` pins sklearn's
+#: pre-1.5 phrasing ("should be >="); newer sklearn versions have
+#: reworded the message (e.g. "should be greater than or equal to").
+#: This fallback matches any ``n_samples=N`` / ``n_clusters=M`` pair
+#: in the same message regardless of the connective text, capturing
+#: both integers so the downstream classification branch still
+#: fires.
+_KS4_KMEANS_FALLBACK_RE = re.compile(
+    r"n_samples=(\d+).{0,200}?n_clusters=(\d+)", re.DOTALL
+)
 
 
 def _classify_insufficient_activity_ks4(
     chain_text: str, log_path: Optional[Path], exc: BaseException
 ) -> Optional[InsufficientActivityError]:
     svd_match = _KS4_SVD_EMPTY_RE.search(chain_text)
-    kmeans_match = _KS4_KMEANS_RE.search(chain_text)
+    # Try the strict regex first; fall back to the permissive variant
+    # so a sklearn release that re-words the message doesn't silently
+    # break this classification branch.
+    kmeans_match = _KS4_KMEANS_RE.search(chain_text) or _KS4_KMEANS_FALLBACK_RE.search(
+        chain_text
+    )
     if svd_match is None and kmeans_match is None:
         return None
 

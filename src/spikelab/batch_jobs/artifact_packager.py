@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal
+from typing import Dict, Iterable, List, Literal, Optional
 
 SupportedFormat = Literal["workspace", "sorting", "custom"]
 
@@ -19,10 +19,17 @@ SupportedFormat = Literal["workspace", "sorting", "custom"]
 _RESERVED_BUNDLE_FILENAMES = frozenset({"manifest.json"})
 
 
+_SHA256_CHUNK_BYTES = 1 << 20  # 1 MiB
+
+
 def _sha256(path: Path) -> str:
+    # 1 MiB chunks instead of 8 KiB. Modern disks deliver hundreds of
+    # MB/s; at 8 KiB the read syscall overhead dominated. 1 MiB keeps
+    # the working set within L2 cache while amortising the syscall
+    # rate to a small fraction of total wall time.
     digest = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(_SHA256_CHUNK_BYTES), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -76,10 +83,39 @@ def package_analysis_bundle(
     output_dir: str,
     output_format: SupportedFormat,
     metadata: Dict[str, object] | None = None,
+    recording_files: Optional[Iterable[str]] = None,
 ) -> str:
-    """Create a run zip bundle and return its absolute path."""
+    """Create a run zip bundle and return its absolute path.
+
+    Parameters:
+        input_paths (Iterable[str]): Paths to copy into the bundle.
+        run_id (str): RFC-1123-style identifier for the bundle.
+        output_dir (str): Directory the zip is written into.
+        output_format (str): One of ``"workspace"``, ``"sorting"``,
+            ``"custom"``. Controls which entrypoint the container
+            will dispatch to.
+        metadata (dict, optional): Arbitrary JSON-serialisable
+            metadata included in the manifest.
+        recording_files (Iterable[str], optional): When
+            ``output_format='sorting'``, the basenames of the input
+            files that the pod-side entrypoint should treat as
+            recordings. Tier L-C2: replaces the name-blacklist
+            heuristic in ``entrypoints/sorting.main`` with a
+            declared whitelist. Ignored for ``"workspace"`` and
+            ``"custom"`` formats. Required for ``"sorting"`` —
+            omitting it raises ``ValueError``.
+    """
     if output_format not in {"workspace", "sorting", "custom"}:
         raise ValueError("output_format must be one of: workspace, sorting, custom")
+    if output_format == "sorting" and recording_files is None:
+        raise ValueError(
+            "package_analysis_bundle: recording_files must be provided "
+            "when output_format='sorting'. The sorting entrypoint reads "
+            "the declared recording list from manifest.json so it can "
+            "distinguish recordings from companion files (probe sidecars, "
+            "metadata.csv, etc.) without guessing. Pass the basenames of "
+            "the recording inputs explicitly."
+        )
 
     # Path-traversal guard: ``run_id`` flows directly into ``bundle_dir``
     # and the output zip filename. A run_id like ``"../etc/passwd"`` would
@@ -95,6 +131,22 @@ def package_analysis_bundle(
 
     output_base = Path(output_dir).resolve()
     output_base.mkdir(parents=True, exist_ok=True)
+
+    # Pre-validate that metadata is JSON-serializable. Without this
+    # guard we'd hash every input, copy every file, then crash on
+    # ``json.dumps`` at the very end — wasting the I/O. Catch it
+    # before any work happens.
+    if metadata is not None:
+        try:
+            json.dumps(metadata)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"metadata is not JSON-serializable: {exc}. The bundle "
+                "manifest is written via ``json.dumps``; convert any "
+                "non-serializable values (Path, datetime, ndarray, etc.) "
+                "to plain JSON types before passing to "
+                "package_analysis_bundle."
+            ) from exc
 
     # Reject duplicate basenames upfront. Two input paths with the
     # same filename (e.g. ``/dir_a/rec.bin`` and ``/dir_b/rec.bin``)
@@ -139,7 +191,11 @@ def package_analysis_bundle(
                 {
                     "name": dest.name,
                     "sha256": _sha256(dest),
-                    "size_bytes": str(dest.stat().st_size),
+                    # size_bytes was previously stringified, which made
+                    # the manifest awkward to consume (downstream
+                    # readers had to ``int(entry["size_bytes"])`` every
+                    # time). Store as int for natural JSON typing.
+                    "size_bytes": int(dest.stat().st_size),
                 }
             )
 
@@ -149,6 +205,11 @@ def package_analysis_bundle(
             "files": payload_files,
             "metadata": metadata or {},
         }
+        if recording_files is not None:
+            # Declared whitelist consumed by entrypoints/sorting.main.
+            # Names are basenames (the bundle layout is flat under
+            # ``bundle_dir``), matching the keys in ``payload_files``.
+            manifest["recording_files"] = sorted(set(recording_files))
         (bundle_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )

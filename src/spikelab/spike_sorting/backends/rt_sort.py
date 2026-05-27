@@ -19,14 +19,17 @@ Requirements:
     # see https://pytorch.org/get-started/locally/
 """
 
+import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 
 from ..config import SortingPipelineConfig, WaveformConfig
 from ..sorting_utils import _check_unit_id_density
 from .base import SorterBackend
+
+_logger = logging.getLogger(__name__)
 
 
 def _numpy_sorting_to_ks_extractor(
@@ -166,8 +169,19 @@ class RTSortBackend(SorterBackend):
         self._check_dependencies()
 
     def _check_dependencies(self) -> None:
-        """Raise a clear ImportError listing any missing RT-Sort deps."""
+        """Raise a clear ImportError listing any missing RT-Sort deps.
+
+        Distinguishes ImportError (package missing) from other
+        exception types (package present but broken — e.g. ABI
+        mismatch, partially-installed wheel, native library missing).
+        Pre-Tier-L the blanket ``except ImportError`` collapsed both
+        into "missing", which sent operators down the wrong
+        troubleshooting path when the real problem was a broken
+        install. Non-ImportError failures now report the underlying
+        exception message.
+        """
         missing = []
+        broken: List[str] = []
         for name, pkg in [
             ("torch", "torch"),
             ("diptest", "diptest"),
@@ -180,11 +194,18 @@ class RTSortBackend(SorterBackend):
                 __import__(name)
             except ImportError:
                 missing.append(pkg)
-        if missing:
+            except Exception as exc:
+                broken.append(f"{pkg} (import raised {type(exc).__name__}: {exc})")
+        if missing or broken:
+            parts = []
+            if missing:
+                parts.append("missing: " + ", ".join(missing))
+            if broken:
+                parts.append("present-but-broken: " + "; ".join(broken))
             raise ImportError(
-                "RT-Sort backend requires the following packages "
-                f"which are not installed: {', '.join(missing)}. "
-                "For PyTorch, install a CUDA-matching wheel from "
+                "RT-Sort backend dependency check failed — "
+                + " | ".join(parts)
+                + ". For PyTorch, install a CUDA-matching wheel from "
                 "https://pytorch.org/get-started/locally/"
             )
 
@@ -228,6 +249,14 @@ class RTSortBackend(SorterBackend):
             recording, sorter="rt_sort"
         )
 
+        # Tier L-E3: compute the persistent rt_sort.pickle path at
+        # the backend level rather than letting the runner infer it
+        # via ``output_folder.parent.parent``. The pickle lives in
+        # the recording's results dir (parent of inter_path); pass
+        # it explicitly so a caller that uses a non-canonical folder
+        # structure doesn't silently write to the wrong location.
+        rt_sort_pickle_path = Path(output_folder).parent.parent / "rt_sort.pickle"
+
         def _do_sort():
             return spike_sort(
                 rec_cache=recording,
@@ -235,6 +264,7 @@ class RTSortBackend(SorterBackend):
                 recording_dat_path=recording_dat_path,
                 output_folder=output_folder,
                 config=self.config,
+                rt_sort_pickle_path=rt_sort_pickle_path,
             )
 
         if watchdog is None:
@@ -306,11 +336,12 @@ class RTSortBackend(SorterBackend):
             try:
                 import os
 
-                current = max(1, round(os.cpu_count() * 2 / 3))
+                cpu_count = os.cpu_count() or 1
+                current = max(1, round(cpu_count * 2 / 3))
             except Exception:
                 current = 4
         if current <= 1:
-            print(
+            _logger.info(
                 "[oom retry] rt_sort: num_processes already at 1 — "
                 "no further scaling possible."
             )
@@ -319,7 +350,7 @@ class RTSortBackend(SorterBackend):
         if new_n >= current:
             return False
         rt.num_processes = new_n
-        print(
+        _logger.info(
             f"[oom retry] rt_sort: scaled num_processes {current} -> "
             f"{new_n} (factor={factor})."
         )

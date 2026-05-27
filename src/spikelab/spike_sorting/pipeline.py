@@ -10,12 +10,16 @@ handled by the ``SorterBackend`` subclass passed to
 ``process_recording``.
 """
 
+import hashlib
 import json
+import logging
 import os
 import pickle
+import re
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import shutil
@@ -34,6 +38,8 @@ from .sorting_utils import (
     delete_folder,
     get_paths,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Display names for the source_format metadata field.
 _SORTER_DISPLAY_NAMES = {
@@ -94,8 +100,17 @@ def _get_noise_levels(
             start_frame=0, end_frame=length, return_scaled=return_scaled
         )
     else:
-        rng = np.random.RandomState(seed=seed)
-        starts = rng.randint(0, length - chunk_size, size=num_chunks)
+        # ``default_rng`` instead of the legacy ``RandomState`` so the
+        # noise estimate seeds with the same PCG64 stream as
+        # ``config.execution.random_seed`` callers elsewhere in
+        # pipeline.py (e.g. line ~1595). Bit-exact reproducibility
+        # vs. the prior Mersenne-Twister stream is broken — the change
+        # shifts which chunks are sampled, which shifts the MAD
+        # estimate by ~1e-6 µV (50k filtered samples per channel are
+        # statistically robust to chunk selection). Downstream sorters
+        # are not bit-exact reproducible to that precision anyway.
+        rng = np.random.default_rng(seed)
+        starts = rng.integers(0, length - chunk_size, size=num_chunks)
         chunks = []
         for s in starts:
             chunks.append(
@@ -294,6 +309,31 @@ def build_spikedata(
 # ---------------------------------------------------------------------------
 
 
+def _curation_cache_key(sd: Any, curate_kwargs: dict) -> str:
+    """Content fingerprint for the curate_spikedata cache.
+
+    Combines the source SpikeData's unit-id set with the resolved
+    ``curate_kwargs`` into a deterministic SHA256 string. The cache
+    files (``unit_ids.npy`` + ``curation_history.json``) are valid
+    only when this fingerprint matches — a re-sort that produces
+    different unit ids OR a config change that produces different
+    thresholds both flip the fingerprint, so the read-side falls
+    through to fresh curation rather than returning a stale result.
+    """
+    if sd.neuron_attributes is not None:
+        unit_ids = sorted(
+            int(sd.neuron_attributes[i].get("unit_id", i)) for i in range(sd.N)
+        )
+    else:
+        unit_ids = list(range(sd.N))
+    canonical = json.dumps(
+        {"unit_ids": unit_ids, "kwargs": curate_kwargs},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def curate_spikedata(
     sd: Any, curation_folder: Any, config: Any, recurate: bool = False
 ) -> Tuple[Any, dict]:
@@ -338,23 +378,39 @@ def curate_spikedata(
     unit_ids_path = curation_folder / "unit_ids.npy"
     history_path = curation_folder / "curation_history.json"
 
-    # Check cache
+    expected_cache_key = _curation_cache_key(sd, curate_kwargs)
+
+    # Check cache. A stale cache (source unit_ids changed since the
+    # cache was written, OR curate_kwargs changed) is silently
+    # invalidated by the fingerprint mismatch — fall through to fresh
+    # curation rather than return wrong results. Legacy caches written
+    # before the __cache_key__ field existed are treated as a miss for
+    # the same reason; recuration is cheap (it's thresholding on the
+    # already-loaded SpikeData, not re-running the sorter).
     if not recurate and unit_ids_path.exists() and history_path.exists():
-        cached_ids = set(int(x) for x in np.load(str(unit_ids_path)))
-        passing = [
-            i
-            for i in range(sd.N)
-            if sd.neuron_attributes is not None
-            and int(sd.neuron_attributes[i].get("unit_id", i)) in cached_ids
-        ]
-        sd_curated = sd.subset(passing)
-        with open(history_path, "r") as f:
-            history = json.load(f)
-        return sd_curated, history
+        try:
+            with open(history_path, "r") as f:
+                cached_history = json.load(f)
+        except (OSError, ValueError):
+            cached_history = None
+        if (
+            cached_history is not None
+            and cached_history.get("__cache_key__") == expected_cache_key
+        ):
+            cached_ids = set(int(x) for x in np.load(str(unit_ids_path)))
+            passing = [
+                i
+                for i in range(sd.N)
+                if sd.neuron_attributes is not None
+                and int(sd.neuron_attributes[i].get("unit_id", i)) in cached_ids
+            ]
+            sd_curated = sd.subset(passing)
+            return sd_curated, cached_history
 
     # Run curation
     sd_curated, results = sd.curate(**curate_kwargs)
     history = build_curation_history(sd, sd_curated, results, parameters=curate_kwargs)
+    history["__cache_key__"] = expected_cache_key
 
     # Save to disk
     curation_folder.mkdir(parents=True, exist_ok=True)
@@ -471,7 +527,7 @@ class Compiler:
         fig_fs_Hz = None
 
         for rec_name, sd, curation_history, include_failed_units in self.recs_cache:
-            print(f"Adding recording: {rec_name}")
+            _logger.info(f"Adding recording: {rec_name}")
 
             fs_Hz = sd.metadata.get("fs_Hz", 30000.0)
             rec_metadata[rec_name] = {
@@ -536,16 +592,25 @@ class Compiler:
         neg_units.sort(key=lambda x: float(x[0].get("amplitude", 0)), reverse=True)
         pos_units.sort(key=lambda x: float(x[0].get("amplitude", 0)), reverse=True)
 
+        # Build a per-recording compile_dict. Each recording gets its
+        # own ``units`` list / ``locations`` / ``fs`` so multi-recording
+        # sorts produce a non-empty output (the previous code left
+        # compile_dict=None on multi-recording requests, silently
+        # dropping the user's compile_to_mat/compile_to_npz flag).
+        # For single-recording sorts the on-disk layout is unchanged
+        # (one ``sorted.{mat,npz}`` with the legacy top-level layout);
+        # multi-recording sorts write one file per recording named
+        # after the (sanitised) rec_name.
         compile_dict = None
         if self.compile_to_mat or self.compile_to_npz:
-            if len(rec_metadata) == 1:
-                rec = list(rec_metadata.keys())[0]
-                meta = rec_metadata[rec]
-                compile_dict = {
+            compile_dict = {
+                rec_name: {
                     "units": [],
                     "locations": meta["locations"],
                     "fs": meta["fs"],
                 }
+                for rec_name, meta in rec_metadata.items()
+            }
 
         if comp.compile_waveforms:
             create_folder(folder / "negative_peaks")
@@ -562,7 +627,7 @@ class Compiler:
             ("positive", pos_units),
         ]:
             has_pos = group_label == "positive"
-            print(
+            _logger.info(
                 f"\nIterating through {len(units_group)} units with "
                 f"{group_label} peaks"
             )
@@ -595,24 +660,41 @@ class Compiler:
                             }
                         if self.save_electrodes:
                             unit_dict["electrode"] = attrs.get("electrode")
-                        compile_dict["units"].append(unit_dict)
+                        compile_dict[rec_name]["units"].append(unit_dict)
 
                     if comp.compile_waveforms:
                         wf_path = attrs.get("_waveforms_path")
                         wf_window = attrs.get("_waveforms_window")
                         if wf_path is not None:
-                            waveforms = np.load(wf_path, mmap_mode="r")
-                            if wf_window is not None:
-                                waveforms = waveforms[:, wf_window[0] : wf_window[1], :]
                             wf_folder = (
                                 folder / "positive_peaks"
                                 if has_pos
                                 else folder / "negative_peaks"
                             )
-                            np.save(
-                                wf_folder / f"waveforms_{sorted_index}.npy",
-                                np.array(waveforms),
-                            )
+                            dest = wf_folder / f"waveforms_{sorted_index}.npy"
+                            if wf_window is None:
+                                # No window slice → straight file copy
+                                # avoids materializing a multi-GB mmap
+                                # into RAM via ``np.array(waveforms)``.
+                                shutil.copyfile(wf_path, dest)
+                            else:
+                                # Windowed: write the sliced view in
+                                # chunks so we don't materialize the
+                                # full mmap. ``np.lib.format.open_memmap``
+                                # gives a memmap-backed sink we can
+                                # copy into per-spike.
+                                src = np.load(wf_path, mmap_mode="r")
+                                sliced = src[:, wf_window[0] : wf_window[1], :]
+                                sink = np.lib.format.open_memmap(
+                                    str(dest),
+                                    mode="w+",
+                                    dtype=sliced.dtype,
+                                    shape=sliced.shape,
+                                )
+                                chunk = max(1, 1024)
+                                for i in range(0, sliced.shape[0], chunk):
+                                    sink[i : i + chunk] = sliced[i : i + chunk]
+                                del sink, sliced, src
 
                     sorted_index += 1
 
@@ -623,18 +705,31 @@ class Compiler:
                     fig_has_pos_peak.append(has_pos)
 
         if compile_dict is not None:
-            if self.compile_to_mat and savemat is not None:
-                savemat(folder / "sorted.mat", compile_dict)
-                print("Compiled results to .mat")
-            if self.compile_to_npz:
-                np.savez(folder / "sorted.npz", **compile_dict)
-                print("Compiled results to .npz")
+            # Single-recording: keep the legacy ``sorted.{mat,npz}``
+            # filename so existing readers don't break.
+            # Multi-recording: write one file per recording named
+            # after the rec_name, sanitised for filesystem safety.
+            if len(compile_dict) == 1:
+                only_rec = next(iter(compile_dict))
+                outputs = {"sorted": compile_dict[only_rec]}
+            else:
+                outputs = {
+                    re.sub(r"[^A-Za-z0-9._-]", "_", rec_name): per_rec
+                    for rec_name, per_rec in compile_dict.items()
+                }
+            for out_stem, per_rec_dict in outputs.items():
+                if self.compile_to_mat and savemat is not None:
+                    savemat(folder / f"{out_stem}.mat", per_rec_dict)
+                    _logger.info(f"Compiled results to {out_stem}.mat")
+                if self.compile_to_npz:
+                    np.savez(folder / f"{out_stem}.npz", **per_rec_dict)
+                    _logger.info(f"Compiled results to {out_stem}.npz")
 
         if self.create_figures:
             from .figures import plot_curation_bar, plot_std_scatter, plot_templates
 
             figures_path = folder / "figures"
-            print("\nSaving figures")
+            _logger.info("\nSaving figures")
             create_folder(figures_path)
 
             plot_curation_bar(
@@ -648,7 +743,7 @@ class Compiler:
                 label_rotation=fig.bar_label_rotation,
                 save_path=str(figures_path / "curation_bar_plot.png"),
             )
-            print("Curation bar plot has been saved")
+            _logger.info("Curation bar plot has been saved")
 
             if self.create_std_scatter_plot and scatter_n_spikes:
                 plot_std_scatter(
@@ -664,7 +759,7 @@ class Compiler:
                     y_max_buffer=fig.scatter_y_max_buffer,
                     save_path=str(figures_path / "std_scatter_plot.png"),
                 )
-                print("Std scatter plot has been saved")
+                _logger.info("Std scatter plot has been saved")
 
             if fig_templates and fig_fs_Hz is not None:
                 plot_templates(
@@ -685,7 +780,7 @@ class Compiler:
                     x_label=fig.templates_x_label,
                     save_path=str(figures_path / "all_templates_plot.png"),
                 )
-                print("All templates plot has been saved")
+                _logger.info("All templates plot has been saved")
 
 
 # ---------------------------------------------------------------------------
@@ -748,8 +843,8 @@ def process_recording(
     try:
         sort_lock_cm.__enter__()
     except ConcurrentSortError as exc:
-        print(f"Concurrent sort detected: {exc}")
-        print("Moving on to next recording")
+        _logger.info(f"Concurrent sort detected: {exc}")
+        _logger.info("Moving on to next recording")
         return exc
 
     try:
@@ -813,8 +908,8 @@ def _process_recording_body(
                 rec_path if rec_loaded is None else rec_loaded
             )
         except Exception as e:
-            print(f"Could not open the recording file because of {e}")
-            print("Moving on to next recording")
+            _logger.info(f"Could not open the recording file because of {e}")
+            _logger.info("Moving on to next recording")
             return e
 
         # Everything past this point is wrapped so that a failure in
@@ -870,7 +965,7 @@ def _process_recording_body(
             }
 
             if not config.figures.create_figures:
-                print("Skipping figure generation (create_figures=False)")
+                _logger.info("Skipping figure generation (create_figures=False)")
             else:
                 unit_figures_dir.mkdir(parents=True, exist_ok=True)
                 figures_dir.mkdir(parents=True, exist_ok=True)
@@ -914,7 +1009,9 @@ def _process_recording_body(
                         w_e_raw=w_e_raw,
                     )
                 elif not config.figures.create_unit_figures:
-                    print("Skipping per-unit figures (create_unit_figures=False)")
+                    _logger.info(
+                        "Skipping per-unit figures (create_unit_figures=False)"
+                    )
 
                 if _fig.get("generate_quality_distributions") is not None:
                     print_stage("GENERATING QUALITY DISTRIBUTIONS (ALL UNITS)")
@@ -935,7 +1032,7 @@ def _process_recording_body(
                         f"(recording has {len(epoch_sds)} epochs, 0-indexed)."
                     )
                 sd_for_curation = epoch_sds[cur.curation_epoch]
-                print(
+                _logger.info(
                     f"Curating based on epoch {cur.curation_epoch} "
                     f"({sd_for_curation.metadata.get('source_file', '')})"
                 )
@@ -969,7 +1066,7 @@ def _process_recording_body(
 
             n_before = sd.N
             n_after = sd_curated.N
-            print(
+            _logger.info(
                 f"Curation: {n_before} -> {n_after} units "
                 f"({n_before - n_after} removed)"
             )
@@ -998,7 +1095,7 @@ def _process_recording_body(
 
                 n_curated_figs = len(list(curated_dir.glob("*.png")))
                 n_failed_figs = len(list(failed_dir.glob("*.png")))
-                print(
+                _logger.info(
                     f"Per-unit figures sorted: {n_curated_figs} curated, "
                     f"{n_failed_figs} failed"
                 )
@@ -1028,7 +1125,7 @@ def _process_recording_body(
             )
 
             print_stage("DONE WITH RECORDING")
-            print(f"Recording: {rec_path}")
+            _logger.info(f"Recording: {rec_path}")
             stopwatch.log_time("Total")
 
             if comp.save_raw_pkl:
@@ -1045,7 +1142,7 @@ def _process_recording_body(
             wd = find_tripped_global_watchdog()
             if wd is not None:
                 err = wd.make_error()
-                print(f"Recording aborted by watchdog: {err}")
+                _logger.info(f"Recording aborted by watchdog: {err}")
                 return err
             raise
         except MemoryError as e:
@@ -1055,10 +1152,10 @@ def _process_recording_body(
             wd = find_tripped_global_watchdog()
             if wd is not None:
                 err = wd.make_error()
-                print(f"Recording aborted by watchdog: {err}")
+                _logger.info(f"Recording aborted by watchdog: {err}")
                 return err
-            print(f"Recording aborted due to MemoryError: {e!r}")
-            print("Moving on to next recording")
+            _logger.info(f"Recording aborted due to MemoryError: {e!r}")
+            _logger.info("Moving on to next recording")
             return e
         except Exception as e:
             # Misclassification guard: if a watchdog tripped but
@@ -1072,22 +1169,22 @@ def _process_recording_body(
             wd = find_tripped_global_watchdog()
             if wd is not None and wd.interrupt_delivery_failed():
                 err = wd.make_error()
-                print(
+                _logger.info(
                     f"Recording aborted by watchdog "
                     f"(interrupt_main failed; reclassified "
                     f"from {type(e).__name__}): {err}"
                 )
                 return err
-            print(f"Recording failed in post-sort pipeline: {e!r}")
-            # Print the full traceback so the originating call site is
+            _logger.info(f"Recording failed in post-sort pipeline: {e!r}")
+            # Log the full traceback so the originating call site is
             # diagnosable from the batch log. The previous handler only
             # printed ``repr(e)`` — for a deeply-nested failure (typical
             # for waveform extraction / curation errors) that leaves the
             # operator with no way to find which call raised. The
             # behaviour (return the error rather than re-raising so the
             # batch loop continues) is preserved.
-            print(traceback.format_exc())
-            print("Moving on to next recording")
+            _logger.info(traceback.format_exc())
+            _logger.info("Moving on to next recording")
             return e
 
 
@@ -1115,23 +1212,34 @@ def compile_results(
             is True.
         curation_history (dict or None): Curation history dict.
         rec_chunks (list or None): Epoch frame boundaries.
+
+    Notes:
+        When ``rec_chunks`` describes a multi-epoch recording, each
+        epoch chunk gets a fresh ``Compiler`` because each chunk
+        writes to its own ``chunk{c}/`` output folder. ``Compiler``
+        merges all of its queued recordings into one output in
+        ``save_results``, so a single instance cannot serve
+        multiple distinct destinations — re-instantiating per chunk
+        is the correct shape, not wasted work. ``Compiler.__init__``
+        reads a handful of config attrs and allocates an empty list;
+        the cost is negligible.
     """
     comp = config.compilation
     exe = config.execution
     include_failed_units = bool(getattr(comp, "include_failed_units", False))
 
     compile_stopwatch = Stopwatch("COMPILING RESULTS")
-    print(f"For recording: {rec_path}")
+    _logger.info(f"For recording: {rec_path}")
     if comp.compile_single_recording:
         if (
             not (Path(results_path) / "parameters.json").exists()
             or exe.recompile_single_recording
         ):
-            print(f"Saving to path: {results_path}")
+            _logger.info(f"Saving to path: {results_path}")
             if rec_chunks is not None and len(rec_chunks) > 1:
                 epoch_sds = sd.split_epochs()
                 for c, sd_chunk in enumerate(epoch_sds):
-                    print(f"Compiling chunk {c}")
+                    _logger.info(f"Compiling chunk {c}")
                     compiler = Compiler(config)
                     compiler.add_recording(
                         rec_name,
@@ -1151,12 +1259,12 @@ def compile_results(
                 compiler.save_results(results_path)
                 compile_stopwatch.log_time("Done compiling results.")
         else:
-            print(
+            _logger.info(
                 "Skipping compiling results because 'recompile_single_recording' "
                 "is set to False and already compiled"
             )
     else:
-        print(
+        _logger.info(
             "Skipping compiling results because 'compile_single_recording' "
             "is set to False"
         )
@@ -1201,7 +1309,7 @@ def _bounded_host_memory(frac: float = 0.8):
     try:
         import resource
     except ImportError:
-        print(
+        _logger.info(
             "[host memory cap] Windows detected — RLIMIT_DATA unavailable. "
             "Local sorting is not protected from host OOM. "
             "Use Docker, or monitor RAM manually."
@@ -1213,7 +1321,7 @@ def _bounded_host_memory(frac: float = 0.8):
 
     ram_bytes = get_system_ram_bytes()
     if ram_bytes is None:
-        print("[host memory cap] Could not detect system RAM; cap not enforced.")
+        _logger.info("[host memory cap] Could not detect system RAM; cap not enforced.")
         yield
         return
 
@@ -1225,7 +1333,9 @@ def _bounded_host_memory(frac: float = 0.8):
     try:
         resource.setrlimit(resource.RLIMIT_DATA, (new_soft, hard_orig))
     except (ValueError, OSError) as exc:
-        print(f"[host memory cap] Failed to set RLIMIT_DATA: {exc}; cap not enforced.")
+        _logger.info(
+            f"[host memory cap] Failed to set RLIMIT_DATA: {exc}; cap not enforced."
+        )
         yield
         return
 
@@ -1236,6 +1346,38 @@ def _bounded_host_memory(frac: float = 0.8):
             resource.setrlimit(resource.RLIMIT_DATA, (soft_orig, hard_orig))
         except (ValueError, OSError):
             pass
+
+
+_GPU_BANNER_CACHE: Optional[str] = None
+
+
+def _cached_gpu_banner_info() -> str:
+    """Return the cached nvidia-smi banner line.
+
+    The GPU inventory is static for the life of the process. Running
+    nvidia-smi once per recording on a multi-recording batch wastes
+    a subprocess invocation per recording. First call populates the
+    cache; subsequent calls return the cached string immediately.
+    """
+    import subprocess as _subprocess
+
+    global _GPU_BANNER_CACHE
+    if _GPU_BANNER_CACHE is not None:
+        return _GPU_BANNER_CACHE
+    try:
+        gpu_info = _subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,memory.total",
+                "--format=csv,noheader",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+    except (_subprocess.SubprocessError, FileNotFoundError):
+        gpu_info = "(nvidia-smi unavailable)"
+    _GPU_BANNER_CACHE = gpu_info
+    return gpu_info
 
 
 def _print_pipeline_banner(
@@ -1277,17 +1419,17 @@ def _print_pipeline_banner(
     from .sorting_utils import get_system_ram_bytes, print_stage
 
     print_stage(f"SPIKE SORTING — {sorter.upper()}")
-    print()
-    print("-- Environment --")
-    print(f"Started:        {_dt.datetime.now().isoformat(timespec='seconds')}")
-    print(f"Host:           {socket.gethostname()}")
-    print(f"Platform:       {platform.platform()}")
-    print(f"Python:         {sys.version.split()[0]}")
+    _logger.info("")
+    _logger.info("-- Environment --")
+    _logger.info(f"Started:        {_dt.datetime.now().isoformat(timespec='seconds')}")
+    _logger.info(f"Host:           {socket.gethostname()}")
+    _logger.info(f"Platform:       {platform.platform()}")
+    _logger.info(f"Python:         {sys.version.split()[0]}")
 
     try:
         import spikeinterface as _si
 
-        print(f"SpikeInterface: {_si.__version__}")
+        _logger.info(f"SpikeInterface: {_si.__version__}")
     except ImportError:
         pass
 
@@ -1295,60 +1437,52 @@ def _print_pipeline_banner(
         import spikelab as _sl
 
         version = getattr(_sl, "__version__", "unknown")
-        print(f"SpikeLab:       {version}")
+        _logger.info(f"SpikeLab:       {version}")
     except ImportError:
         pass
 
-    print()
-    print("-- System Resources --")
+    _logger.info("")
+    _logger.info("-- System Resources --")
     cpu_count = os.cpu_count()
     if cpu_count is not None:
-        print(f"CPU cores:      {cpu_count}")
+        _logger.info(f"CPU cores:      {cpu_count}")
 
     ram_bytes = get_system_ram_bytes()
     if ram_bytes is not None:
-        print(f"RAM total:      {ram_bytes / 1e9:.1f} GB")
+        _logger.info(f"RAM total:      {ram_bytes / 1e9:.1f} GB")
 
     try:
         import resource
 
         soft, _hard = resource.getrlimit(resource.RLIMIT_DATA)
         if soft == resource.RLIM_INFINITY:
-            print("Heap cap:       (unlimited)")
+            _logger.info("Heap cap:       (unlimited)")
         else:
-            print(f"Heap cap:       {soft / 1e9:.1f} GB (RLIMIT_DATA)")
+            _logger.info(f"Heap cap:       {soft / 1e9:.1f} GB (RLIMIT_DATA)")
     except ImportError:
-        print("Heap cap:       (Windows — not enforced)")
+        _logger.info("Heap cap:       (Windows — not enforced)")
 
-    try:
-        gpu_info = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,driver_version,memory.total",
-                "--format=csv,noheader",
-            ],
-            text=True,
-            timeout=5,
-        ).strip()
-        print(f"GPU:            {gpu_info}")
-    except (subprocess.SubprocessError, FileNotFoundError):
-        print("GPU:            (nvidia-smi unavailable)")
+    # Cache the GPU banner output. ``_print_pipeline_banner`` runs
+    # once per recording, but the GPU inventory is static for the
+    # life of the process — re-running nvidia-smi each time wastes a
+    # subprocess invocation per recording on multi-recording batches.
+    _logger.info(f"GPU:            {_cached_gpu_banner_info()}")
 
     if config.sorter.use_docker:
         if docker_image_tag:
-            print(f"Docker image:   {docker_image_tag}")
+            _logger.info(f"Docker image:   {docker_image_tag}")
         if docker_image_digest:
-            print(f"Docker image digest: {docker_image_digest}")
+            _logger.info(f"Docker image digest: {docker_image_digest}")
 
-    print()
-    print("-- Run --")
-    print(f"Sorter:         {sorter}")
-    print(f"Use Docker:     {config.sorter.use_docker}")
-    print(f"Recording:      {rec_path}")
-    print(f"Log file:       {log_path}")
+    _logger.info("")
+    _logger.info("-- Run --")
+    _logger.info(f"Sorter:         {sorter}")
+    _logger.info(f"Use Docker:     {config.sorter.use_docker}")
+    _logger.info(f"Recording:      {rec_path}")
+    _logger.info(f"Log file:       {log_path}")
 
     # RT-Sort projects a sizeable on-disk footprint per recording
-    # (scaled traces + model traces + model outputs). Print it here
+    # (scaled traces + model traces + model outputs). Log it here
     # so the user sees the requirement before the sort starts —
     # complements the ``low_disk_inter`` preflight check.
     if sorter.lower() == "rt_sort" and recording is not None:
@@ -1360,11 +1494,13 @@ def _print_pipeline_banner(
             projected_gb = estimate_rt_sort_intermediate_gb(
                 n_channels=n_ch, n_samples=n_smp
             )
-            print(f"RT-Sort disk:   ~{projected_gb:.1f} GB intermediates projected")
+            _logger.info(
+                f"RT-Sort disk:   ~{projected_gb:.1f} GB intermediates projected"
+            )
         except Exception:
             pass
 
-    print()
+    _logger.info("")
 
 
 def _print_pipeline_summary(
@@ -1378,19 +1514,31 @@ def _print_pipeline_summary(
 
     from .sorting_utils import get_system_ram_bytes, print_stage
 
-    print()
+    _logger.info("")
     print_stage("SUMMARY")
-    print()
-    print(f"Status:         {status}")
+    _logger.info("")
+    _logger.info(f"Status:         {status}")
     if error is not None:
-        print(f"Error:          {type(error).__name__}: {error}")
+        _logger.info(f"Error:          {type(error).__name__}: {error}")
+        # Surface classified-error attached attributes (sorter,
+        # log_path, model_path, reason, ...) when present so the
+        # operator does not need to grep pod logs for actionable
+        # detail. ``SpikeSortingClassifiedError`` instances carry
+        # these on the exception object itself.
+        from ._exceptions import SpikeSortingClassifiedError
+
+        if isinstance(error, SpikeSortingClassifiedError):
+            for attr in ("sorter", "log_path", "model_path", "reason"):
+                value = getattr(error, attr, None)
+                if value is not None:
+                    _logger.info(f"  {attr}:{' ' * max(0, 13 - len(attr))}{value}")
 
     minutes, seconds = divmod(int(elapsed_s), 60)
-    print(f"Wall time:      {minutes}m {seconds}s")
+    _logger.info(f"Wall time:      {minutes}m {seconds}s")
 
     ram_bytes = get_system_ram_bytes()
     if ram_bytes is not None:
-        print(f"RAM total:      {ram_bytes / 1e9:.1f} GB")
+        _logger.info(f"RAM total:      {ram_bytes / 1e9:.1f} GB")
     try:
         gpu_mem = subprocess.check_output(
             [
@@ -1401,11 +1549,11 @@ def _print_pipeline_summary(
             text=True,
             timeout=5,
         ).strip()
-        print(f"GPU memory:     {gpu_mem}")
+        _logger.info(f"GPU memory:     {gpu_mem}")
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
 
-    print(f"Finished:       {_dt.datetime.now().isoformat(timespec='seconds')}")
+    _logger.info(f"Finished:       {_dt.datetime.now().isoformat(timespec='seconds')}")
 
 
 def sort_recording(
@@ -1555,7 +1703,7 @@ def sort_recording(
             )
             report_findings(findings, strict=config.execution.preflight_strict)
         except Exception as exc:
-            print(f"Preflight aborted the run: {exc!r}")
+            _logger.info(f"Preflight aborted the run: {exc!r}")
             raise
 
     # Main loop — wrap in a host heap cap (Linux-only), a live host
@@ -1564,7 +1712,6 @@ def sort_recording(
     # workstation into swap or fragment GPU VRAM into a hard failure.
     # The host-memory watchdog is the primary protection on Windows,
     # where ``_bounded_host_memory`` is a no-op.
-    from contextlib import nullcontext
 
     from .guards import GpuMemoryWatchdog, HostMemoryWatchdog, resolve_active_device
 
@@ -1696,7 +1843,7 @@ def sort_recording(
                     docker_image_tag = get_docker_image(sorter)
                     docker_image_digest = get_local_image_digest(docker_image_tag)
                 except Exception as exc:
-                    print(f"[docker digest] resolution failed: {exc!r}")
+                    _logger.warning(f"[docker digest] resolution failed: {exc!r}")
 
             # Persist a JSON snapshot of the config so the
             # post-sorting Markdown report can list non-default
@@ -1716,7 +1863,7 @@ def sort_recording(
                     json.dump(snapshot, f, indent=2)
                 os.replace(tmp, config_used_path)
             except Exception as exc:
-                print(f"[config snapshot] failed: {exc!r}")
+                _logger.warning(f"[config snapshot] failed: {exc!r}")
 
             sd_raw = None
             sd_curated = None
@@ -1744,8 +1891,8 @@ def sort_recording(
                     and docker_image_digest
                     and expected_digest != docker_image_digest
                 ):
-                    print(
-                        f"WARNING: Docker image digest mismatch — "
+                    _logger.warning(
+                        f"Docker image digest mismatch — "
                         f"expected {expected_digest!r}, found "
                         f"{docker_image_digest!r}. The image tag has "
                         "been re-pushed to the registry since the "
@@ -1791,7 +1938,6 @@ def sort_recording(
                 # network mounts or unresponsive storage that the
                 # log-inactivity watchdog can miss when the sorter
                 # keeps logging while waiting on kernel I/O).
-                from contextlib import nullcontext
 
                 from .guards import IOStallWatchdog
 
@@ -1889,7 +2035,9 @@ def sort_recording(
                                     f"value"
                                 )
                         if skip_reason is not None:
-                            print(f"[canary] skipping {rec_name}: {skip_reason}.")
+                            _logger.info(
+                                f"[canary] skipping {rec_name}: {skip_reason}."
+                            )
                         else:
                             from .canary import run_canary
 
@@ -1936,12 +2084,12 @@ def sort_recording(
                                 attempt += 1
                                 scaled = backend.scale_oom_params(oom_factor)
                                 if not scaled:
-                                    print(
+                                    _logger.info(
                                         "[oom retry] backend declined to scale "
                                         "memory-bound params; surrendering."
                                     )
                                     break
-                                print(
+                                _logger.info(
                                     f"[oom retry] retrying recording "
                                     f"({attempt}/{oom_max}) after GPU OOM "
                                     f"with reduced batch."
@@ -1997,11 +2145,11 @@ def sort_recording(
                     if config.compilation.save_raw_pkl:
                         raw_pkl = res_path / "sorted_spikedata.pkl"
                         _atomic_write_pickle(sd_raw, raw_pkl)
-                        print(f"Saved {sd_raw.N} raw units to {raw_pkl}")
+                        _logger.info(f"Saved {sd_raw.N} raw units to {raw_pkl}")
 
                     curated_pkl = res_path / "sorted_spikedata_curated.pkl"
                     _atomic_write_pickle(sd_curated, curated_pkl)
-                    print(f"Saved {sd_curated.N} curated units to {curated_pkl}")
+                    _logger.info(f"Saved {sd_curated.N} curated units to {curated_pkl}")
 
                     # Epoch splitting
                     if sd_curated.metadata.get("rec_chunks_ms"):
@@ -2102,7 +2250,9 @@ def sort_recording(
                                 log_path=log_path,
                             )
                         except Exception as exc:
-                            print(f"[sorting report] generation raised: {exc!r}")
+                            _logger.warning(
+                                f"[sorting report] generation raised: {exc!r}"
+                            )
 
                         # Apply tee_log_policy ONLY when the report
                         # write succeeded AND the recording was a
@@ -2413,11 +2563,11 @@ def _write_recording_report(record: "RecordingResult", results_folder: Path) -> 
                 pass
         os.replace(tmp, target)
     except Exception as exc:
-        print(f"[recording report] failed to write {target}: {exc!r}")
+        _logger.warning(f"[recording report] failed to write {target}: {exc!r}")
 
 
 def _print_batch_summary(report: "SortRunReport") -> None:
-    """Print a final summary table for a sort_recording batch.
+    """Log a final summary table for a sort_recording batch.
 
     Surfaces enough detail per failed recording (status, error
     class+message, wall time, retry count, log file path, links to
@@ -2428,17 +2578,17 @@ def _print_batch_summary(report: "SortRunReport") -> None:
     """
     print_stage("BATCH SUMMARY")
     n = len(report.records)
-    print(f"Total recordings:  {n}")
-    print(f"Succeeded:         {len(report.succeeded)}")
+    _logger.info(f"Total recordings:  {n}")
+    _logger.info(f"Succeeded:         {len(report.succeeded)}")
     failed = report.failed
-    print(f"Failed:            {len(failed)}")
+    _logger.info(f"Failed:            {len(failed)}")
 
     if report.succeeded:
-        print()
-        print("Successful recordings:")
+        _logger.info("")
+        _logger.info("Successful recordings:")
         for rec in report.succeeded:
             units = rec.n_curated_units if rec.n_curated_units is not None else "?"
-            print(
+            _logger.info(
                 f"  - {rec.rec_name}: {units} curated units, "
                 f"{rec.wall_time_s:.1f}s wall time"
             )
@@ -2452,10 +2602,10 @@ def _print_batch_summary(report: "SortRunReport") -> None:
         or rec.min_disk_free_gb is not None
         for rec in report.records
     ):
-        print()
-        print("Resource trends (only recordings that hit a warn threshold):")
-        print("| Recording | Peak host RAM % | Peak GPU % | Min disk free GB |")
-        print("|---|---|---|---|")
+        _logger.info("")
+        _logger.info("Resource trends (only recordings that hit a warn threshold):")
+        _logger.info("| Recording | Peak host RAM % | Peak GPU % | Min disk free GB |")
+        _logger.info("|---|---|---|---|")
         for rec in report.records:
             if (
                 rec.peak_host_ram_pct is None
@@ -2478,11 +2628,11 @@ def _print_batch_summary(report: "SortRunReport") -> None:
                 if rec.min_disk_free_gb is not None
                 else "—"
             )
-            print(f"| {rec.rec_name} | {ram} | {gpu} | {disk} |")
+            _logger.info(f"| {rec.rec_name} | {ram} | {gpu} | {disk} |")
 
     if failed:
-        print()
-        print("Failures:")
+        _logger.info("")
+        _logger.info("Failures:")
         for rec in failed:
             err_kind = rec.error_class or "?"
             err_msg = (
@@ -2491,21 +2641,21 @@ def _print_batch_summary(report: "SortRunReport") -> None:
             retries = (
                 f", {rec.retries_used} retry/retries used" if rec.retries_used else ""
             )
-            print(f"  - {rec.rec_name}  [{rec.status}]  {err_kind}: {err_msg}")
-            print(f"      wall time: {rec.wall_time_s:.1f}s{retries}")
+            _logger.info(f"  - {rec.rec_name}  [{rec.status}]  {err_kind}: {err_msg}")
+            _logger.info(f"      wall time: {rec.wall_time_s:.1f}s{retries}")
             if rec.log_path:
-                print(f"      log: {rec.log_path}")
+                _logger.info(f"      log: {rec.log_path}")
             results_folder = Path(rec.results_folder) if rec.results_folder else None
             if results_folder is not None:
                 rec_report = results_folder / "recording_report.json"
                 if rec_report.exists():
-                    print(f"      report: {rec_report}")
+                    _logger.info(f"      report: {rec_report}")
                 disk_report = results_folder / "disk_exhaustion_report.json"
                 if disk_report.exists():
-                    print(f"      disk report: {disk_report}")
+                    _logger.info(f"      disk report: {disk_report}")
                 gpu_snap = results_folder / "gpu_snapshot_at_trip.txt"
                 if gpu_snap.exists():
-                    print(f"      gpu snapshot: {gpu_snap}")
+                    _logger.info(f"      gpu snapshot: {gpu_snap}")
 
 
 def _make_disk_watchdog(
@@ -2597,9 +2747,9 @@ def _write_disk_exhaustion_report(report: Any, results_folder: Path) -> None:
             except (OSError, AttributeError):
                 pass
         os.replace(tmp, target)
-        print(f"[disk watchdog] wrote disk-exhaustion report: {target}")
+        _logger.info(f"[disk watchdog] wrote disk-exhaustion report: {target}")
     except Exception as exc:
-        print(f"[disk exhaustion report] failed to write {target}: {exc!r}")
+        _logger.warning(f"[disk exhaustion report] failed to write {target}: {exc!r}")
 
 
 def _atomic_write_pickle(
@@ -2615,6 +2765,30 @@ def _atomic_write_pickle(
     Important when the in-process inactivity watchdog is active —
     that watchdog can call ``os._exit`` mid-write, and a non-atomic
     write would leave the result file unreadable.
+
+    .. warning::
+        ``os.fsync`` can block indefinitely on a hung network mount
+        (NFS server unresponsive, SMB share down). It is a syscall
+        that does not release the GIL in a way Python can interrupt,
+        so ``_thread.interrupt_main`` from the inactivity watchdog
+        queues a ``KeyboardInterrupt`` that does not deliver until
+        the next bytecode boundary — which is never reached while
+        fsync is blocked. The pipeline's escape hatch is the
+        watchdog's grace-then-``os._exit`` sequence (typically
+        bounded by ``sorter_inactivity_in_process_grace_s``,
+        default ~10 s): the process exits hard, the half-written
+        ``.tmp`` file is removed by the ``except BaseException``
+        cleanup below the next time the path is visited, and the
+        run is reported as a sorter-inactivity failure.
+
+        Callers OUTSIDE the watchdog-wrapped ``sort_recording``
+        path (e.g. notebooks that import this private function
+        directly) get no such protection — on a hung mount the
+        process will block until SIGKILL or the OS NFS timeout
+        (typically minutes). The function is ``_``-prefixed
+        because the canonical caller is the watchdog-wrapped
+        pipeline; bare callers are responsible for their own
+        timeout discipline.
 
     Parameters:
         obj: Any picklable object.

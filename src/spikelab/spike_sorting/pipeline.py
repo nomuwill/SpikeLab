@@ -1212,6 +1212,17 @@ def compile_results(
             is True.
         curation_history (dict or None): Curation history dict.
         rec_chunks (list or None): Epoch frame boundaries.
+
+    Notes:
+        When ``rec_chunks`` describes a multi-epoch recording, each
+        epoch chunk gets a fresh ``Compiler`` because each chunk
+        writes to its own ``chunk{c}/`` output folder. ``Compiler``
+        merges all of its queued recordings into one output in
+        ``save_results``, so a single instance cannot serve
+        multiple distinct destinations — re-instantiating per chunk
+        is the correct shape, not wasted work. ``Compiler.__init__``
+        reads a handful of config attrs and allocates an empty list;
+        the cost is negligible.
     """
     comp = config.compilation
     exe = config.execution

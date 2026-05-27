@@ -2888,13 +2888,50 @@ class TestLoaderMCPToolsCoverage:
         assert result["info"]["num_neurons"] == 2
         assert "workspace_id" in result
         mock_load.assert_called_once()
+        # Default (no explicit collection) should forward ``collection=None``
+        # so the underlying loader runs its heuristic search.
+        assert mock_load.call_args.kwargs.get("collection") is None
 
     @pytestmark_server
     @pytest.mark.asyncio
     @patch("spikelab.mcp_server.tools.data_loaders.load_spikedata_from_ibl")
-    async def test_load_from_ibl_surfaces_array_metadata_as_summary(
-        self, mock_load
-    ):
+    async def test_load_from_ibl_forwards_explicit_collection(self, mock_load):
+        """
+        Tier L-F2: the ``collection`` MCP parameter must reach the
+        underlying ``load_spikedata_from_ibl`` call so the heuristic
+        search can be short-circuited from agent-facing callers too.
+
+        Tests:
+            (Test Case 1) Passing ``collection="alf/probe00/pykilosort"``
+                forwards that value as the ``collection`` keyword.
+            (Test Case 2) Passing ``collection=""`` (the MCP empty-string
+                default) maps to ``collection=None`` on the underlying
+                call, preserving heuristic behavior.
+        """
+        train = [[10.0, 20.0], [15.0]]
+        sd = SpikeData(train, length=30.0)
+        mock_load.return_value = sd
+
+        # Test Case 1: explicit collection forwarded.
+        await data_loaders.load_from_ibl(
+            eid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            pid="11111111-2222-3333-4444-555555555555",
+            collection="alf/probe00/pykilosort",
+        )
+        assert mock_load.call_args.kwargs.get("collection") == "alf/probe00/pykilosort"
+
+        # Test Case 2: empty string → None (heuristic mode preserved).
+        await data_loaders.load_from_ibl(
+            eid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            pid="11111111-2222-3333-4444-555555555555",
+            collection="",
+        )
+        assert mock_load.call_args.kwargs.get("collection") is None
+
+    @pytestmark_server
+    @pytest.mark.asyncio
+    @patch("spikelab.mcp_server.tools.data_loaders.load_spikedata_from_ibl")
+    async def test_load_from_ibl_surfaces_array_metadata_as_summary(self, mock_load):
         """
         Array-valued IBL metadata (e.g. ``trial_start_times``) appears
         in the response under ``info.metadata`` as a JSON-friendly
@@ -3533,7 +3570,9 @@ class TestComputeResampledISI:
         # Uniform 1 ms diffs except one 4 ms gap.
         with pytest.raises(ValueError) as excinfo:
             await analysis.compute_resampled_isi(
-                ws_id, ns, "rates_nonuniform",
+                ws_id,
+                ns,
+                "rates_nonuniform",
                 times=[0.0, 1.0, 2.0, 6.0, 7.0, 8.0],
             )
         msg = str(excinfo.value)
@@ -4724,9 +4763,7 @@ class TestUniqueNamespace:
             _warnings.simplefilter("always")
             assigned = _unique_namespace(ws, "rec")
 
-        warn_msgs = [
-            str(rec.message) for rec in w if rec.category is UserWarning
-        ]
+        warn_msgs = [str(rec.message) for rec in w if rec.category is UserWarning]
         relevant = [m for m in warn_msgs if "rec" in m]
         assert relevant, warn_msgs
         assert "rec" in relevant[0]

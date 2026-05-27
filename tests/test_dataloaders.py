@@ -1782,6 +1782,87 @@ class TestIBLLoader:
         assert sd.N == 0
         assert sd.length == pytest.approx(5_000.0)
 
+    def test_explicit_collection_short_circuits_heuristic_search(self):
+        """
+        Tier L-F2: passing ``collection="alf/probe00/pykilosort"`` must
+        skip the PID-suffix heuristic + fallback chain and issue exactly
+        one ``load_object("spikes", ...)`` call against the explicit
+        collection.
+
+        Tests:
+            (Test Case 1) With ``collection`` set, exactly one
+                ``load_object("spikes", ...)`` call is made and its
+                ``collection`` kwarg matches the explicit value.
+            (Test Case 2) Without ``collection`` (None / default), the
+                heuristic tries multiple candidates when the first
+                fails, so more than one ``load_object("spikes", ...)``
+                call is made.
+        """
+        eid, pid = "test-eid", "11111111-2222-3333-4444-555555555500"
+        # Build mocks where the heuristic-preferred ``alf/probe00/pykilosort``
+        # call fails so the fallback chain is exercised when ``collection``
+        # is None — but the explicit ``collection="alf"`` call succeeds.
+        mock_one_api, mock_brainwidemap, _, _, _ = self._build_mocks(
+            pid,
+            eid,
+            n_good=2,
+            fail_collections={"alf/probe00/pykilosort"},
+        )
+
+        # Test Case 1: explicit collection, exactly one spikes call.
+        with patch.dict(
+            sys.modules,
+            {
+                "one": MagicMock(),
+                "one.api": mock_one_api,
+                "brainwidemap": mock_brainwidemap,
+            },
+        ):
+            loaders.load_spikedata_from_ibl(
+                eid, pid, length_ms=200_000.0, collection="alf"
+            )
+
+        mock_one = mock_one_api.ONE.return_value
+        spikes_calls = [
+            c
+            for c in mock_one.load_object.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "spikes"
+        ]
+        assert len(spikes_calls) == 1, (
+            f"explicit collection should issue exactly one spikes call, "
+            f"got {len(spikes_calls)}: {spikes_calls}"
+        )
+        assert spikes_calls[0].kwargs.get("collection") == "alf"
+
+        # Test Case 2: no explicit collection, heuristic falls through
+        # at least one failed candidate so >1 spikes call is made.
+        mock_one_api2, mock_brainwidemap2, _, _, _ = self._build_mocks(
+            pid,
+            eid,
+            n_good=2,
+            fail_collections={"alf/probe00/pykilosort"},
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "one": MagicMock(),
+                "one.api": mock_one_api2,
+                "brainwidemap": mock_brainwidemap2,
+            },
+        ):
+            loaders.load_spikedata_from_ibl(eid, pid, length_ms=200_000.0)
+
+        mock_one2 = mock_one_api2.ONE.return_value
+        spikes_calls2 = [
+            c
+            for c in mock_one2.load_object.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "spikes"
+        ]
+        assert len(spikes_calls2) >= 2, (
+            f"no explicit collection: heuristic should try more than one "
+            f"candidate when the first fails, got {len(spikes_calls2)}"
+        )
+
 
 @skip_no_pandas
 class TestIBLQuery:
@@ -2493,9 +2574,7 @@ class TestS3Utils:
         with patch("spikelab.data_loaders.s3_utils.boto3") as mock_boto3:
             mock_boto3.client.return_value = mock_client
             with pytest.raises(PermissionError):
-                download_from_s3(
-                    "s3://my-bucket/file.h5", local_path=caller_path
-                )
+                download_from_s3("s3://my-bucket/file.h5", local_path=caller_path)
         # Caller's file was not unlinked.
         assert os.path.exists(caller_path)
 
@@ -6200,12 +6279,7 @@ class TestIsS3UrlHostnameSpoofing:
         """
         from spikelab.data_loaders.s3_utils import is_s3_url
 
-        assert (
-            is_s3_url(
-                "https://s3.evil.amazonaws.com.attacker.example/path"
-            )
-            is False
-        )
+        assert is_s3_url("https://s3.evil.amazonaws.com.attacker.example/path") is False
 
     def test_legitimate_virtual_hosted_url_accepted(self):
         """
@@ -6215,10 +6289,7 @@ class TestIsS3UrlHostnameSpoofing:
         """
         from spikelab.data_loaders.s3_utils import is_s3_url
 
-        assert (
-            is_s3_url("https://my-bucket.s3.us-west-2.amazonaws.com/key")
-            is True
-        )
+        assert is_s3_url("https://my-bucket.s3.us-west-2.amazonaws.com/key") is True
 
     def test_legitimate_path_style_url_accepted(self):
         """

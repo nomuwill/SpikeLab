@@ -1684,6 +1684,7 @@ def load_spikedata_from_ibl(
     pid: str,
     *,
     length_ms: Optional[float] = None,
+    collection: Optional[str] = None,
 ) -> SpikeData:
     """Load spike trains for a single IBL probe into SpikeData.
 
@@ -1698,6 +1699,14 @@ def load_spikedata_from_ibl(
         pid (str): IBL probe ID (UUID string).
         length_ms (float | None): Recording duration in milliseconds.
             If not provided, the maximum spike time across all units is used.
+        collection (str | None): If provided, skip the heuristic
+            collection search and load spikes directly from this
+            collection (e.g. ``"alf/probe00/pykilosort"``). Saves 3-4
+            network round-trips per call when the caller already knows
+            the canonical collection (e.g. in batch workflows that
+            resolve the collection once and reuse it). ``None``
+            (default) falls back to the PID-suffix heuristic + fallback
+            chain.
 
     Returns:
         sd (SpikeData): Loaded spike train data.
@@ -1715,8 +1724,10 @@ def load_spikedata_from_ibl(
         - Requires ``one-api`` and ``brainwidemap`` packages (optional dependencies).
         - Spike times are converted from seconds (IBL convention) to milliseconds.
         - Trial times are converted from seconds to milliseconds.
-        - Probe collection is inferred from the PID suffix; falls back through
-          ``alf/probe00/pykilosort``, ``alf/probe01/pykilosort``, and ``alf``.
+        - When ``collection`` is ``None``, the probe collection is
+          inferred from the PID suffix; falls back through
+          ``alf/probe00/pykilosort``, ``alf/probe01/pykilosort``, and
+          ``alf``.
     """
     try:
         from one.api import ONE  # type: ignore
@@ -1742,28 +1753,35 @@ def load_spikedata_from_ibl(
     unit_df = bwm_units(one)
     good_units = unit_df[(unit_df["pid"] == pid) & (unit_df["label"] == 1)]
 
-    # Build the ordered list of collections to try, with the probe-specific
-    # one first when the PID suffix hints at the probe number. This is a
-    # best-effort heuristic for ordering (PIDs are UUIDs, so the last two
-    # hex chars can coincidentally match "00"/"01"). All candidates are
-    # tried regardless, so correctness is not affected — only the order.
-    collections = []
-    if pid.endswith("00") or pid.endswith("01"):
-        collections.append(f"alf/probe{pid[-2:]}/pykilosort")
-    collections.extend(_IBL_FALLBACK_COLLECTIONS)
-    # Deduplicate while preserving order.
-    seen: set = set()
-    ordered_collections: List[str] = []
-    for c in collections:
-        if c not in seen:
-            seen.add(c)
-            ordered_collections.append(c)
+    # Build the ordered list of collections to try. When the caller
+    # supplied an explicit ``collection``, short-circuit the heuristic
+    # search — saves 3-4 network round-trips per call in batch
+    # workflows that already know the canonical collection.
+    if collection is not None:
+        ordered_collections: List[str] = [collection]
+    else:
+        # With the probe-specific collection first when the PID suffix
+        # hints at the probe number. This is a best-effort heuristic
+        # for ordering (PIDs are UUIDs, so the last two hex chars can
+        # coincidentally match "00"/"01"). All candidates are tried
+        # regardless, so correctness is not affected — only the order.
+        collections = []
+        if pid.endswith("00") or pid.endswith("01"):
+            collections.append(f"alf/probe{pid[-2:]}/pykilosort")
+        collections.extend(_IBL_FALLBACK_COLLECTIONS)
+        # Deduplicate while preserving order.
+        seen: set = set()
+        ordered_collections = []
+        for c in collections:
+            if c not in seen:
+                seen.add(c)
+                ordered_collections.append(c)
 
     # Load spikes from the first available collection.
     spikes = None
-    for collection in ordered_collections:
+    for candidate in ordered_collections:
         try:
-            spikes = one.load_object(eid, "spikes", collection=collection)
+            spikes = one.load_object(eid, "spikes", collection=candidate)
             break
         except (ValueError, KeyError, FileNotFoundError):
             continue

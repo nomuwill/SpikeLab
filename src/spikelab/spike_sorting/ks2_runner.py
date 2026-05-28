@@ -282,8 +282,8 @@ class RunKilosort:
         kilosort2_channelmap_txt = kilosort2_channelmap_txt.format(
             nchan=recording.get_num_channels(),
             sample_rate=recording.get_sampling_frequency(),
-            xcoords=[p[0] for p in positions],
-            ycoords=[p[1] for p in positions],
+            xcoords=[float(p[0]) for p in positions],
+            ycoords=[float(p[1]) for p in positions],
             kcoords=groups,
         )
         # endregion

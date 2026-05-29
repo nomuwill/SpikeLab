@@ -3076,6 +3076,48 @@ async def pairwise_tests(
 # ---------------------------------------------------------------------------
 
 
+def _store_hippie_result(ws, sd, workspace_id, namespace, result, prefix):
+    """Write embeddings / UMAP / cluster labels to neuron_attributes and return summary.
+
+    Shared by ``classify_neurons_hippie`` and ``compress_neurons_hippie``; differs
+    only in the attribute-name prefix (``"hippie"`` vs ``"vae"``). Re-stores the
+    SpikeData in the workspace so downstream tools see the new attributes.
+    """
+    sd.set_neuron_attribute(f"{prefix}_embedding", result["embeddings"].tolist())
+    added_attrs = [f"{prefix}_embedding"]
+    if "umap_coords" in result:
+        sd.set_neuron_attribute(
+            f"{prefix}_umap_x", result["umap_coords"][:, 0].tolist()
+        )
+        sd.set_neuron_attribute(
+            f"{prefix}_umap_y", result["umap_coords"][:, 1].tolist()
+        )
+        added_attrs += [f"{prefix}_umap_x", f"{prefix}_umap_y"]
+    if "cluster_labels" in result:
+        sd.set_neuron_attribute(f"{prefix}_cluster", result["cluster_labels"].tolist())
+        added_attrs.append(f"{prefix}_cluster")
+
+    ws.store(namespace, "spikedata", sd)
+
+    labels = result.get("cluster_labels")
+    n_clusters = (
+        int(np.unique(labels[labels >= 0]).size) if labels is not None else None
+    )
+    n_noise = int((labels < 0).sum()) if labels is not None else None
+
+    return {
+        "workspace_id": workspace_id,
+        "namespace": namespace,
+        "n_neurons": int(result["embeddings"].shape[0]),
+        "embedding_dim": int(result["embeddings"].shape[1]),
+        "umap_computed": "umap_coords" in result,
+        "hdbscan_computed": "cluster_labels" in result,
+        "n_clusters": n_clusters,
+        "n_noise_neurons": n_noise,
+        "neuron_attributes_added": added_attrs,
+    }
+
+
 async def classify_neurons_hippie(
     workspace_id: str,
     namespace: str,
@@ -3130,45 +3172,7 @@ async def classify_neurons_hippie(
         cache_dir=cache_dir,
     )
 
-    # Store results as neuron_attributes
-    sd.set_neuron_attribute("hippie_embedding", result["embeddings"].tolist())
-    if "umap_coords" in result:
-        sd.set_neuron_attribute("hippie_umap_x", result["umap_coords"][:, 0].tolist())
-        sd.set_neuron_attribute("hippie_umap_y", result["umap_coords"][:, 1].tolist())
-    if "cluster_labels" in result:
-        sd.set_neuron_attribute("hippie_cluster", result["cluster_labels"].tolist())
-
-    # Persist the updated SpikeData
-    ws.store(namespace, "spikedata", sd)
-
-    n_clusters = (
-        int(np.unique(result["cluster_labels"][result["cluster_labels"] >= 0]).size)
-        if "cluster_labels" in result
-        else None
-    )
-    n_noise = (
-        int((result["cluster_labels"] < 0).sum())
-        if "cluster_labels" in result
-        else None
-    )
-
-    added_attrs = ["hippie_embedding"]
-    if "umap_coords" in result:
-        added_attrs += ["hippie_umap_x", "hippie_umap_y"]
-    if "cluster_labels" in result:
-        added_attrs.append("hippie_cluster")
-
-    return {
-        "workspace_id": workspace_id,
-        "namespace": namespace,
-        "n_neurons": int(result["embeddings"].shape[0]),
-        "embedding_dim": int(result["embeddings"].shape[1]),
-        "umap_computed": "umap_coords" in result,
-        "hdbscan_computed": "cluster_labels" in result,
-        "n_clusters": n_clusters,
-        "n_noise_neurons": n_noise,
-        "neuron_attributes_added": added_attrs,
-    }
+    return _store_hippie_result(ws, sd, workspace_id, namespace, result, "hippie")
 
 
 # ---------------------------------------------------------------------------
@@ -3199,10 +3203,23 @@ async def train_vae_hippie(
 
     Requires avg_waveform in neuron_attributes — run get_waveform_traces first.
     """
+    import os
+
     from ....spikedata.hippie_adapter import train_vae_on_spikedata
 
     ws = _get_workspace(workspace_id)
     sd = _get_spikedata(ws, namespace)
+
+    # Fail fast if output_dir is unwritable — VAE training can take hours, so
+    # surface permission / typo errors before the run starts rather than after.
+    os.makedirs(output_dir, exist_ok=True)
+    probe = os.path.join(output_dir, ".write_probe")
+    try:
+        with open(probe, "w") as fh:
+            fh.write("")
+        os.remove(probe)
+    except OSError as e:
+        raise OSError(f"output_dir is not writable: {output_dir!r} ({e})") from e
 
     train_vae_on_spikedata(
         sd,
@@ -3214,8 +3231,6 @@ async def train_vae_hippie(
         val_fraction=val_fraction,
         device=device,
     )
-
-    import os
 
     ckpt_path = os.path.join(output_dir, "vae_best.ckpt")
     return {
@@ -3271,39 +3286,4 @@ async def compress_neurons_hippie(
         device=device,
     )
 
-    sd.set_neuron_attribute("vae_embedding", result["embeddings"].tolist())
-    if "umap_coords" in result:
-        sd.set_neuron_attribute("vae_umap_x", result["umap_coords"][:, 0].tolist())
-        sd.set_neuron_attribute("vae_umap_y", result["umap_coords"][:, 1].tolist())
-    if "cluster_labels" in result:
-        sd.set_neuron_attribute("vae_cluster", result["cluster_labels"].tolist())
-
-    ws.store(namespace, "spikedata", sd)
-
-    n_clusters = (
-        int(np.unique(result["cluster_labels"][result["cluster_labels"] >= 0]).size)
-        if "cluster_labels" in result
-        else None
-    )
-
-    added_attrs = ["vae_embedding"]
-    if "umap_coords" in result:
-        added_attrs += ["vae_umap_x", "vae_umap_y"]
-    if "cluster_labels" in result:
-        added_attrs.append("vae_cluster")
-
-    return {
-        "workspace_id": workspace_id,
-        "namespace": namespace,
-        "n_neurons": int(result["embeddings"].shape[0]),
-        "embedding_dim": int(result["embeddings"].shape[1]),
-        "umap_computed": "umap_coords" in result,
-        "hdbscan_computed": "cluster_labels" in result,
-        "n_clusters": n_clusters,
-        "n_noise_neurons": (
-            int((result["cluster_labels"] < 0).sum())
-            if "cluster_labels" in result
-            else None
-        ),
-        "neuron_attributes_added": added_attrs,
-    }
+    return _store_hippie_result(ws, sd, workspace_id, namespace, result, "vae")

@@ -19,15 +19,17 @@ from spikelab.spikedata.hippie_adapter import (
     classify_neurons,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
-def _make_spike_train(n_spikes=200, duration_s=60.0, seed=0):
+_DURATION_MS = 60_000.0  # 60 s recording, expressed in ms (SpikeLab convention)
+
+
+def _make_spike_train(n_spikes=200, duration_ms=_DURATION_MS, seed=0):
     rng = np.random.default_rng(seed)
-    return np.sort(rng.uniform(0, duration_s, n_spikes))
+    return np.sort(rng.uniform(0, duration_ms, n_spikes))
 
 
 def _make_waveform(n=82, seed=0):
@@ -40,11 +42,10 @@ def _make_spikedata(n_units=10, seed=0):
     """Return a minimal SpikeData with avg_waveform in neuron_attributes."""
     from spikelab.spikedata import SpikeData
 
-    rng = np.random.default_rng(seed)
     trains = [_make_spike_train(200 + i * 10, seed=seed + i) for i in range(n_units)]
     waveforms = [_make_waveform(seed=seed + i) for i in range(n_units)]
     attrs = [{"avg_waveform": w} for w in waveforms]
-    return SpikeData(trains, length=60.0, neuron_attributes=attrs)
+    return SpikeData(trains, length=_DURATION_MS, neuron_attributes=attrs)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,16 @@ class TestISIHistogram:
         assert hist.shape == (100,)
         assert np.isfinite(hist).all()
 
+    def test_populated_for_realistic_train(self):
+        # Regression guard: spike times in ms should land inside the
+        # [1, 5000] ms log-spaced bin range and produce a histogram with
+        # genuine structure (more than two distinct values after
+        # normalization). A unit-conversion bug pushing ISIs out of range
+        # collapses the histogram to a flat output and trips this check.
+        st = _make_spike_train(500)
+        hist = _isi_histogram(st)
+        assert np.unique(hist).size > 2
+
 
 class TestAutocorrelogram:
     def test_output_shape(self):
@@ -105,6 +116,15 @@ class TestAutocorrelogram:
         acg = _autocorrelogram(np.array([]), n_bins=100)
         assert acg.shape == (100,)
         assert (acg == 0).all()
+
+    def test_populated_for_realistic_train(self):
+        # Regression guard: with a high enough rate that some pairs fall
+        # inside max_lag_ms=100, the ACG must have non-zero counts. A
+        # unit-conversion bug puts every lag outside the window and
+        # collapses the ACG to all zeros (or constant).
+        st = _make_spike_train(2000)
+        acg = _autocorrelogram(st)
+        assert np.unique(acg).size > 1
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +150,7 @@ class TestExtractFeatures:
         from spikelab.spikedata import SpikeData
 
         trains = [_make_spike_train(100, seed=i) for i in range(3)]
-        sd = SpikeData(trains, length=60.0)
+        sd = SpikeData(trains, length=_DURATION_MS)
         with pytest.raises(ValueError, match="avg_waveform"):
             extract_features(sd)
 

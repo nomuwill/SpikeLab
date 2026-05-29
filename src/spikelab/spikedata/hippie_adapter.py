@@ -14,6 +14,13 @@ from typing import Optional, Union
 
 import numpy as np
 
+__all__ = [
+    "extract_features",
+    "classify_neurons",
+    "train_vae_on_spikedata",
+    "compress_neurons",
+]
+
 
 # ISI histogram parameters (log-spaced, matching HIPPIE training data convention)
 _ISI_N_BINS = 100
@@ -54,8 +61,11 @@ def _preprocess_waveform(wave: np.ndarray, target: int = 50) -> np.ndarray:
 
 
 def _isi_histogram(spike_times: np.ndarray, n_bins: int = _ISI_N_BINS) -> np.ndarray:
-    """Compute a log-spaced ISI histogram, log(x+1)-transformed and min-max normalized."""
-    isis_ms = np.diff(np.sort(spike_times)) * 1000.0
+    """Compute a log-spaced ISI histogram, log(x+1)-transformed and min-max normalized.
+
+    Spike times must be in milliseconds (SpikeLab convention).
+    """
+    isis_ms = np.diff(np.sort(spike_times))
     isis_ms = isis_ms[isis_ms > 0]
     if len(isis_ms) < 2:
         return np.full(
@@ -79,19 +89,22 @@ def _autocorrelogram(
     max_lag_ms: float = _ACG_MAX_LAG_MS,
     n_bins: int = _ACG_N_BINS,
 ) -> np.ndarray:
-    """Compute a half-sided autocorrelogram (forward lags only), min-max normalized."""
+    """Compute a half-sided autocorrelogram (forward lags only), min-max normalized.
+
+    Spike times must be in milliseconds (SpikeLab convention).
+    """
     if len(spike_times) < 2:
         return np.zeros(n_bins, dtype=np.float32)
 
-    st_ms = np.sort(spike_times) * 1000.0
+    st = np.sort(spike_times)
     bin_edges = np.linspace(0.0, max_lag_ms, n_bins + 1)
     counts = np.zeros(n_bins, dtype=np.float64)
 
-    for i in range(len(st_ms)):
-        hi = np.searchsorted(st_ms, st_ms[i] + max_lag_ms, side="right")
+    for i in range(len(st)):
+        hi = np.searchsorted(st, st[i] + max_lag_ms, side="right")
         lo = i + 1
         if lo < hi:
-            diffs = st_ms[lo:hi] - st_ms[i]
+            diffs = st[lo:hi] - st[i]
             counts += np.histogram(diffs, bins=bin_edges)[0]
 
     total = counts.sum()
@@ -134,6 +147,7 @@ def extract_features(
             - "isi":  (N, 100) log-transformed, normalized ISI histograms
             - "acg":  (N, 100) normalized autocorrelograms
     """
+    _require_hippie()
     waves = sd.get_neuron_attribute("avg_waveform")
     if waves is None or any(w is None for w in waves):
         raise ValueError(

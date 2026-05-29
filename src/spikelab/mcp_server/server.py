@@ -4379,7 +4379,6 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "load_workspace_item": analysis.load_workspace_item,
     "merge_workspace": analysis.merge_workspace,
     "fetch_workspace_item": analysis.fetch_workspace_item,
-<<<<<<< HEAD
     # Shuffling and stack builders
     "spike_shuffle": analysis.spike_shuffle,
     "spike_shuffle_stack": analysis.spike_shuffle_stack,

@@ -71,6 +71,17 @@ class TestPreprocessWaveform:
         assert out.shape == (50,)
         assert np.isfinite(out).all()
 
+    def test_nonzero_flat_waveform_collapses_to_minus_one(self):
+        # Dead channel / clipped recording: a constant non-zero waveform
+        # should normalize to all -1.0 (not pass through as the raw constant)
+        # so those units land in a deterministic noise corner of the latent
+        # space and cluster together rather than scattering on out-of-range
+        # values. Regression guard for the W2 fix discussed in PR #120.
+        wave = np.full(50, -50.0)
+        out = _preprocess_waveform(wave)
+        assert out.shape == (50,)
+        np.testing.assert_allclose(out, -1.0, atol=1e-5)
+
 
 class TestISIHistogram:
     def test_output_shape(self):

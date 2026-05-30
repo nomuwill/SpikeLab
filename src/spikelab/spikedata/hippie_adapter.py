@@ -48,15 +48,20 @@ def _require_hippie():
 
 
 def _preprocess_waveform(wave: np.ndarray, target: int = 50) -> np.ndarray:
-    """Resample waveform to target length and min-max normalize to [-1, 1]."""
+    """Resample waveform to target length and min-max normalize to [-1, 1].
+
+    Flat waveforms (dead channels, clipped recordings) collapse to all -1.0
+    via the epsilon-protected divisor, putting those units in a deterministic
+    noise corner of the HIPPIE latent space.
+    """
     import torch
     import torch.nn.functional as F
 
     t = torch.as_tensor(wave, dtype=torch.float32).view(1, 1, -1)
     t = F.interpolate(t, size=(target,), mode="linear", align_corners=False).squeeze()
     mn, mx = t.min().item(), t.max().item()
-    if mx > mn:
-        t = (t - mn) / (mx - mn) * 2.0 - 1.0
+    # Epsilon matches the HIPPIE training-pipeline normalisation (do not strip).
+    t = (t - mn) / (mx - mn + 1e-8) * 2.0 - 1.0
     return t.numpy().astype(np.float32)
 
 
@@ -80,6 +85,7 @@ def _isi_histogram(spike_times: np.ndarray, n_bins: int = _ISI_N_BINS) -> np.nda
     hist = np.log1p(hist)
     mn, mx = hist.min(), hist.max()
     if mx > mn:
+        # Epsilon matches the HIPPIE training-pipeline normalisation (do not strip).
         hist = (hist - mn) / (mx - mn + 1e-8) * 2.0 - 1.0
     return hist
 
@@ -114,6 +120,7 @@ def _autocorrelogram(
     acg = counts.astype(np.float32)
     mn, mx = acg.min(), acg.max()
     if mx > mn:
+        # Epsilon matches the HIPPIE training-pipeline normalisation (do not strip).
         acg = (acg - mn) / (mx - mn + 1e-8) * 2.0 - 1.0
     return acg
 

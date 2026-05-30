@@ -2385,7 +2385,11 @@ def _ibl_collect_channels(
         try:
             channels = one.load_object(eid, "channels", collection=candidate)
             break
-        except (ValueError, KeyError, FileNotFoundError):
+        except Exception:  # noqa: BLE001
+            # Best-effort: any failure (missing collection, network
+            # timeout, auth, schema drift) yields no electrodes_by_channel
+            # rather than crashing the spike-train load. Matches the
+            # defensive posture of _ibl_collect_session_metadata.
             continue
     if channels is None:
         return {}

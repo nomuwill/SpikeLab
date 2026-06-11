@@ -1,0 +1,15 @@
+{
+    "args": "./start_splitter.sh",
+    "cpu_request": 6,
+    "memory_request": 48,
+    "disk_request": 400,
+    "GPU": 0,
+    "image": "braingeneers/maxtwo_splitter:v0.75",
+    "init_args": "./download_only.sh",
+    "init_cpu_request": 1,
+    "init_memory_request": 8,
+    "init_disk_request": 400,
+    "init_GPU": 0,
+    "ephemeral_mount_path": "/data",
+    "s3_endpoint_value": "s3.braingeneers.gi.ucsc.edu"
+}

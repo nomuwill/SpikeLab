@@ -1,0 +1,10 @@
+{
+    "args": "./run.sh",
+    "cpu_request": 12,
+    "memory_request": 64,
+    "disk_request": 600,
+    "GPU": 1,
+    "image": "braingeneers/ephys_pipeline:v0.79",
+    "gpu_resource": "nvidia.com/gpu",
+    "backoff_limit": 2
+}
